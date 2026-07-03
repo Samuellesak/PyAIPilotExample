@@ -1,0 +1,127 @@
+# Quadcopter parameters — DJI X config
+# All units SI (kg, m, s, rad, N).
+
+# ── Physical ──────────────────────────────────────────────────────────
+m:     5.49   # total mass [kg]  — identified by sysid.py (ground angular-rate fit)
+g:     9.81    # gravitational acceleration [m/s^2]
+L:     0.14    # arm length (rotor to CoM) [m]
+kappa: 0.016   # rotor torque-to-thrust ratio [m]
+
+# ── Inertia (computed from geometry, not specified directly) ──────────
+# Motors: 4 point masses at arm tips.  d = L/sqrt(2) = projected offset.
+#   I_motors_xx = 4 * m_motor * d² = 2 * m_motor * L²
+#   I_motors_zz = 4 * m_motor * L²
+# Frame: 4 uniform rods of length L at 45° to body axes.
+#   I_frame_xx = m_frame * L² / 6   (each rod: m_arm * L² * sin²45° / 3)
+#   I_frame_zz = m_frame * L² / 3   (each rod: m_arm * L² / 3, summed)
+# where m_frame = m - 4 * m_motor
+#   Ixx = Iyy = 2 * m_motor * L² + m_frame * L² / 6
+#   Izz       = 4 * m_motor * L² + m_frame * L² / 3
+m_motor: 0.050  # mass of one motor [kg]  (4 * m_motor must be < m)
+
+# ── Aerodynamic drag ──────────────────────────────────────────────────
+# Force drag:  F = -Dv * |v| .* v   [N / (m/s)^2]  — diagonal elements
+# (Dv unidentified from ground sysid — needs in-flight velocity data)
+Dv: [0.05, 0.05, 0.020]
+
+# Torque drag: M = -Dw * |w| .* w   [N·m / (rad/s)^2] — diagonal elements
+# Dw_xy identified from ground roll/pitch excitation (sysid.py).
+# Dw_z unidentified (kappa degenerate on ground) — kept at nominal.
+Dw: [0.0377, 0.0377, 0.002]
+
+# ── Aerodynamic moment coefficients ───────────────────────────────────
+# Pitch moment from forward  body velocity  [N·m / (m/s)]
+# Roll  moment from sideways body velocity  (C_M_p = C_M_q)
+C_M_q: 0.0
+
+# ── Carrot tracker ────────────────────────────────────────────────────
+# Waypoints in NED frame [North, East, Down] [m].
+# First entry is the starting point (world origin).
+# NED z is negative upward: z = -10 means 10 m altitude.
+waypoints:
+  - [  0.0,  0.0,  0.0]    # 0  start / world origin
+  - [ 10.0,  -10.0, -5.0]   
+  - [ 20.0, 0, 0]   
+  - [ 60.0, -10.0, 0]   
+  - [ 80.0,  0.0, 10.0]   
+  - [ 100.0,  0.0,  15.0]   
+
+T_max_motor:    57.53  # maximum thrust per motor [N]  (used for normalization) 63.31
+tau_motor:      0.05  # first-order motor lag time constant [s]  (typ. 20–100 ms for brushless)
+
+v_ref:          2.0   # reference cruise speed [m/s]
+lookahead_gain: 1.0   # lookahead distance = lookahead_gain * v_ref [m]
+tau:            3.0   # exponential transition length [m]
+                      # at d_over=tau the blend is 63%, at 3*tau ~95%
+
+# ── Controller selection ─────────────────────────────────────────────────────
+# 1 = Cascade PI  (analytical gains, no offline solve required)
+# 2 = LQI         (requires lqi_gains.npz — run `python lqi.py` first)
+controller_type: 1
+
+# ── Cascade controller gains ─────────────────────────────────────────────────
+# Inner loop: rate bandwidth [rad/s].  K_rate_i = rate_bandwidth * I_ii.
+# No offline computation required — gains are derived analytically at startup.
+# Set to true to keep the drone in hover indefinitely (no carrot transition).
+# Use this for gain tuning: observe cascade.png rate/attitude panels without path following.
+hover_only: true
+
+rate_bandwidth: 20.0    # inner loop rate BW [rad/s]; K_rate_roll = bw*Ixx
+                        # motor BW = 1/tau_motor = 20 rad/s
+                        # TUNE THIS via step-rate sysid — see comment block below
+
+# Outer loop: velocity PI -> desired tilt angle -> P on tilt error -> desired rates
+Kp_vel:  1      # horizontal velocity P  [1/s]
+Ki_vel:  0.00128    # horizontal velocity I  [1/s^2]
+Kp_vz:   1      # vertical velocity P    [1/s]
+Ki_vz:   0.00128    # vertical velocity I    [1/s^2]
+Kp_z:    0.5    # altitude position hold [1/s]: NED-z error [m] → vD reference [m/s]
+                  # clipped to ±1.5 m/s; outer-most loop wrapping vD control
+
+# Direct K_rate override — set > 0 to bypass the analytical formula.
+# Use this when m_motor geometry is uncertain (common in sim).
+# Tuning procedure: increase K_rate_roll_override from 0.05 to 0.5 in 50% steps
+# until cascade.png panel 3 shows p_meas tracking p_des within ~0.5 rad/s.
+# Leave at 0.0 to use the analytical value (rate_bandwidth * Ixx).
+K_rate_roll_override:  0.0
+K_rate_pitch_override: 0.0
+
+K_att:  6.0      # attitude P: tilt error [rad] -> rate command [rad/s]
+                  # TUNE THIS after rate loop is identified — must stay < rate_bandwidth/3
+
+K_psi:   1.0      # yaw P   [1/s]
+Ki_psi:  0.0002    # yaw I   [1/s^2]  = K_psi^2 / 5 0.2
+
+MAX_TILT_DEG: 35.0   # outer loop tilt limit [deg]  (max horiz accel ~4.1 m/s^2)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ── LQI cost weights ─────────────────────────────────────────────────────────
+# Q_aug is a 14×14 diagonal matrix for the augmented state:
+#   z = [vel_body(3), quat(4), rates(3)]   (reduced plant state, 10 elements)
+#   xi = [xi_vN, xi_vE, xi_vD, xi_psi]    (integrators, 4 elements)
+# R_cost is a scalar × I_4 penalising motor thrust deviations from trim.
+# After editing, re-run `python lqi.py` to recompute lqi_gains.npz.
+
+Q_vel:     [2.0, 2.0, 2.0]        # body-frame velocity [u, v, w]  [1/(m/s)^2]
+Q_quat:    [2.0, 2.0, 2.0, 2.0]   # quaternion [qw, qx, qy, qz]   [dimensionless]
+Q_rates:   [20.0, 20.0, 20.0]     # body rates  [p, q, r]          [1/(rad/s)^2]
+Q_int_vel: [1.0, 1.0, 1.0]        # velocity integrators [N, E, D]  [1/m^2]
+Q_int_psi: 1.0                    # yaw integrator                  [1/rad^2]
+R_cost:    5.0                    # control cost (scalar × I_4)     [1/N^2]
