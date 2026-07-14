@@ -9,13 +9,15 @@ MAVLINK_CMD_SIM_RESET = 31000
 CONTROL_HZ            = 250
 DT                    = 1.0 / CONTROL_HZ
 
-# Max yaw reference rate [rad/s] — prevents 180° jump at startup
-PSI_RATE_MAX = np.deg2rad(30)
+# Max yaw slew rate [rad/s] used to prevent instantaneous step-changes in r_des.
+# The r_des clamp (±2 rad/s) is the hard limit; this softer limit just shapes the
+# transient.  90°/s is fast enough to track direction changes without lag.
+PSI_RATE_MAX = np.deg2rad(90)
 
 # ── Launch sequence ────────────────────────────────────────────────────
 # 1. WAIT  : motors idle on slope, IMU settles, integrators stay clean
 # 2. TRACK : cascade runs immediately; carrot velocity ramps 0 → v_ned_ref
-WAIT_PHASE_SEC   = 3.0    # seconds to sit on slope before cascade starts
+WAIT_PHASE_SEC   = 3.5    # seconds to sit on slope before cascade starts
                           # must be long enough for the complementary filter
                           # to converge to the actual slope tilt (~3× filter τ)
 CARROT_RAMP_SEC  = 3.0    # ramp carrot velocity from 0 → v_ned_ref over this long
@@ -23,7 +25,7 @@ INTEGRATE_DELAY    = 2.0    # horizontal (N/E) integrator delay after hover entr
                             # prevents windup: drone hits 3+ m/s during slope release
 INTEGRATE_DELAY_V  = 0.0    # vertical (D) integrator delay — activate immediately
                             # so altitude drift is corrected without waiting 2 s
-HOVER_HOLD_SEC     = 10.0   # hold hover this long [s] before carrot tracker activates
+HOVER_HOLD_SEC     = 1.0    # hold hover this long [s] before carrot tracker activates
 
 
 def _rot_from_quat(q):
@@ -93,12 +95,13 @@ class Controller:
             flush=True
         )
 
-        # Outer loop gains
-        self._Kp_vel   = float(param['Kp_vel'])
-        self._Ki_vel   = float(param['Ki_vel'])
-        self._Kp_vz    = float(param['Kp_vz'])
-        self._Ki_vz    = float(param['Ki_vz'])
-        self._Kp_z     = float(param.get('Kp_z', 0.5))   # altitude position hold [1/s]
+        # Outer loop gains — per-axis velocity PI
+        self._Kp_vN    = float(param['Kp_vN'])
+        self._Ki_vN    = float(param['Ki_vN'])
+        self._Kp_vE    = float(param['Kp_vE'])
+        self._Ki_vE    = float(param['Ki_vE'])
+        self._Kp_vD    = float(param['Kp_vD'])
+        self._Ki_vD    = float(param['Ki_vD'])
         self._K_att    = float(param['K_att'])
         self._K_psi    = float(param['K_psi'])
         self._Ki_psi   = float(param['Ki_psi'])
@@ -109,8 +112,6 @@ class Controller:
         if self._hover_only:
             print("[Controller] hover_only=true — carrot tracker disabled, "
                   "drone will hold altitude indefinitely", flush=True)
-
-        self._z_ref    = None   # NED z reference set at hover entry
 
         # Cascade integrators
         self.xi_vel      = np.zeros(3)              # NED velocity integrals [m]
@@ -197,7 +198,7 @@ class Controller:
                 self._last_nostate_t = _now
                 print(f"[CONTROLLER] waiting for mav_state... data keys: {list(self.data.keys())}",
                       flush=True)
-            self._send_motors_norm([0.0] * 4)
+            self._send_attitude_target(0.0, 0.0, 0.0, 0.0)
             time.sleep(DT)
             return
 
@@ -246,7 +247,7 @@ class Controller:
                       f"roll={phi_deg:.1f}°  pitch={theta_deg:.1f}°  R22={R22_w:.3f}  "
                       f"rates=({rates[0]:.2f},{rates[1]:.2f},{rates[2]:.2f})  "
                       f"dt={_actual_dt*1000:.1f}ms", flush=True)
-            self._send_motors_norm([0.05] * 4)   # ~0.6 N each — stays grounded
+            self._send_attitude_target(0.0, 0.0, 0.0, 4.0 * 0.05 * self.T_max)
             time.sleep(DT)
             return
 
@@ -291,24 +292,28 @@ class Controller:
         hover_elapsed = (time.time() - self._hover_entry_t) if self._hover_entry_t else 0.0
         in_hover = self._hover_only or hover_elapsed < HOVER_HOLD_SEC
 
-        # Latch z_ref once the drone has stabilized at altitude (after INTEGRATE_DELAY).
-        # Deferring avoids capturing the ground elevation at hover entry, which would
-        # immediately fight the liftoff climb.
-        if (self._z_ref is None and
-                self._hover_entry_t is not None and
-                hover_elapsed >= INTEGRATE_DELAY):
-            self._z_ref = pos_ned[2]
-            print(f"[CONTROLLER] z_ref latched = {self._z_ref:.2f}m (EKF position)",
-                  flush=True)
+        # ── Liftoff blip: high-thrust burst right at WAIT→HOVER transition ──
+        # All four motors commanded equally (no rate setpoints) for pure vertical force.
+        _blip_dur  = float(self.param.get('blip_dur_sec',     0.1))
+        _blip_frac = float(self.param.get('blip_thrust_frac', 0.8))
+        if hover_elapsed < _blip_dur:
+            self._send_motors_norm(np.full(4, _blip_frac))
+            time.sleep(DT)
+            return
 
         v_ref_for_gains = np.zeros(3)
         if in_hover:
-            # Altitude hold: Kp_z * (z_ref - z_meas) → vD reference correction.
-            # NED z increases downward, so if drone sinks (z_meas > z_ref) the error is
-            # negative → vD_ref < 0 (command upward velocity) → more collective thrust.
-            if self._z_ref is not None:
-                v_ref_for_gains[2] = float(np.clip(
-                    self._Kp_z * (self._z_ref - pos_ned[2]), -1.5, 1.5))
+            # During hover hold, pre-rotate _psi_cmd toward the first waypoint so the
+            # drone is already facing the right direction when carrot activates.
+            r1 = self.tracker.waypoints[min(1, self.tracker.n_waypoints - 1)]
+            to_wp = r1[:2] - pos_ned[:2]   # NE only
+            if np.linalg.norm(to_wp) > 0.5:
+                psi_to_wp = np.arctan2(to_wp[1], to_wp[0])
+                dpsi = _wrap_pi(psi_to_wp - self._psi_cmd)
+                self._psi_cmd = _wrap_pi(
+                    self._psi_cmd + np.clip(dpsi,
+                                            -PSI_RATE_MAX * _actual_dt,
+                                             PSI_RATE_MAX * _actual_dt))
         else:
             # Carrot tracking: use EKF position to follow the waypoint path.
             if not self._carrot_active:
@@ -318,20 +323,54 @@ class Controller:
                       f"{self.tracker.n_waypoints-1}", flush=True)
             t_carrot = time.time() - self._t_carrot_start
             alpha = min(1.0, t_carrot / CARROT_RAMP_SEC)
+
+            det = self.data.get('gate_detection', {})
+            # Refine target waypoint to exact sim gate NED when YOLO+PnP locks on.
+            if det.get('detected') and det.get('tvec_cam') is not None:
+                gate_ned = self._active_gate_ned()
+                if gate_ned is not None:
+                    self.tracker.waypoints[self.tracker.wp] = gate_ned
+
             v_ned_ref_carrot, psi_ref_carrot = self.tracker.update(pos_ned)
-            v_ref_for_gains = alpha * v_ned_ref_carrot
-            # Rate-limit yaw reference to avoid 180° jumps at path start
+            v_ref_for_gains = alpha * np.array([v_ned_ref_carrot[0],
+                                                v_ned_ref_carrot[1],
+                                                v_ned_ref_carrot[2]])
+
+            # Visual yaw correction from orange centroid (bearing-only).
+            # When the centroid is available, blend the carrot psi toward the
+            # camera bearing so the drone points its nose at the detected orange blob.
+            cx_det = det.get('centre_px')
+            if cx_det is not None:
+                dx_px = float(cx_det[0]) - self.param.get('cam_cx', 320.0)
+                psi_vis = _wrap_pi(quat_to_yaw(quat) +
+                                   np.arctan2(dx_px, self.param.get('cam_fx', 320.0)))
+                dpsi_vis = _wrap_pi(psi_vis - psi_ref_carrot)
+                _VIS_BLEND = 0.4   # weight of visual bearing vs carrot waypoint yaw
+                psi_ref_carrot = _wrap_pi(psi_ref_carrot + _VIS_BLEND * dpsi_vis)
+
+            # Rate-limit yaw reference
             dpsi = _wrap_pi(psi_ref_carrot - self._psi_cmd)
             self._psi_cmd = _wrap_pi(
                 self._psi_cmd + np.clip(dpsi, -PSI_RATE_MAX * _actual_dt,
                                                PSI_RATE_MAX * _actual_dt))
             if self._logger is not None:
                 self._logger.log_carrot(
-                    time_ms = _now * 1e3,
-                    wp      = self.tracker.wp,
-                    alpha   = self.tracker.blend_alpha,
-                    v_cmd   = v_ned_ref_carrot,
+                    time_ms    = _now * 1e3,
+                    wp         = self.tracker.wp,
+                    alpha      = self.tracker.blend_alpha,
+                    v_cmd      = v_ned_ref_carrot,
+                    carrot_pos = self.tracker.carrot_pos,
                 )
+
+        # Advance carrot waypoint when sim signals gate passage.
+        if self.data.pop('gate_passed', False):
+            agi = self.data.get('active_gate_index', -1)
+            if agi >= 0:
+                new_wp = min(int(agi) + 1, self.tracker.n_waypoints - 1)
+                if new_wp > self.tracker.wp:
+                    self.tracker.wp = new_wp
+                    print(f"[GATE PASSED id={self.data.get('last_gate_id')}] "
+                          f"tracker.wp → {self.tracker.wp}", flush=True)
 
         psi_meas = quat_to_yaw(quat)
 
@@ -360,8 +399,6 @@ class Controller:
                 phi_meas_gt   = self.data.get('attitude_roll'),
                 theta_meas_gt = self.data.get('attitude_pitch'),
             )
-            u = self._inner_loop(p_des, q_des, r_des, rates, T_coll)
-
             if self._logger is not None:
                 dbg = getattr(self, '_dbg', {})
                 self._logger.log_cascade(
@@ -401,9 +438,11 @@ class Controller:
                     f"T_coll={T_coll:.2f}N  R22={R22:.3f}\n"
                     f"  xi_vel=({self.xi_vel[0]:.3f},{self.xi_vel[1]:.3f},{self.xi_vel[2]:.3f})  "
                     f"xi_psi={self.xi_psi:.3f}  intg=H={intg_h} V={intg_v}  "
-                    f"u=({u[0]:.2f},{u[1]:.2f},{u[2]:.2f},{u[3]:.2f})N",
+                    f"T_norm={T_coll/(4.0*self.T_max):.3f}",
                     flush=True
                 )
+
+            self._send_attitude_target(p_des, q_des, r_des, T_coll)
 
         else:
             # ── LQI ──────────────────────────────────────────────────────
@@ -425,7 +464,8 @@ class Controller:
                     flush=True
                 )
 
-        self._send_motors_norm(u / self.T_max)
+            self._send_motors_norm(u / self.T_max)
+
         time.sleep(DT)
 
     # ------------------------------------------------------------------
@@ -463,13 +503,16 @@ class Controller:
         #   2. hover_t delay has elapsed (horizontal/yaw delayed to avoid liftoff windup;
         #      vertical starts immediately to correct altitude drift)
         if hover_t >= INTEGRATE_DELAY:
-            if self._Ki_vel > 0:
-                self.xi_vel[:2] = np.clip(self.xi_vel[:2] + dt * e_vel_c[:2],
-                                          -self._XI_VEL_LIM[:2], self._XI_VEL_LIM[:2])
+            if self._Ki_vN > 0:
+                self.xi_vel[0] = float(np.clip(self.xi_vel[0] + dt * e_vel_c[0],
+                                               -self._XI_VEL_LIM[0], self._XI_VEL_LIM[0]))
+            if self._Ki_vE > 0:
+                self.xi_vel[1] = float(np.clip(self.xi_vel[1] + dt * e_vel_c[1],
+                                               -self._XI_VEL_LIM[1], self._XI_VEL_LIM[1]))
             if self._Ki_psi > 0:
                 self.xi_psi = np.clip(self.xi_psi + dt * e_psi,
                                       -self._XI_PSI_LIM, self._XI_PSI_LIM)
-        if hover_t >= INTEGRATE_DELAY_V and self._Ki_vz > 0:
+        if hover_t >= INTEGRATE_DELAY_V and self._Ki_vD > 0:
             self.xi_vel[2] = float(np.clip(self.xi_vel[2] + dt * e_vel_c[2],
                                            -self._XI_VEL_LIM[2], self._XI_VEL_LIM[2]))
 
@@ -477,8 +520,8 @@ class Controller:
         # Use clamped error for proportional path too: unclamped liftoff vz
         # (~11 m/s upward) would otherwise cut collective to ~0.5 N/motor.
         g   = self._g
-        a_N = self._Kp_vel * e_vel_c[0] + self._Ki_vel * self.xi_vel[0]
-        a_E = self._Kp_vel * e_vel_c[1] + self._Ki_vel * self.xi_vel[1]
+        a_N = self._Kp_vN * e_vel_c[0] + self._Ki_vN * self.xi_vel[0]
+        a_E = self._Kp_vE * e_vel_c[1] + self._Ki_vE * self.xi_vel[1]
 
         # Rotate desired NED acceleration into body horizontal frame.
         # Without this, theta_des = -a_N/g is only correct when yaw = 0 (north).
@@ -509,7 +552,7 @@ class Controller:
         # Collective thrust (tilt-corrected); a_z > 0 = NED-down = less lift needed.
         # T_collective is the TOTAL thrust fed into the mixer's first row (T1+T2+T3+T4),
         # so use 4*T_hover (=m*g), not T_hover (=m*g/4) which is per-motor hover thrust.
-        a_z = self._Kp_vz * e_vel_c[2] + self._Ki_vz * self.xi_vel[2]
+        a_z = self._Kp_vD * e_vel_c[2] + self._Ki_vD * self.xi_vel[2]
         T_raw = 4.0 * self.T_hover * (1.0 - a_z / g) / R22
         # Output filter: removes R22 (attitude) noise that the vD filter cannot catch.
         alpha_T = np.exp(-dt / self._TAU_T_COLL)
@@ -540,6 +583,32 @@ class Controller:
         tau_z = self._K_rate_yaw   * (r_des - rates[2])
         u_raw = self._M_inv @ np.array([T_collective, tau_x, tau_y, tau_z])
         return np.clip(u_raw, 0.0, self.T_max)
+
+    # ------------------------------------------------------------------
+    # Attitude-target output (body rates + collective thrust)
+    # ------------------------------------------------------------------
+
+    def _send_attitude_target(self, p_des, q_des, r_des, T_collective):
+        """Send desired body rates + collective thrust to the sim's onboard rate controller.
+
+        type_mask 0x80: ignore attitude quaternion — sim uses body-rate + thrust setpoints.
+        thrust_norm = T_collective [N, total over 4 motors] / (4 * T_max_motor).
+        """
+        thrust_norm = float(np.clip(T_collective / (4.0 * self.T_max), 0.0, 1.0))
+        self.sim_conn.mav.set_attitude_target_send(
+            int(time.time() * 1e3) & 0xFFFFFFFF,
+            self.sim_conn.target_system,
+            self.sim_conn.target_component,
+            0x80,                       # ignore attitude quaternion; use rates + thrust
+            [1.0, 0.0, 0.0, 0.0],      # attitude quaternion (ignored)
+            float(p_des),
+            float(q_des),
+            float(r_des),
+            thrust_norm,
+        )
+        if self._logger is not None:
+            self._logger.log_control(time.time() * 1000.0,
+                                     np.full(4, T_collective / 4.0))
 
     # ------------------------------------------------------------------
     # LQI controller
@@ -608,6 +677,19 @@ class Controller:
         if self._logger is not None:
             u_n = np.asarray(u_norm)
             self._logger.log_control(time.time() * 1000.0, u_n * self.T_max)
+
+    # ------------------------------------------------------------------
+    # Gate helpers
+    # ------------------------------------------------------------------
+
+    def _active_gate_ned(self):
+        """Return NED position of the currently active gate, or None."""
+        gates = self.data.get('track_gates_ned')
+        idx   = self.data.get('active_gate_index')
+        if gates is None or idx is None:
+            return None
+        g = gates.get(int(idx))
+        return g['ned'].copy() if g is not None else None
 
     # ------------------------------------------------------------------
     # MAVLink commands

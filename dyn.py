@@ -65,11 +65,12 @@ def load_params(yaml_path="params.yaml"):
     # Controller selection and gains
     p['controller_type'] = int(raw.get('controller_type', 1))
     p['rate_bandwidth'] = float(raw.get('rate_bandwidth', 12.0))
-    p['Kp_vel']         = float(raw.get('Kp_vel',   0.8))
-    p['Ki_vel']         = float(raw.get('Ki_vel',   0.128))
-    p['Kp_vz']          = float(raw.get('Kp_vz',    0.8))
-    p['Ki_vz']          = float(raw.get('Ki_vz',    0.128))
-    p['Kp_z']           = float(raw.get('Kp_z',     0.5))
+    p['Kp_vN']          = float(raw.get('Kp_vN', raw.get('Kp_vel', 0.1)))
+    p['Ki_vN']          = float(raw.get('Ki_vN', raw.get('Ki_vel', 0.0)))
+    p['Kp_vE']          = float(raw.get('Kp_vE', raw.get('Kp_vel', 0.1)))
+    p['Ki_vE']          = float(raw.get('Ki_vE', raw.get('Ki_vel', 0.0)))
+    p['Kp_vD']          = float(raw.get('Kp_vD', raw.get('Kp_vz',  0.3)))
+    p['Ki_vD']          = float(raw.get('Ki_vD', raw.get('Ki_vz',  0.05)))
     p['K_att']          = float(raw.get('K_att',    3.0))
     p['K_psi']          = float(raw.get('K_psi',    1.0))
     p['Ki_psi']         = float(raw.get('Ki_psi',   0.200))
@@ -78,6 +79,8 @@ def load_params(yaml_path="params.yaml"):
     p['K_rate_roll_override']  = float(raw.get('K_rate_roll_override',  0.0))
     p['K_rate_pitch_override'] = float(raw.get('K_rate_pitch_override', 0.0))
     p['hover_only']            = bool(raw.get('hover_only', False))
+    p['logging']               = int(raw.get('logging', 1))
+    p['initial_yaw_deg']       = float(raw.get('initial_yaw_deg', 0.0))
 
     # LQI cost weights (optional — only present when lqi.py is used)
     if 'Q_vel' in raw:

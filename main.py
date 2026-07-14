@@ -41,7 +41,8 @@ controller.arm()
 # to arrive in the background thread, then purge them.  The control loop's 3 s
 # wait-phase means no flight data is lost by clearing here.
 time.sleep(1.0)
-logger.reset_flight_data()
+if logger is not None:
+    logger.reset_flight_data()
 print("Starting control loop...", flush=True)
 try:
     while True:
@@ -49,7 +50,8 @@ try:
 except KeyboardInterrupt:
     print("\nCtrl+C received, saving logs...", flush=True)
 finally:
-    logger.save()
+    if logger is not None:
+        logger.save()
     for _c in [ts_loop, mavlink_rx, vision_rx]:
         _t = _c.get_thread_for_join()
         if _t is not None:

@@ -60,7 +60,12 @@ START_NORM   = 0.18   # normalized throttle at ramp start
 END_NORM     = 0.80   # normalized throttle at ramp end
 
 # Liftoff detection thresholds
-LIFTOFF_Z_DELTA        = 2.0   # zacc must drop this many m/s² below baseline
+# Uses acc_norm (|a|) rather than az alone: on the ground acc_norm ≈ g regardless
+# of platform tilt or motor throttle (ground reaction absorbs thrust).  Only after
+# true liftoff does net upward acceleration push acc_norm above g.  This makes
+# detection incline-invariant — az-based detection triggers falsely when the drone
+# tilts forward on the slope before actually leaving the surface.
+LIFTOFF_ACC_DELTA      = 1.5   # acc_norm must exceed g + this value [m/s²]
 LIFTOFF_CONSEC_MIN     = 12    # consecutive samples needed (IMU ~60 Hz, loop 250 Hz)
 LIFTOFF_MIN_THROTTLE_F = 0.85  # only detect after throttle ≥ this × hover throttle
 
@@ -68,6 +73,10 @@ LIFTOFF_MIN_THROTTLE_F = 0.85  # only detect after throttle ≥ this × hover th
 POST_LIFTOFF_STOP_SEC  = 2.0          # end test this many seconds after liftoff
 CRASH_ACC_NORM_THRESH  = float('inf') # disabled — set to 40.0 to re-enable
 CRASH_CONSEC_MIN       = 12
+
+# Hover phase (entered after liftoff is confirmed)
+HOVER_SEC    = 10.0   # hover this long then kill motors
+KP_VZ        = 0.3    # vD [m/s] → thrust correction [normalised]
 
 MAVLINK_CMD_SIM_RESET = 31000
 # ─────────────────────────────────────────────────────────────────────────────
@@ -83,6 +92,18 @@ def send_motors(conn, u_norm):
         conn.target_component,
         0,
         cmds
+    )
+
+
+def send_attitude_target(conn, p, q, r, thrust_norm):
+    """Zero-attitude target: body rates + collective thrust via the sim rate controller."""
+    conn.mav.set_attitude_target_send(
+        int(time.time() * 1e3) & 0xFFFFFFFF,
+        conn.target_system, conn.target_component,
+        0x80,                          # type_mask: ignore attitude quaternion
+        [1.0, 0.0, 0.0, 0.0],         # quaternion placeholder (ignored)
+        float(p), float(q), float(r),
+        float(np.clip(thrust_norm, 0.0, 1.0)),
     )
 
 
@@ -165,14 +186,20 @@ def main():
     log_acc_norm = []
     log_gyro_mag = []
 
+    blip_dur  = float(param.get('blip_dur_sec',     0.15))
+    blip_frac = float(param.get('blip_thrust_frac', 0.80))
+
     liftoff_norm   = None
     liftoff_t      = None
     liftoff_consec = 0
     crash_consec   = 0
+    t_hover_start  = None
+    T_hover_norm   = T_hover_theory / T_max
 
     t_test_start = time.time()
     last_print_t = 0.0
     t_hold_start = 0.0
+    t_blip_start = 0.0
     phase        = "IDLE"
 
     # ── Control loop ─────────────────────────────────────────────────────────
@@ -187,11 +214,19 @@ def main():
                     zacc_baseline = float(np.mean(zacc_idle_samples))
                     print(f"  zacc baseline = {zacc_baseline:.3f} m/s²  "
                           f"(n={len(zacc_idle_samples)} samples)  "
-                          f"liftoff trigger < {zacc_baseline - LIFTOFF_Z_DELTA:.3f} m/s²",
+                          f"liftoff trigger: |acc| > {g + LIFTOFF_ACC_DELTA:.2f} m/s²",
                           flush=True)
                 else:
                     print("  WARNING: no IMU data received during IDLE — "
                           "liftoff detection disabled", flush=True)
+                print(f"  *** BLIP start ({blip_dur:.2f}s @ {blip_frac*100:.0f}%) ***",
+                      flush=True)
+                t_blip_start = t
+                phase = "BLIP"
+
+        elif phase == "BLIP":
+            u_norm = blip_frac
+            if t - t_blip_start >= blip_dur:
                 print("  *** RAMP start ***", flush=True)
                 phase = "RAMP"
 
@@ -207,7 +242,37 @@ def main():
             if t - t_hold_start >= HOLD_SEC:
                 break
 
-        # ── Motor command (all 4 equal) ────────────────────────────────────
+        elif phase == "HOVER":
+            # Zero body rates + hover thrust with vD feedback from EKF.
+            # vD > 0 means climbing in NED (down is positive), so subtract correction.
+            mav = shared.get('mav_state')
+            vD  = float(mav['vel_ned'][2]) if mav is not None else 0.0
+            u_norm = float(np.clip(T_hover_norm - KP_VZ * vD, 0.05, 0.60))
+            send_attitude_target(conn, 0.0, 0.0, 0.0, u_norm)
+            logger.log_control(int(time.time() * 1000), [u_norm * T_max] * 4)
+
+            az, acc_norm, gyro_mag = read_imu(shared)
+            if az is not None:
+                log_t.append(t)
+                log_norm.append(u_norm)
+                log_zacc.append(az)
+                log_acc_norm.append(acc_norm)
+                log_gyro_mag.append(gyro_mag)
+                if t - last_print_t >= 1.0:
+                    last_print_t = t
+                    print(f"[HOVER t={t:5.1f}s]  "
+                          f"T_norm={u_norm:.3f} ({u_norm*100:.1f}%)  "
+                          f"vD={vD:+.2f}m/s  "
+                          f"zacc={az:.3f}  gyro={gyro_mag:.3f} rad/s",
+                          flush=True)
+
+            if t - t_hover_start >= HOVER_SEC:
+                print(f"\n[HOVER] {HOVER_SEC:.0f}s complete — killing motors.", flush=True)
+                break
+            time.sleep(DT)
+            continue
+
+        # ── Motor command (all 4 equal) — only for non-HOVER phases ──────
         send_motors(conn, u_norm)
         logger.log_control(int(time.time() * 1000), [u_norm * T_max] * 4)
 
@@ -224,30 +289,36 @@ def main():
             log_acc_norm.append(acc_norm)
             log_gyro_mag.append(gyro_mag)
 
-            # Liftoff detection (RAMP + HOLD only)
-            if (liftoff_norm is None and zacc_baseline is not None
-                    and phase not in ("IDLE",) and u_norm >= hover_min_throttle):
-                if az < zacc_baseline - LIFTOFF_Z_DELTA:
+            # Liftoff detection (RAMP + HOLD only).
+            # Uses |acc| rather than az: on the ground |acc| ≈ g regardless of tilt
+            # (ground reaction absorbs thrust).  After liftoff, net upward acceleration
+            # pushes |acc| above g — attitude-invariant, incline-safe.
+            if (liftoff_norm is None
+                    and phase not in ("IDLE", "BLIP") and u_norm >= hover_min_throttle):
+                if acc_norm > g + LIFTOFF_ACC_DELTA:
                     liftoff_consec += 1
                     if liftoff_consec >= LIFTOFF_CONSEC_MIN:
                         liftoff_norm = u_norm
                         liftoff_t    = t
                         print(f"  *** LIFTOFF detected at t={t:.2f}s  "
                               f"throttle={u_norm:.4f} ({u_norm*100:.1f}%)  "
-                              f"zacc={az:.3f} (Δ={az-zacc_baseline:.3f})  "
+                              f"|acc|={acc_norm:.3f} m/s² (>{g+LIFTOFF_ACC_DELTA:.2f})  "
                               f"≈ {u_norm*T_max:.2f} N/motor ***",
                               flush=True)
                 else:
                     liftoff_consec = 0
 
-            # Auto-stop after liftoff
-            if liftoff_norm is not None and t - liftoff_t >= POST_LIFTOFF_STOP_SEC:
-                print(f"\n[Auto-stop] {POST_LIFTOFF_STOP_SEC:.0f}s after liftoff — ending test.",
+            # Transition to hover after POST_LIFTOFF_STOP_SEC
+            if (liftoff_norm is not None and phase != "HOVER"
+                    and t - liftoff_t >= POST_LIFTOFF_STOP_SEC):
+                phase         = "HOVER"
+                t_hover_start = t
+                print(f"\n[HOVER] Entering hover at t={t:.2f}s  "
+                      f"T_hover_norm={T_hover_norm:.3f} ({T_hover_norm*100:.1f}%)",
                       flush=True)
-                break
 
             # Crash detection
-            if phase not in ("IDLE",) and acc_norm > CRASH_ACC_NORM_THRESH:
+            if phase not in ("IDLE", "BLIP") and acc_norm > CRASH_ACC_NORM_THRESH:
                 crash_consec += 1
                 if crash_consec >= CRASH_CONSEC_MIN:
                     print(f"\n*** CRASH detected at t={t:.2f}s  "
@@ -290,7 +361,7 @@ def main():
         print(f"  Calibrated T_max_motor       : {T_max_calibrated:.2f} N  "
               f"← update params.yaml so hover = {liftoff_norm*100:.1f}% throttle")
     else:
-        print("  Liftoff NOT detected — lower LIFTOFF_Z_DELTA or inspect zacc log")
+        print("  Liftoff NOT detected — lower LIFTOFF_ACC_DELTA or inspect acc_norm log")
     print("────────────────────────────────────────────────────────────────\n")
 
     # ── Save CSV + Plot ───────────────────────────────────────────────────────
@@ -337,10 +408,9 @@ def main():
                   label="|acc| (m/s²)")
         if zacc_baseline is not None:
             ax_z.axhline(zacc_baseline, color="gray", ls="--", lw=0.8,
-                         label=f"baseline {zacc_baseline:.2f}")
-            ax_z.axhline(zacc_baseline - LIFTOFF_Z_DELTA, color="red",
-                         ls=":", lw=1.2,
-                         label=f"liftoff trigger ({zacc_baseline-LIFTOFF_Z_DELTA:.2f})")
+                         label=f"zacc baseline {zacc_baseline:.2f}")
+        ax_z.axhline(g + LIFTOFF_ACC_DELTA, color="red", ls=":", lw=1.2,
+                     label=f"|acc| liftoff trigger ({g+LIFTOFF_ACC_DELTA:.2f} m/s²)")
         if liftoff_t is not None:
             ax_z.axvline(liftoff_t, color="red", ls=":", lw=1.2,
                          label=f"liftoff t={liftoff_t:.1f}s")

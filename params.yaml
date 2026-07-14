@@ -34,22 +34,83 @@ Dw: [0.0377, 0.0377, 0.002]
 # Roll  moment from sideways body velocity  (C_M_p = C_M_q)
 C_M_q: 0.0
 
-# ── Carrot tracker ────────────────────────────────────────────────────
+# ── Initial EKF yaw ──────────────────────────────────────────────────────────
+# The sim does not send ATTITUDE messages so the EKF cannot auto-detect the
+# drone's heading.  Set this to the drone's facing direction in the sim's NED
+# frame (0 = North, 90 = East, -90 = West).  Confirm from the path log:
+# if the trajectory moves along East (pE) when approaching gates, use 90.
+initial_yaw_deg: 90.0
+
+# ── Carrot tracker ────────────────────────────────────────────────────────────
 # Waypoints in NED frame [North, East, Down] [m].
 # First entry is the starting point (world origin).
 # NED z is negative upward: z = -10 means 10 m altitude.
+# Drone faces East in the sim — gates are along the East axis.
 waypoints:
-  - [  0.0,  0.0,  0.0]    # 0  start / world origin
-  - [ 10.0,  -10.0, -5.0]   
-  - [ 20.0, 0, 0]   
-  - [ 60.0, -10.0, 0]   
-  - [ 80.0,  0.0, 10.0]   
-  - [ 100.0,  0.0,  15.0]   
+  - [   0.0,    0.0,   0.0]    # 0  start / world origin
+  - [   0.0,   40.0,   0.0]    # 1  gate 0 (~40 m East)
+  - [   0.0,   80.0,   0.0]    # 2  gate 1
+  - [   0.0,  120.0,   0.0]    # 3  gate 2
+  - [   0.0,  160.0,   0.0]    # 4  gate 3
+  - [   0.0,  200.0,   0.0]    # 5  gate 4
+  # Note: D=0 keeps the reference altitude at launch height; vD velocity control holds it.
 
-T_max_motor:    57.53  # maximum thrust per motor [N]  (used for normalization) 63.31
+# ── Camera intrinsics (pinhole, no distortion) ────────────────────────
+# Starting assumption: 640×480, 90° horizontal FOV → fx = fy = image_width/2.
+# Tune cam_fx/cam_fy to the actual sim camera if PnP distance reads wrong.
+cam_fx: 320.0      # focal length x [pixels]
+cam_fy: 320.0      # focal length y [pixels]
+cam_cx: 320.0      # principal point x [pixels]  (image_width / 2)
+cam_cy: 180.0      # principal point y [pixels]  (image_height / 2)
+
+# ── EKF vision update noise ────────────────────────────────────────────
+ekf_vision_sigma:     0.5    # 1-sigma position noise from PnP [m]
+ekf_vision_gate:      10.0   # reject PnP position innovation > this [m]
+ekf_vision_vel_sigma: 1.0    # 1-sigma velocity noise from PnP differencing [m/s]
+ekf_vision_vel_gate:  5.0    # reject PnP velocity innovation > this [m/s]
+ekf_vision_yaw_sigma: 0.1    # 1-sigma yaw noise from PnP [rad] (~6 deg)
+ekf_vision_yaw_gate:  1.0    # reject PnP yaw innovation > this [rad] (~57°); prevents 180° PnP flip
+
+# Fallback gate dimensions used for PnP when track data has not yet arrived.
+# Only the rotation part of PnP (rvec) is used for yaw — it is scale-invariant,
+# so an approximate size gives a good yaw estimate.  Position update is skipped
+# (no known gate NED).  Measure the sim gate opening and set accordingly.
+gate_width_default:   1.5    # [m]  — inner gate opening, measured
+gate_height_default:  1.5    # [m]
+
+# Gate distance lock — prevents distant-gate detections from corrupting PnP
+vision_max_gate_dist: 50.0   # reject PnP solutions farther than this [m]
+vision_vel_max_factor: 2.5   # reject PnP velocity > v_ref * this (e.g. 2.5 × 2 m/s = 5 m/s)
+vision_lock_frames:   5      # consecutive valid PnP frames required to acquire lock
+vision_lock_miss:     30     # consecutive missed frames before lock is released
+vision_spike_tol:     5.0    # reject PnP if distance > locked_dist + this [m]
+
+# ── Blue disturbance suppression ──────────────────────────────────────────────
+# Zeros out blue pixels in the raw frame before the orange mask is applied.
+# Prevents sim background noise from bleeding into the dilated YOLO input.
+# OpenCV hue range is 0-179.  Blue ≈ 100-140.  Set suppress_blue: false to disable.
+suppress_blue:      true
+suppress_blue_h_lo: 100
+suppress_blue_h_hi: 140
+suppress_blue_s_lo: 80    # min saturation — avoids suppressing grey/white regions
+suppress_blue_v_lo: 50    # min value — avoids suppressing dark/shadow regions
+
+# ── Launch blip ──────────────────────────────────────────────────────────────
+# High-thrust burst fired immediately when the WAIT phase ends (at hover entry).
+# blip_dur_sec    : duration of the blip [s]
+# blip_thrust_frac: thrust fraction during blip (0–1, relative to T_max_motor)
+blip_dur_sec:      0.15
+blip_thrust_frac:  0.8
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+# 0 = no logs written to disk (faster, no disk I/O)
+# 1 = full logs (IMU, EKF, control, vision frames, MAVLink)
+logging: 1
+
+T_max_motor:    48.27  # maximum thrust per motor [N]  (used for normalization) 57.53
 tau_motor:      0.05  # first-order motor lag time constant [s]  (typ. 20–100 ms for brushless)
 
-v_ref:          2.0   # reference cruise speed [m/s]
+v_ref:          4.0   # reference cruise speed [m/s]
 lookahead_gain: 1.0   # lookahead distance = lookahead_gain * v_ref [m]
 tau:            3.0   # exponential transition length [m]
                       # at d_over=tau the blend is 63%, at 3*tau ~95%
@@ -64,19 +125,24 @@ controller_type: 1
 # No offline computation required — gains are derived analytically at startup.
 # Set to true to keep the drone in hover indefinitely (no carrot transition).
 # Use this for gain tuning: observe cascade.png rate/attitude panels without path following.
-hover_only: true
+hover_only: false
 
 rate_bandwidth: 20.0    # inner loop rate BW [rad/s]; K_rate_roll = bw*Ixx
                         # motor BW = 1/tau_motor = 20 rad/s
                         # TUNE THIS via step-rate sysid — see comment block below
 
 # Outer loop: velocity PI -> desired tilt angle -> P on tilt error -> desired rates
-Kp_vel:  1      # horizontal velocity P  [1/s]
-Ki_vel:  0.00128    # horizontal velocity I  [1/s^2]
-Kp_vz:   1      # vertical velocity P    [1/s]
-Ki_vz:   0.00128    # vertical velocity I    [1/s^2]
-Kp_z:    0.5    # altitude position hold [1/s]: NED-z error [m] → vD reference [m/s]
-                  # clipped to ±1.5 m/s; outer-most loop wrapping vD control
+# R22 = cos(roll)*cos(pitch): thrust compensation factor for tilt.  At level flight
+# R22≈1; it rises toward 1/cos(tilt) as the drone tilts so collective is boosted to
+# maintain altitude.  Appears constant in logs because the drone flies near-level.
+# Per-axis velocity PI gains (NED frame).  No position hold loop — altitude is managed
+# by vD alone: v_ref_D=0 in hover, carrot D component during race.
+Kp_vN:  0.4    # North velocity P  [1/s]
+Ki_vN:  0.0    # North velocity I  [1/s²]
+Kp_vE:  0.4    # East  velocity P  [1/s]
+Ki_vE:  0.0    # East  velocity I  [1/s²]
+Kp_vD:  0.6    # Down  velocity P  [1/s]  — higher: stronger correction for vD drift
+Ki_vD:  0.05   # Down  velocity I  [1/s²] — small integral to trim steady-state vD offset
 
 # Direct K_rate override — set > 0 to bypass the analytical formula.
 # Use this when m_motor geometry is uncertain (common in sim).
@@ -89,7 +155,7 @@ K_rate_pitch_override: 0.0
 K_att:  6.0      # attitude P: tilt error [rad] -> rate command [rad/s]
                   # TUNE THIS after rate loop is identified — must stay < rate_bandwidth/3
 
-K_psi:   1.0      # yaw P   [1/s]
+K_psi:   2.0      # yaw P   [1/s]
 Ki_psi:  0.0002    # yaw I   [1/s^2]  = K_psi^2 / 5 0.2
 
 MAX_TILT_DEG: 35.0   # outer loop tilt limit [deg]  (max horiz accel ~4.1 m/s^2)

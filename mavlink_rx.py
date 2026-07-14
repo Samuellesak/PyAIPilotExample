@@ -28,6 +28,17 @@ class MAVLinkRX:
         self._last_imu_t = None
         self._yaw_initialised = False   # True after first ATTITUDE injects yaw into EKF
 
+        # Apply initial yaw from params if the sim does not send ATTITUDE messages.
+        # Set initial_yaw_deg in params.yaml to match the drone's heading in the sim
+        # (e.g. 90.0 if the drone faces East).  Ignored once ATTITUDE arrives.
+        from dyn import load_params as _lp
+        _p = _lp("params.yaml")
+        _init_yaw_deg = float(_p.get('initial_yaw_deg', 0.0))
+        if _init_yaw_deg != 0.0:
+            self._ekf.set_yaw(np.deg2rad(_init_yaw_deg))
+            print(f"[MAVLinkRX] EKF yaw pre-set from params: {_init_yaw_deg:.1f}°",
+                  flush=True)
+
     @classmethod
     def create_mavlink_rx(cls, mavlink_connection, data, logger=None):
         rx = cls(mavlink_connection, data, logger)
@@ -48,8 +59,9 @@ class MAVLinkRX:
         Continuously receive MAVLink messages without blocking.
         One bad handler never crashes the loop.
         """
-        _msg_counts = {}
-        _diag_t     = time.time()
+        _msg_counts  = {}
+        _diag_t      = time.time()
+        _diag_period = 10.0   # print seen message types every 10 s
 
         while self.is_running:
 
@@ -61,12 +73,13 @@ class MAVLinkRX:
                 time.sleep(0.01)
                 continue
 
+            now = time.time()
+            if now - _diag_t >= _diag_period:
+                _diag_t = now
+                top = dict(sorted(_msg_counts.items(), key=lambda kv: -kv[1])[:15])
+                print(f"[MAVLinkRX] msg types seen: {top}", flush=True)
+
             if msg is None:
-                if time.time() - _diag_t >= 5.0:
-                    _diag_t = time.time()
-                    print(f"[MAVLinkRX] waiting for IMU. "
-                          f"Seen: {dict(list(_msg_counts.items())[:10])}",
-                          flush=True)
                 time.sleep(0.001)
                 continue
 
@@ -98,6 +111,8 @@ class MAVLinkRX:
                     self.on_actuator_output_status(msg)
                 elif msg_type == "COLLISION":
                     self.on_collision(msg)
+                elif msg_type == "LOCAL_POSITION_NED":
+                    self.on_local_position_ned(msg)
                 elif msg_type == "DATA_TRANSMISSION_HANDSHAKE":
                     track_data_transfer_id = msg.width
                     self.track_chunks[track_data_transfer_id] = {}
@@ -142,10 +157,11 @@ class MAVLinkRX:
             self._ekf.set_roll(0.0)          # force phi=0 at hover entry (drone is level laterally)
             print("[MAVLinkRX] EKF position, velocity zeroed; roll forced to 0", flush=True)
 
-        # Sim reports gyro with p and q sign-flipped vs FRD convention:
-        # +xgyro = roll LEFT (not roll-right), +ygyro = nose DOWN (not nose-up).
-        # Negate p and q so the EKF and controller receive standard FRD rates.
-        gyro = np.array([-gx, -gy, gz])
+        # Sim reports all three gyro axes sign-flipped vs FRD convention:
+        # +xgyro = roll LEFT (not roll-right), +ygyro = nose DOWN (not nose-up),
+        # +zgyro = yaw LEFT (not yaw-right).  Negate all three so the EKF and
+        # controller receive standard FRD rates where +r = yaw right (CW from above).
+        gyro = np.array([-gx, -gy, -gz])
         acc  = np.array([ax, ay, az])
 
         # Gate motor-vibration spikes from the EKF.
@@ -188,6 +204,21 @@ class MAVLinkRX:
         else:
             zupt_applied, zupt_innov = False, 0.0
 
+        # Vision position + velocity + yaw update from PnP (written by vision_rx thread).
+        vis = self.data.pop('_vision_ekf_update', None)
+        if vis is not None:
+            if vis.get('pos_ned') is not None:
+                self._ekf.update_position(
+                    vis['pos_ned'], sigma_pos=vis['sigma_pos'], gate_dist=vis['gate'])
+            if vis.get('vel_ned') is not None:
+                self._ekf.update_velocity(
+                    vis['vel_ned'], sigma_vel=vis['sigma_vel'],
+                    gate_dist=vis['vel_gate'])
+            if vis.get('yaw_ned') is not None:
+                self._ekf.update_yaw(
+                    vis['yaw_ned'], sigma_yaw=vis['sigma_yaw'],
+                    gate_dist=vis.get('yaw_gate', 1.0))
+
         if self.logger:
             self.logger.log_ekf(
                 t_us, now,
@@ -199,9 +230,9 @@ class MAVLinkRX:
             )
 
         self.data['mav_state'] = {
-            'pos_ned':  self._ekf.pos_ned,           # EKF dead-reckoned NED position [m]
+            'pos_ned':  self._ekf.pos_ned,
             'vel_body': np.zeros(3),
-            'vel_ned':  self._ekf.vel_ned,           # EKF NED velocity [vN, vE, vD]
+            'vel_ned':  self._ekf.vel_ned,
             'quat':     self._ekf.quat,
             'rates':    gyro,
             'wall_t':   now,
@@ -222,6 +253,8 @@ class MAVLinkRX:
         (data_type, sim_boot_time_ms, race_start_boot_time_ms,
          race_finish_time_ns, active_gate_index,
          last_gate_race_time) = struct.unpack_from("<BQqqIq", raw_payload)
+        self.data['active_gate_index'] = int(active_gate_index)
+        self.data['race_started']      = (race_start_boot_time_ms > 0)
 
     def on_track_data_packet(self, msg):
         raw_payload = bytes(msg.data)
@@ -241,6 +274,7 @@ class MAVLinkRX:
     def on_track_data(self, payload):
         num_gates, = struct.unpack_from("<H", payload)
         payload = payload[2:]
+        gates = {}
         for i in range(num_gates):
             (gate_id,
              position_ned_x, position_ned_y, position_ned_z,
@@ -248,6 +282,21 @@ class MAVLinkRX:
              orientation_ned_y, orientation_ned_z,
              width, height) = struct.unpack_from("<Hfffffffff", payload)
             payload = payload[38:]
+            gates[int(gate_id)] = {
+                'ned':    np.array([float(position_ned_x),
+                                    float(position_ned_y),
+                                    float(position_ned_z)]),
+                'quat':   np.array([float(orientation_ned_w), float(orientation_ned_x),
+                                    float(orientation_ned_y), float(orientation_ned_z)]),
+                'width':  float(width),
+                'height': float(height),
+            }
+        self.data['track_gates_ned'] = gates
+        if not getattr(self, '_track_printed', False):
+            self._track_printed = True
+            for gid, g in sorted(gates.items()):
+                print(f"[TRACK] gate {gid}: NED={g['ned']}  "
+                      f"{g['width']:.1f}x{g['height']:.1f}m", flush=True)
 
     def on_attitude(self, msg):
         """
@@ -281,7 +330,16 @@ class MAVLinkRX:
                 motor_back_left,  motor_back_right,
             )
 
+    def on_local_position_ned(self, msg):
+        pos = np.array([float(msg.x),  float(msg.y),  float(msg.z)],  dtype=float)
+        vel = np.array([float(msg.vx), float(msg.vy), float(msg.vz)], dtype=float)
+        self.data['_sim_pos_ned'] = pos
+        self.data['_sim_vel_ned'] = vel
+        if self.logger:
+            self.logger.log_position(msg.time_boot_ms,
+                                     msg.x,  msg.y,  msg.z,
+                                     msg.vx, msg.vy, msg.vz)
+
     def on_collision(self, msg):
-        collision_id = msg.id
-        threat_level = msg.threat_level
-        impact       = msg.horizontal_minimum_delta
+        self.data['gate_passed']  = True
+        self.data['last_gate_id'] = int(msg.id)

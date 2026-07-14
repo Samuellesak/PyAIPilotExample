@@ -56,6 +56,7 @@ class CarrotTracker:
 
         self.wp             = 1        # index of current target waypoint
         self.blend_alpha    = 0.0      # exposed for logging / debugging
+        self.carrot_pos     = np.zeros(3)  # carrot NED position, exposed for logging
         self.finished       = False
 
     # ------------------------------------------------------------------
@@ -101,23 +102,22 @@ class CarrotTracker:
 
         self.blend_alpha = alpha
 
-        # --- advance waypoint when carrot passes segment end OR drone is
-        # within c metres of the waypoint (buffer for off-path approaches).
-        dist_to_wp = float(np.linalg.norm(pos - r1))
-        if lambda_L + self.c >= seg_length or dist_to_wp < self.c:
-            if WP + 1 < self.n_waypoints - 1:
-                self.wp += 1
-            elif WP + 1 == self.n_waypoints - 1:
-                # entering the last segment
-                self.wp += 1
-            else:
-                # arrived at final waypoint
-                self.finished    = True
-                self._last_psi   = self._yaw(ea)
-                return np.zeros(3), self._last_psi
+        # Waypoint advance is driven exclusively by the COLLISION signal from the
+        # sim (controller calls self.wp += 1 when gate_passed fires).  Automatic
+        # distance-based advance is disabled: the locked gate NED must remain the
+        # target until the drone physically passes through it.
 
-        v_ned_ref     = self.v_ref * ea_blend
-        psi_ref       = self._yaw(ea_blend)
+        # --- carrot position: foot on segment + c metres in blended direction --
+        # Velocity points from the drone's current 3-D position toward the carrot,
+        # which gives automatic cross-track correction when the drone drifts off the
+        # path — the lateral displacement pulls the velocity reference sideways.
+        foot         = r0 + lambda_L * ea
+        rC           = foot + self.c * ea_blend
+        self.carrot_pos = rC
+
+        to_carrot, _ = self._unit(rC - pos)
+        v_ned_ref     = self.v_ref * to_carrot
+        psi_ref       = self._yaw(to_carrot)
         self._last_psi = psi_ref
 
         return v_ned_ref, psi_ref

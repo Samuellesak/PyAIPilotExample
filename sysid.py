@@ -109,7 +109,7 @@ class DataCollector:
         t_us = msg.time_usec
         now  = time.time()
 
-        gyro = np.array([gx, gy, gz])
+        gyro = np.array([-gx, -gy, -gz])   # all three axes sign-flipped vs FRD (matches mavlink_rx.py)
         acc  = np.array([ax, ay, az])
 
         dt = (now - self._last_imu_t) if self._last_imu_t is not None else 0.004

@@ -52,6 +52,7 @@ class Logger:
         self._carrot = {
             "t": [], "wp": [], "alpha": [],
             "vcx": [], "vcy": [], "vcz": [],
+            "cx":  [], "cy":  [], "cz":  [],   # carrot NED position
         }
 
         # Cascade controller signal log — one row per control tick (~250 Hz)
@@ -111,6 +112,25 @@ class Logger:
             "FL": [], "FR": [], "BL": [], "BR": [],
         }
 
+        # Vision / YOLO / PnP log — one row per processed camera frame
+        self._vision = {
+            "wall_t": [], "frame_id": [], "detected": [],
+            # YOLO outputs
+            "conf": [],
+            "bb_cx": [], "bb_cy": [], "bb_w": [], "bb_h": [],
+            # Keypoint pixel coordinates (4 corners: TL TR BR BL)
+            "kp0x": [], "kp0y": [], "kp1x": [], "kp1y": [],
+            "kp2x": [], "kp2y": [], "kp3x": [], "kp3y": [],
+            # PnP output: gate in OpenCV camera frame [m]
+            "pnp_ok": [],
+            "tvec_x": [], "tvec_y": [], "tvec_z": [],   # z = forward distance
+            # Drone NED position derived from PnP + known gate NED
+            "pos_N": [], "pos_E": [], "pos_D": [],
+            # Velocity derived from consecutive PnP positions
+            "vel_ok": [],
+            "vel_N": [], "vel_E": [], "vel_D": [], "speed_ms": [],
+        }
+
         print(f"Logger: session directory -> {self.session_dir}")
 
     # ------------------------------------------------------------------
@@ -138,6 +158,8 @@ class Logger:
                 self._ekf[key].clear()
             for key in self._motors:
                 self._motors[key].clear()
+            for key in self._vision:
+                self._vision[key].clear()
 
     def log_mavlink(self, msg):
         """Append one MAVLink message to the text log."""
@@ -170,7 +192,7 @@ class Logger:
             d["u0"].append(float(u[0])); d["u1"].append(float(u[1]))
             d["u2"].append(float(u[2])); d["u3"].append(float(u[3]))
 
-    def log_carrot(self, time_ms, wp, alpha, v_cmd):
+    def log_carrot(self, time_ms, wp, alpha, v_cmd, carrot_pos=None):
         """Accumulate one carrot-tracker sample."""
         with self._lock:
             d = self._carrot
@@ -180,6 +202,10 @@ class Logger:
             d["vcx"].append(float(v_cmd[0]))
             d["vcy"].append(float(v_cmd[1]))
             d["vcz"].append(float(v_cmd[2]))
+            cp = carrot_pos if carrot_pos is not None else [float('nan')] * 3
+            d["cx"].append(float(cp[0]))
+            d["cy"].append(float(cp[1]))
+            d["cz"].append(float(cp[2]))
 
     def log_ekf(self, t_us, wall_t, x, P_diag,
                 acc_applied, acc_innov,
@@ -256,14 +282,78 @@ class Logger:
             d["FL"].append(float(FL)); d["FR"].append(float(FR))
             d["BL"].append(float(BL)); d["BR"].append(float(BR))
 
-    def log_frame(self, frame_id, img):
-        """Save every 100th decoded camera frame as JPEG."""
+    def log_frame(self, frame_id, img, force=False, suffix=""):
+        """
+        Save a camera frame as JPEG.
+        force=True  : always save (used for detected gates).
+        suffix      : optional filename suffix, e.g. "_mask" for orange-mask images.
+        Otherwise saves every 30th frame.
+        """
         with self._lock:
             self._frame_count += 1
-            save_this = (self._frame_count % 100 == 0)
+            save_this = force or (self._frame_count % 30 == 0)
         if save_this:
-            path = os.path.join(self.frames_dir, f"frame_{frame_id:06d}.jpg")
+            path = os.path.join(self.frames_dir, f"frame_{frame_id:06d}{suffix}.jpg")
             cv2.imwrite(path, img)
+
+    def log_vision(self, wall_t, frame_id, detected,
+                   conf=0.0, bb=None, corners=None,
+                   tvec=None, drone_ned=None, vel_ned=None):
+        """
+        Accumulate one vision/YOLO/PnP sample (called at camera frame rate).
+
+        bb       : (cx_px, cy_px, w_px, h_px) bounding box or None
+        corners  : (4, 2) ndarray of keypoint pixel coords (TL TR BR BL) or None
+        tvec     : (3,) gate position in OpenCV camera frame [m] or None
+        drone_ned: (3,) drone NED position estimate from PnP or None
+        vel_ned  : (3,) drone NED velocity estimate from PnP differencing or None
+        """
+        _nan = float("nan")
+        with self._lock:
+            d = self._vision
+            d["wall_t"].append(float(wall_t))
+            d["frame_id"].append(int(frame_id))
+            d["detected"].append(int(detected))
+            d["conf"].append(float(conf) if detected else _nan)
+            # Bounding box
+            if bb is not None and detected:
+                d["bb_cx"].append(float(bb[0])); d["bb_cy"].append(float(bb[1]))
+                d["bb_w"].append(float(bb[2]));  d["bb_h"].append(float(bb[3]))
+            else:
+                d["bb_cx"].append(_nan); d["bb_cy"].append(_nan)
+                d["bb_w"].append(_nan);  d["bb_h"].append(_nan)
+            # Keypoints
+            if corners is not None and detected:
+                for i, (kx, ky) in enumerate(corners[:4]):
+                    d[f"kp{i}x"].append(float(kx))
+                    d[f"kp{i}y"].append(float(ky))
+            else:
+                for i in range(4):
+                    d[f"kp{i}x"].append(_nan); d[f"kp{i}y"].append(_nan)
+            # PnP
+            pnp_ok = tvec is not None
+            d["pnp_ok"].append(int(pnp_ok))
+            if pnp_ok:
+                d["tvec_x"].append(float(tvec[0])); d["tvec_y"].append(float(tvec[1]))
+                d["tvec_z"].append(float(tvec[2]))
+            else:
+                d["tvec_x"].append(_nan); d["tvec_y"].append(_nan); d["tvec_z"].append(_nan)
+            # Drone NED from PnP
+            if drone_ned is not None and pnp_ok:
+                d["pos_N"].append(float(drone_ned[0])); d["pos_E"].append(float(drone_ned[1]))
+                d["pos_D"].append(float(drone_ned[2]))
+            else:
+                d["pos_N"].append(_nan); d["pos_E"].append(_nan); d["pos_D"].append(_nan)
+            # Velocity
+            vel_ok = vel_ned is not None
+            d["vel_ok"].append(int(vel_ok))
+            if vel_ok:
+                d["vel_N"].append(float(vel_ned[0])); d["vel_E"].append(float(vel_ned[1]))
+                d["vel_D"].append(float(vel_ned[2]))
+                d["speed_ms"].append(float(np.linalg.norm(vel_ned)))
+            else:
+                d["vel_N"].append(_nan); d["vel_E"].append(_nan)
+                d["vel_D"].append(_nan); d["speed_ms"].append(_nan)
 
     # ------------------------------------------------------------------
     # Call once at the end of the flight
@@ -291,6 +381,8 @@ class Logger:
         self._write_carrot_csv()
         self._write_ekf_csv()
         self._write_cascade_csv()
+        self._write_vision_csv()
+        self._plot_vision()
         print(f"Logger: all data saved to {self.session_dir}")
 
     # ------------------------------------------------------------------
@@ -491,7 +583,8 @@ class Logger:
 
         t = (np.array(d["t"]) - d["t"][0]) / 1e3  # ms -> seconds
 
-        fig, (ax_wp, ax_v) = plt.subplots(2, 1, figsize=(13, 6), sharex=True)
+        fig, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
+        ax_wp, ax_v, ax_c = axes
 
         ax_wp.step(t, d["wp"],    label="waypoint index", where="post", linewidth=1.2)
         ax_wp.plot(t, d["alpha"], label="blend α",        linewidth=0.8, linestyle="--")
@@ -504,10 +597,18 @@ class Logger:
         ax_v.plot(t, d["vcy"], label="vc_E", linewidth=0.8)
         ax_v.plot(t, d["vcz"], label="vc_D", linewidth=0.8)
         ax_v.set_ylabel("Reference velocity (m/s)")
-        ax_v.set_xlabel("Time (s)")
         ax_v.set_title("Carrot Reference Velocity (NED)")
         ax_v.legend(loc="upper left")
         ax_v.grid(True, alpha=0.4)
+
+        ax_c.plot(t, d["cx"], label="carrot_N", linewidth=0.8)
+        ax_c.plot(t, d["cy"], label="carrot_E", linewidth=0.8)
+        ax_c.plot(t, d["cz"], label="carrot_D", linewidth=0.8)
+        ax_c.set_ylabel("Carrot NED position (m)")
+        ax_c.set_xlabel("Time (s)")
+        ax_c.set_title("Carrot Position (NED)")
+        ax_c.legend(loc="upper left")
+        ax_c.grid(True, alpha=0.4)
 
         plt.tight_layout()
         out = os.path.join(self.session_dir, "carrot.png")
@@ -562,7 +663,9 @@ class Logger:
         t0 = d["t"][0]
         out = os.path.join(self.session_dir, "carrot.csv")
         with open(out, "w") as f:
-            f.write("time_s,wp,blend_alpha,vc_N_ms,vc_E_ms,vc_D_ms,v_cmd_ms\n")
+            f.write("time_s,wp,blend_alpha,"
+                    "vc_N_ms,vc_E_ms,vc_D_ms,v_cmd_ms,"
+                    "carrot_N_m,carrot_E_m,carrot_D_m\n")
             for i in range(len(d["t"])):
                 t_s   = (d["t"][i] - t0) / 1e3
                 v_mag = (d["vcx"][i]**2 + d["vcy"][i]**2 + d["vcz"][i]**2) ** 0.5
@@ -570,7 +673,8 @@ class Logger:
                     f"{t_s:.4f},"
                     f"{d['wp'][i]},{d['alpha'][i]:.4f},"
                     f"{d['vcx'][i]:.4f},{d['vcy'][i]:.4f},{d['vcz'][i]:.4f},"
-                    f"{v_mag:.4f}\n"
+                    f"{v_mag:.4f},"
+                    f"{d['cx'][i]:.4f},{d['cy'][i]:.4f},{d['cz'][i]:.4f}\n"
                 )
         print(f"Logger: carrot CSV -> {out}")
 
@@ -789,7 +893,8 @@ class Logger:
         Panel 3: 3-D perspective (optional)
         """
         with self._lock:
-            d = {k: list(v) for k, v in self._ekf.items()}
+            d  = {k: list(v) for k, v in self._ekf.items()}
+            dc = {k: list(v) for k, v in self._carrot.items()}
         if not d["t_us"]:
             print("Logger: no EKF data for path plot, skipping.")
             return
@@ -840,6 +945,28 @@ class Logger:
         # Mark start and end of EKF path
         ax_map.plot(pE[0],  pN[0],  "g^", ms=10, zorder=6, label="Start")
         ax_map.plot(pE[-1], pN[-1], "rs", ms=10, zorder=6, label="End")
+
+        # ── Carrot quivers ───────────────────────────────────────────────
+        # Show where the carrot point is and which direction it is commanding,
+        # subsampled to ~40 arrows so the map stays readable.
+        if dc["t"] and len(dc["t"]) >= 2:
+            _n   = len(dc["t"])
+            _step = max(1, _n // 40)
+            _cE  = np.array(dc["cy"])[::_step]    # carrot East  position
+            _cN  = np.array(dc["cx"])[::_step]    # carrot North position
+            _vE  = np.array(dc["vcy"])[::_step]   # velocity East  component
+            _vN  = np.array(dc["vcx"])[::_step]   # velocity North component
+            # Normalise arrow length so scale is independent of v_ref value
+            _spd = np.hypot(_vN, _vE)
+            _mask = _spd > 0.01
+            if _mask.any():
+                ax_map.quiver(
+                    _cE[_mask], _cN[_mask],
+                    _vE[_mask] / _spd[_mask], _vN[_mask] / _spd[_mask],
+                    color="darkorange", alpha=0.75,
+                    scale=25, scale_units="width", width=0.004,
+                    zorder=7, label="Carrot direction",
+                )
 
         ax_map.set_xlabel("East (m)")
         ax_map.set_ylabel("North (m)")
@@ -892,6 +1019,12 @@ class Logger:
             ax3.set_zlabel("Altitude (m)")
             ax3.set_title("3-D EKF Path vs Planned Waypoints")
             ax3.legend(fontsize=8)
+            # Match the 2D top-down convention: East=right, North=up.
+            # azim=90 places the camera north of the scene looking south:
+            # near objects (south) appear at the bottom, far objects (north)
+            # at the top — same as the 2D scatter where positive pN is up.
+            # Camera-right aligns with +X (East), so East also goes right.
+            ax3.view_init(elev=30, azim=90)
 
             out3 = os.path.join(self.session_dir, "path_3d.png")
             plt.savefig(out3, dpi=150)
@@ -1005,3 +1138,113 @@ class Logger:
                     f"{d['T_coll'][i]:.3f},{d['R22'][i]:.4f}\n"
                 )
         print(f"Logger: cascade CSV -> {out}")
+
+    # ── Vision / YOLO / PnP ──────────────────────────────────────────────
+
+    def _write_vision_csv(self):
+        with self._lock:
+            d = {k: list(v) for k, v in self._vision.items()}
+        if not d["wall_t"]:
+            print("Logger: no vision data collected, skipping CSV.")
+            return
+        t0 = d["wall_t"][0]
+        out = os.path.join(self.session_dir, "vision.csv")
+        with open(out, "w") as f:
+            f.write(
+                "time_s,frame_id,detected,conf,"
+                "bb_cx,bb_cy,bb_w,bb_h,"
+                "kp0x,kp0y,kp1x,kp1y,kp2x,kp2y,kp3x,kp3y,"
+                "pnp_ok,tvec_x,tvec_y,tvec_z,"
+                "pos_N,pos_E,pos_D,"
+                "vel_ok,vel_N,vel_E,vel_D,speed_ms\n"
+            )
+            for i in range(len(d["wall_t"])):
+                t_s = d["wall_t"][i] - t0
+
+                def _f(v):
+                    return f"{v:.4f}" if v == v else "nan"   # nan-safe formatter
+
+                f.write(
+                    f"{t_s:.4f},{d['frame_id'][i]},{d['detected'][i]},{_f(d['conf'][i])},"
+                    f"{_f(d['bb_cx'][i])},{_f(d['bb_cy'][i])},"
+                    f"{_f(d['bb_w'][i])},{_f(d['bb_h'][i])},"
+                    f"{_f(d['kp0x'][i])},{_f(d['kp0y'][i])},"
+                    f"{_f(d['kp1x'][i])},{_f(d['kp1y'][i])},"
+                    f"{_f(d['kp2x'][i])},{_f(d['kp2y'][i])},"
+                    f"{_f(d['kp3x'][i])},{_f(d['kp3y'][i])},"
+                    f"{d['pnp_ok'][i]},{_f(d['tvec_x'][i])},{_f(d['tvec_y'][i])},{_f(d['tvec_z'][i])},"
+                    f"{_f(d['pos_N'][i])},{_f(d['pos_E'][i])},{_f(d['pos_D'][i])},"
+                    f"{d['vel_ok'][i]},{_f(d['vel_N'][i])},{_f(d['vel_E'][i])},{_f(d['vel_D'][i])},{_f(d['speed_ms'][i])}\n"
+                )
+        print(f"Logger: vision CSV -> {out}")
+
+    def _plot_vision(self):
+        with self._lock:
+            d = {k: list(v) for k, v in self._vision.items()}
+        if not d["wall_t"] or not any(d["detected"]):
+            print("Logger: no gate detections in vision log, skipping plot.")
+            return
+
+        t0  = d["wall_t"][0]
+        t   = np.array(d["wall_t"]) - t0
+        det = np.array(d["detected"], dtype=bool)
+
+        # NaN-safe arrays for detected-only metrics
+        conf    = np.array(d["conf"],    dtype=float)
+        dist    = np.array(d["tvec_z"], dtype=float)   # forward distance [m]
+        pnp_ok  = np.array(d["pnp_ok"], dtype=bool)
+        vel_ok  = np.array(d["vel_ok"], dtype=bool)
+        pos_N   = np.array(d["pos_N"],  dtype=float)
+        pos_E   = np.array(d["pos_E"],  dtype=float)
+        pos_D   = np.array(d["pos_D"],  dtype=float)
+        speed   = np.array(d["speed_ms"], dtype=float)
+
+        fig, axes = plt.subplots(4, 1, figsize=(14, 16), sharex=True)
+
+        # Panel 0: Detection flag + confidence
+        ax = axes[0]
+        ax.fill_between(t, 0, det.astype(float), step="post",
+                        alpha=0.3, color="tab:green", label="detected")
+        ax2 = ax.twinx()
+        ax2.plot(t[det], conf[det], ".", ms=3, color="tab:blue", label="confidence")
+        ax2.set_ylim(0, 1.05)
+        ax2.set_ylabel("Confidence")
+        ax.set_ylabel("Detected (0/1)")
+        ax.set_title("YOLO Gate Detection — rate and confidence")
+        lines1, labs1 = ax.get_legend_handles_labels()
+        lines2, labs2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labs1 + labs2, loc="upper right", fontsize=7)
+        ax.grid(True, alpha=0.4)
+
+        # Panel 1: Gate forward distance from PnP (tvec_z)
+        ax = axes[1]
+        ax.plot(t[pnp_ok], dist[pnp_ok], ".", ms=2, color="tab:orange", label="distance (m)")
+        ax.set_ylabel("Gate distance [m]")
+        ax.set_title("PnP — forward distance to gate (tvec_z)")
+        ax.legend(loc="upper right", fontsize=7)
+        ax.grid(True, alpha=0.4)
+
+        # Panel 2: Drone NED position estimate from PnP
+        ax = axes[2]
+        ax.plot(t[pnp_ok], pos_N[pnp_ok], ".", ms=2, label="pos_N (m)")
+        ax.plot(t[pnp_ok], pos_E[pnp_ok], ".", ms=2, label="pos_E (m)")
+        ax.plot(t[pnp_ok], -pos_D[pnp_ok], ".", ms=2, label="altitude -pos_D (m)")
+        ax.set_ylabel("Position (m)")
+        ax.set_title("PnP Drone NED Position Estimate")
+        ax.legend(loc="upper right", fontsize=7)
+        ax.grid(True, alpha=0.4)
+
+        # Panel 3: Speed from PnP velocity (consecutive frames only)
+        ax = axes[3]
+        ax.plot(t[vel_ok], speed[vel_ok], ".", ms=2, color="tab:red", label="speed (m/s)")
+        ax.set_ylabel("Speed (m/s)")
+        ax.set_xlabel("Time (s)")
+        ax.set_title("PnP Velocity Estimate — speed (consecutive frames only)")
+        ax.legend(loc="upper right", fontsize=7)
+        ax.grid(True, alpha=0.4)
+
+        plt.tight_layout()
+        out = os.path.join(self.session_dir, "vision.png")
+        plt.savefig(out, dpi=150)
+        plt.close(fig)
+        print(f"Logger: vision plot -> {out}")

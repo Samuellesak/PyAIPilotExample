@@ -137,6 +137,72 @@ class QuadEKF:
         self._apply_update(innov, H, self._R_z)
         return True, float(np.linalg.norm(innov))
 
+    def update_position(self, pos_ned_meas, sigma_pos=0.5, gate_dist=10.0):
+        """
+        NED position measurement from visual PnP against a known gate landmark.
+        Rejects innovations larger than gate_dist metres (outlier/bad PnP).
+        Returns (applied: bool, innov_norm: float).
+        """
+        innov = np.asarray(pos_ned_meas, dtype=float) - self.x[self._IP]
+        innov_norm = float(np.linalg.norm(innov))
+        if innov_norm > gate_dist:
+            return False, innov_norm
+
+        H       = np.zeros((3, self.N))
+        H[0, 0] = H[1, 1] = H[2, 2] = 1.0   # measures position states 0:3
+        R       = (sigma_pos ** 2) * np.eye(3)
+
+        self._apply_update(innov, H, R)
+        self.x[self._IQ] /= np.linalg.norm(self.x[self._IQ])
+        return True, innov_norm
+
+    def update_velocity(self, vel_ned_meas, sigma_vel=1.0, gate_dist=5.0):
+        """
+        NED velocity measurement derived from finite-differencing consecutive PnP positions.
+        Rejects innovations larger than gate_dist m/s (outlier/dropped frame).
+        Returns (applied: bool, innov_norm: float).
+        """
+        innov = np.asarray(vel_ned_meas, dtype=float) - self.x[self._IV]
+        innov_norm = float(np.linalg.norm(innov))
+        if innov_norm > gate_dist:
+            return False, innov_norm
+
+        H       = np.zeros((3, self.N))
+        H[0, 3] = H[1, 4] = H[2, 5] = 1.0   # measures velocity states 3:6
+        R       = (sigma_vel ** 2) * np.eye(3)
+
+        self._apply_update(innov, H, R)
+        return True, innov_norm
+
+    def update_yaw(self, yaw_meas, sigma_yaw=0.1, gate_dist=np.pi):
+        """
+        NED yaw measurement [rad] from PnP + known gate orientation.
+        Uses the linearised Jacobian of yaw(q) w.r.t. the quaternion state.
+        Wraps innovation to [-π, π].  Rejects |innov| > gate_dist.
+        Returns (applied: bool, innov_abs: float).
+        """
+        qw, qx, qy, qz = self.x[self._IQ]
+        f = 2.0 * (qw * qz + qx * qy)
+        g = 1.0 - 2.0 * (qy * qy + qz * qz)
+        yaw_est = float(np.arctan2(f, g))
+
+        innov = float(yaw_meas) - yaw_est
+        innov = (innov + np.pi) % (2.0 * np.pi) - np.pi   # wrap to [-π, π]
+        if abs(innov) > gate_dist:
+            return False, abs(innov)
+
+        denom = f * f + g * g + 1e-12
+        H = np.zeros((1, self.N))
+        H[0, 6] = 2.0 * qz * g / denom
+        H[0, 7] = 2.0 * qy * g / denom
+        H[0, 8] = (2.0 * qx * g + 4.0 * qy * f) / denom
+        H[0, 9] = (2.0 * qw * g + 4.0 * qz * f) / denom
+
+        R = np.array([[sigma_yaw ** 2]])
+        self._apply_update(np.array([innov]), H, R)
+        self.x[self._IQ] /= np.linalg.norm(self.x[self._IQ])
+        return True, abs(innov)
+
     def reset(self):
         """Reset to identity attitude, zero velocity, zero bias, zero position."""
         self.x[:] = 0.
