@@ -3,7 +3,6 @@ import numpy as np
 from pymavlink import mavutil
 
 from carrot_tracker import CarrotTracker
-from lqi import quat_to_yaw
 
 MAVLINK_CMD_SIM_RESET = 31000
 CONTROL_HZ            = 250
@@ -15,17 +14,13 @@ DT                    = 1.0 / CONTROL_HZ
 PSI_RATE_MAX = np.deg2rad(90)
 
 # ── Launch sequence ────────────────────────────────────────────────────
-# 1. WAIT  : motors idle on slope, IMU settles, integrators stay clean
-# 2. TRACK : cascade runs immediately; carrot velocity ramps 0 → v_ned_ref
-WAIT_PHASE_SEC   = 3.5    # seconds to sit on slope before cascade starts
-                          # must be long enough for the complementary filter
-                          # to converge to the actual slope tilt (~3× filter τ)
-CARROT_RAMP_SEC  = 3.0    # ramp carrot velocity from 0 → v_ned_ref over this long
+# 1. WAIT  : motors idle on slope, IMU settles, gyro/acc bias accumulated
+# 2. BLIP  : high-thrust burst lifts the drone off the slope
+# 3. TRACK : cascade + carrot tracker activate immediately after the blip
+WAIT_PHASE_SEC   = 3.5    # seconds to sit on slope before blip fires
 INTEGRATE_DELAY    = 2.0    # horizontal (N/E) integrator delay after hover entry
                             # prevents windup: drone hits 3+ m/s during slope release
 INTEGRATE_DELAY_V  = 0.0    # vertical (D) integrator delay — activate immediately
-                            # so altitude drift is corrected without waiting 2 s
-HOVER_HOLD_SEC     = 1.0    # hold hover this long [s] before carrot tracker activates
 
 
 def _rot_from_quat(q):
@@ -53,45 +48,8 @@ class Controller:
         # Carrot tracker
         self.tracker = CarrotTracker(param)
 
-        # ── Cascade controller: analytical gains from physical parameters ──
-        m_motor = param.get('m_motor', 0.050)
-        L       = param['L']
-        kappa   = param['kappa']
-        m_frame = param['m'] - 4.0 * m_motor
-        d       = L / np.sqrt(2.0)
-        Ixx     = 2.0 * m_motor * L**2 + m_frame * L**2 / 6.0
-        Iyy     = Ixx
-        Izz     = 4.0 * m_motor * L**2 + m_frame * L**2 / 3.0
-
-        # Mixer: M @ [T1,T2,T3,T4] = [T_total, tau_x, tau_y, tau_z]
-        # Motor layout (dyn.py / thrust_test.py confirmed):
-        #   T1=BR, T2=BL, T3=FL, T4=FR
-        #   Send order: [T3,T4,T2,T1] → sim actuators [0=FL,1=FR,2=BL,3=BR]
-        # tau_y = d*(T3+T4-T1-T2): positive tau_y = more FRONT (T3,T4) = NOSE UP
-        # Confirmed by thrust_test.py leveling controller (working, tested).
-        self._M_inv = np.linalg.inv(np.array([
-            [1,       1,       1,       1      ],
-            [-d,      d,       d,      -d      ],   # roll:  more BL+FL (left) = roll right
-            [-d,     -d,       d,       d      ],   # pitch: more FL+FR (front) = nose up
-            [kappa, -kappa,  kappa,  -kappa    ],   # yaw
-        ]))
-
-        # Inner loop: proportional rate controller, bandwidth method
-        # K_rate = rate_bw * I.  If K_rate_roll_override > 0 in params.yaml,
-        # it is used directly (lets you tune without knowing the true inertia).
-        rate_bw            = float(param.get('rate_bandwidth', 8.0))
-        self._K_rate_roll  = rate_bw * Ixx   # N·m / (rad/s)
-        self._K_rate_pitch = rate_bw * Iyy
-        self._K_rate_yaw   = rate_bw * Izz
-        override_roll  = float(param.get('K_rate_roll_override',  0.0))
-        override_pitch = float(param.get('K_rate_pitch_override', 0.0))
-        if override_roll  > 0.0: self._K_rate_roll  = override_roll
-        if override_pitch > 0.0: self._K_rate_pitch = override_pitch
         print(
-            f"[Controller] Ixx={Ixx:.5f} Iyy={Iyy:.5f} Izz={Izz:.5f} kg·m²  "
-            f"rate_bw={rate_bw}  "
-            f"K_rate_roll={self._K_rate_roll:.5f}  K_rate_pitch={self._K_rate_pitch:.5f}  "
-            f"K_rate_yaw={self._K_rate_yaw:.5f}  K_att={param['K_att']}",
+            f"[Controller] K_att={param['K_att']}  K_psi={param['K_psi']}",
             flush=True
         )
 
@@ -109,6 +67,10 @@ class Controller:
         self._g        = param['g']
 
         self._hover_only = bool(param.get('hover_only', False))
+        self._debug_waypoints_only = bool(param.get('debug_waypoints_only', False))
+        if self._debug_waypoints_only:
+            print("[Controller] debug_waypoints_only=true — "
+                  "gate overrides and visual yaw disabled", flush=True)
         if self._hover_only:
             print("[Controller] hover_only=true — carrot tracker disabled, "
                   "drone will hold altitude indefinitely", flush=True)
@@ -128,17 +90,29 @@ class Controller:
         self._vE_filt      = 0.0                    # filtered EKF vE [m/s]
         self._vD_filt      = 0.0                    # filtered EKF vD [m/s]
         self._T_coll_filt  = 4.0 * self.T_hover     # filtered collective [N]
-        self._TAU_VH       = 0.15                   # horizontal velocity filter τ [s]
-        self._TAU_VD       = 0.40                   # vertical velocity filter τ [s]
+        self._TAU_VH       = float(param.get('tau_vel_h', 0.15))   # horizontal velocity filter τ [s]
+        self._TAU_VD       = float(param.get('tau_vel_d', 0.15))   # vertical   velocity filter τ [s]
         self._TAU_T_COLL   = 0.30                   # T_coll output filter τ [s]
 
         # Rate-limited yaw command — initialised at measured yaw on first update
         self._psi_cmd = None
 
+        # Vision-bearing hold: keep last locked tvec for brief YOLO flicker suppression.
+        # Cleared when pnp_locked drops (gate truly lost) or age exceeds the limit.
+        self._vis_tvec_hold     = None   # last valid locked tvec_cam (3,) or None
+        self._vis_tvec_hold_age = 0      # frames since last fresh locked measurement
+        self._vis_hold_frames   = int(param.get('vision_hold_frames', 5))
+
+        # PT2 filter on the velocity reference — smooths step-changes when switching
+        # between carrot and vision-bearing modes so direction changes are gradual.
+        self._pt2_omega0  = float(param.get('vision_ref_omega0', 0.375))   # [rad/s]
+        self._pt2_zeta    = float(param.get('vision_ref_zeta',   1.0))
+        self._v_ref_pt2_x = np.zeros(3)   # filter output (position state)
+        self._v_ref_pt2_v = np.zeros(3)   # filter derivative state
+
         # Launch-sequence bookkeeping
         self._t_start        = None   # wall-clock time of first valid state
         self._carrot_active  = False  # True after first frame in carrot mode
-        self._t_carrot_start = None   # wall-clock time of carrot activation
         self._hover_entered  = False  # True after first HOVER tick (triggers one-shot reset)
         self._hover_entry_t  = None   # wall-clock time of hover entry (for integrate delay)
 
@@ -225,7 +199,7 @@ class Controller:
             sim_speed = float('nan')
 
         # --- first-state initialisation --------------------------------
-        psi_meas = quat_to_yaw(quat)
+        _, _, psi_meas = quat_to_euler(quat)
         if self._t_start is None:
             # _psi_cmd is set at hover entry (not here) so it reflects the actual
             # heading after the WAIT phase has settled, not the noisy slope reading
@@ -239,10 +213,11 @@ class Controller:
         if t_elapsed < WAIT_PHASE_SEC:
             if _now - getattr(self, '_last_wait_diag_t', 0.0) >= 0.5:
                 self._last_wait_diag_t = _now
-                qw, qx, qy, qz = quat
-                phi_deg   = np.degrees(np.arctan2(2*(qw*qx+qy*qz), 1-2*(qx*qx+qy*qy)))
-                theta_deg = np.degrees(np.arcsin(np.clip(2*(qw*qy-qz*qx), -1, 1)))
-                R22_w = max(0.3, 1.0 - 2*(qx*qx + qy*qy))
+                _phi_w, _theta_w, _ = quat_to_euler(quat)
+                phi_deg   = np.degrees(_phi_w)
+                theta_deg = np.degrees(_theta_w)
+                _, _qx_w, _qy_w, _ = quat
+                R22_w = max(0.3, 1.0 - 2*(_qx_w*_qx_w + _qy_w*_qy_w))
                 print(f"[WAIT t={t_elapsed:.2f}s]  "
                       f"roll={phi_deg:.1f}°  pitch={theta_deg:.1f}°  R22={R22_w:.3f}  "
                       f"rates=({rates[0]:.2f},{rates[1]:.2f},{rates[2]:.2f})  "
@@ -263,7 +238,7 @@ class Controller:
         if not self._hover_entered:
             self._hover_entered          = True
             self._hover_entry_t          = time.time()
-            self._psi_cmd                = quat_to_yaw(quat)   # hold this heading
+            self._psi_cmd = np.deg2rad(float(self.param.get('initial_yaw_deg', 0.0)))
             self.xi_vel                  = np.zeros(3)
             self.xi_psi                  = 0.0
             if self._controller_type == 2:
@@ -284,13 +259,12 @@ class Controller:
             if _s is not None:
                 _s['vel_ned'] = np.zeros(3)
             print(f"[CONTROLLER] Hover entry — psi_cmd={np.degrees(self._psi_cmd):.1f}°  "
-                  f"integrators/filters/EKF-vel reset  ZUPT disabled  "
-                  f"carrot activates in {HOVER_HOLD_SEC:.0f}s",
+                  f"integrators/filters/EKF-vel reset  ZUPT disabled",
                   flush=True)
 
         # Hover vs carrot phase.
         hover_elapsed = (time.time() - self._hover_entry_t) if self._hover_entry_t else 0.0
-        in_hover = self._hover_only or hover_elapsed < HOVER_HOLD_SEC
+        in_hover = self._hover_only
 
         # ── Liftoff blip: high-thrust burst right at WAIT→HOVER transition ──
         # All four motors commanded equally (no rate setpoints) for pure vertical force.
@@ -318,31 +292,112 @@ class Controller:
             # Carrot tracking: use EKF position to follow the waypoint path.
             if not self._carrot_active:
                 self._carrot_active  = True
-                self._t_carrot_start = time.time()
+                # params.yaml waypoints are in WORLD NED (WP0 = launch point).
+                # The EKF has been zeroed to LOCAL NED at hover entry.  Convert
+                # all waypoints to local once so the tracker stays frame-consistent.
+                _off = self.data.get('pos_offset_ned', np.zeros(3))
+                # Only shift N and E axes.  The D (altitude) offset reflects that
+                # the launch slope sits ~4-5 m above the track floor (WORLD D=0).
+                # Applying the full D offset would place every waypoint 4-5 m below
+                # hover, commanding a steep dive that crashes the drone.  Zeroing
+                # the D offset keeps the path flat at hover altitude (LOCAL D≈0).
+                _off_lateral = np.array([_off[0], _off[1], 0.0])
+                self.tracker.waypoints = [np.asarray(wp, dtype=float) - _off_lateral
+                                          for wp in self.tracker.waypoints]
+                # Resync velocity filter to actual EKF velocity.  The filter was
+                # zeroed at hover entry and never updated during the blip (early
+                # return), so without this it starts at 0 and takes several seconds
+                # to catch up — producing near-zero tilt commands while real velocity
+                # is already building from the blip.
+                _v0 = state.get('vel_ned', np.zeros(3))
+                self._vN_filt = float(_v0[0])
+                self._vE_filt = float(_v0[1])
+                self._vD_filt = float(_v0[2])
                 print(f"[CONTROLLER] Carrot activated  wp={self.tracker.wp}/"
-                      f"{self.tracker.n_waypoints-1}", flush=True)
-            t_carrot = time.time() - self._t_carrot_start
-            alpha = min(1.0, t_carrot / CARROT_RAMP_SEC)
-
+                      f"{self.tracker.n_waypoints-1}  "
+                      f"waypoints shifted lateral-only (NE offset={_off[:2]}, D zeroed)  "
+                      f"vel_filt resynced to ({_v0[0]:.2f},{_v0[1]:.2f},{_v0[2]:.2f})m/s",
+                      flush=True)
+                self._v_ref_pt2_x = np.asarray(_v0, dtype=float).copy()
+                self._v_ref_pt2_v = np.zeros(3)
             det = self.data.get('gate_detection', {})
-            # Refine target waypoint to exact sim gate NED when YOLO+PnP locks on.
-            if det.get('detected') and det.get('tvec_cam') is not None:
-                gate_ned = self._active_gate_ned()
-                if gate_ned is not None:
-                    self.tracker.waypoints[self.tracker.wp] = gate_ned
+            # Refine target waypoint to PnP-measured gate position in local NED.
+            # gate_local = pos_ned (EKF local) + R_b2n @ R_cam2body @ tvec_cam
+            # This uses only what the camera sees — no track data dependency.
+            if not self._debug_waypoints_only:
+                if det.get('detected') and det.get('tvec_cam') is not None:
+                    _tvec = np.asarray(det['tvec_cam'], dtype=float)
+                    # cam→body: body_x=cam_z(fwd), body_y=cam_x(right), body_z=cam_y(down)
+                    _t_body = np.array([_tvec[2], _tvec[0], _tvec[1]])
+                    R_bn = _rot_from_quat(quat)
+                    R_nb = R_bn.T
+                    self.tracker.waypoints[self.tracker.wp] = pos_ned + R_nb @ _t_body
+
+            # Update next waypoint from vision-confirmed second-gate NED position.
+            # Only applied once position is stable (median over next_gate_min_frames).
+            _ng_ned = self.data.get('next_gate_ned')
+            if _ng_ned is not None:
+                _wp_next = self.tracker.wp + 1
+                if _wp_next < self.tracker.n_waypoints:
+                    self.tracker.waypoints[_wp_next] = np.asarray(_ng_ned, dtype=float)
 
             v_ned_ref_carrot, psi_ref_carrot = self.tracker.update(pos_ned)
-            v_ref_for_gains = alpha * np.array([v_ned_ref_carrot[0],
-                                                v_ned_ref_carrot[1],
-                                                v_ned_ref_carrot[2]])
+            v_ref_for_gains = v_ned_ref_carrot
+
+            # Vision-bearing override: replace NE components of v_ned_ref with a
+            # direction from the PnP gate bearing — bypasses EKF position drift.
+            # Uses last known tvec for up to vision_hold_frames frames so brief YOLO
+            # flicker doesn't snap control back to the carrot on every missed frame.
+            _fresh_tvec = (det.get('tvec_cam')
+                           if (det.get('pnp_locked') and not self._debug_waypoints_only)
+                           else None)
+
+            # Publish current mode for the vision debug overlay.
+            self.data['vis_ctrl_mode'] = (
+                'PNP'    if _fresh_tvec is not None
+                else 'HOLD'   if self._vis_tvec_hold is not None
+                else 'CARROT'
+            )
+
+            if _fresh_tvec is not None:
+                # Fresh locked measurement — update cache and reset age.
+                self._vis_tvec_hold     = np.asarray(_fresh_tvec, dtype=float)
+                self._vis_tvec_hold_age = 0
+            elif det.get('pnp_locked') and self._vis_tvec_hold is not None:
+                # Gate locked but YOLO flickered this frame — age the cache.
+                self._vis_tvec_hold_age += 1
+                if self._vis_tvec_hold_age > self._vis_hold_frames:
+                    self._vis_tvec_hold = None   # held too long, yield to carrot
+            else:
+                # Lock dropped (gate truly lost) — discard cache immediately.
+                self._vis_tvec_hold     = None
+                self._vis_tvec_hold_age = 0
+
+            if self._vis_tvec_hold is not None:
+                _tvec_v  = self._vis_tvec_hold
+                # cam→body: x_b(fwd)=cam_z, y_b(right)=cam_x
+                _horiz_v = float(np.sqrt(_tvec_v[2]**2 + _tvec_v[0]**2))
+                if _horiz_v > 1.0:   # gate at least 1 m away horizontally
+                    _dir_xb = _tvec_v[2] / _horiz_v   # body-forward component
+                    _dir_yb = _tvec_v[0] / _horiz_v   # body-right  component
+                    _psi_v  = quat_to_euler(quat)[2]
+                    _cp, _sp = np.cos(_psi_v), np.sin(_psi_v)
+                    _dir_n  =  _cp * _dir_xb - _sp * _dir_yb
+                    _dir_e  =  _sp * _dir_xb + _cp * _dir_yb
+                    v_ref_for_gains = np.array([
+                        self.tracker.v_ref * _dir_n,
+                        self.tracker.v_ref * _dir_e,
+                        v_ned_ref_carrot[2],
+                    ])
 
             # Visual yaw correction from orange centroid (bearing-only).
             # When the centroid is available, blend the carrot psi toward the
             # camera bearing so the drone points its nose at the detected orange blob.
-            cx_det = det.get('centre_px')
+            cx_det = None if self._debug_waypoints_only else det.get('centre_px')
             if cx_det is not None:
                 dx_px = float(cx_det[0]) - self.param.get('cam_cx', 320.0)
-                psi_vis = _wrap_pi(quat_to_yaw(quat) +
+                _cur_yaw = quat_to_euler(quat)[2]
+                psi_vis = _wrap_pi(_cur_yaw +
                                    np.arctan2(dx_px, self.param.get('cam_fx', 320.0)))
                 dpsi_vis = _wrap_pi(psi_vis - psi_ref_carrot)
                 _VIS_BLEND = 0.4   # weight of visual bearing vs carrot waypoint yaw
@@ -353,34 +408,45 @@ class Controller:
             self._psi_cmd = _wrap_pi(
                 self._psi_cmd + np.clip(dpsi, -PSI_RATE_MAX * _actual_dt,
                                                PSI_RATE_MAX * _actual_dt))
-            if self._logger is not None:
-                self._logger.log_carrot(
-                    time_ms    = _now * 1e3,
-                    wp         = self.tracker.wp,
-                    alpha      = self.tracker.blend_alpha,
-                    v_cmd      = v_ned_ref_carrot,
-                    carrot_pos = self.tracker.carrot_pos,
-                )
+        # PT2 filter on velocity reference — smooths step-changes from mode transitions.
+        # Applied in carrot mode only; hover holds v_ref=0 unchanged.
+        if not in_hover and self._carrot_active:
+            _w0  = self._pt2_omega0
+            _z   = self._pt2_zeta
+            _err = v_ref_for_gains - self._v_ref_pt2_x
+            self._v_ref_pt2_v += _actual_dt * (_w0**2 * _err - 2.0 * _z * _w0 * self._v_ref_pt2_v)
+            self._v_ref_pt2_x += _actual_dt * self._v_ref_pt2_v
+            v_ref_for_gains    = self._v_ref_pt2_x.copy()
+
+        if not in_hover and self._carrot_active and self._logger is not None:
+            self._logger.log_carrot(
+                time_ms    = _now * 1e3,
+                wp         = self.tracker.wp,
+                v_cmd      = v_ref_for_gains,
+                carrot_pos = self.tracker.carrot_pos,
+                drone_pos  = pos_ned,
+            )
 
         # Advance carrot waypoint when sim signals gate passage.
         if self.data.pop('gate_passed', False):
+            # Always advance by at least 1 from current wp.  The old formula
+            # new_wp = agi + 1 failed when tracker.wp was already agi + 1 (the
+            # common case where sim reports the gate index that was just passed).
+            # Additionally sync forward if sim's active_gate_index is ahead.
             agi = self.data.get('active_gate_index', -1)
+            new_wp = self.tracker.wp + 1
             if agi >= 0:
-                new_wp = min(int(agi) + 1, self.tracker.n_waypoints - 1)
-                if new_wp > self.tracker.wp:
-                    self.tracker.wp = new_wp
-                    print(f"[GATE PASSED id={self.data.get('last_gate_id')}] "
-                          f"tracker.wp → {self.tracker.wp}", flush=True)
+                new_wp = max(new_wp, int(agi) + 1)
+            new_wp = min(new_wp, self.tracker.n_waypoints - 1)
+            if new_wp > self.tracker.wp:
+                self.tracker.wp = new_wp
+                print(f"[GATE PASSED id={self.data.get('last_gate_id')}] "
+                      f"tracker.wp → {self.tracker.wp}", flush=True)
 
-        psi_meas = quat_to_yaw(quat)
+        _, _, psi_meas = quat_to_euler(quat)
 
-        _phi_gt   = self.data.get('attitude_roll')
-        _theta_gt = self.data.get('attitude_pitch')
-        if _phi_gt is not None and _theta_gt is not None:
-            R22 = max(0.3, float(np.cos(_phi_gt) * np.cos(_theta_gt)))
-        else:
-            _, qx_c, qy_c, _ = quat
-            R22 = max(0.3, 1.0 - 2.0 * (qx_c*qx_c + qy_c*qy_c))
+        _, qx_c, qy_c, _ = quat
+        R22 = max(0.3, 1.0 - 2.0 * (qx_c*qx_c + qy_c*qy_c))
         v_ned = state.get('vel_ned', np.zeros(3)).copy()
 
         if self._controller_type == 1:
@@ -388,19 +454,21 @@ class Controller:
             hover_t = hover_elapsed
 
             p_des, q_des, r_des, T_coll = self._outer_loop(
-                v_ned_ref     = v_ref_for_gains,
-                psi_ref       = self._psi_cmd,
-                v_ned_meas    = v_ned,
-                quat          = quat,
-                psi_meas      = psi_meas,
-                R22           = R22,
-                dt            = _actual_dt,
-                hover_t       = hover_t,
-                phi_meas_gt   = self.data.get('attitude_roll'),
-                theta_meas_gt = self.data.get('attitude_pitch'),
+                v_ned_ref  = v_ref_for_gains,
+                psi_ref    = self._psi_cmd,
+                v_ned_meas = v_ned,
+                quat       = quat,
+                psi_meas   = psi_meas,
+                R22        = R22,
+                dt         = _actual_dt,
+                hover_t    = hover_t,
             )
             if self._logger is not None:
                 dbg = getattr(self, '_dbg', {})
+                _phase_log = ('HOVER' if in_hover
+                              else f'CARROT_wp{self.tracker.wp}' if self._carrot_active
+                              else 'INIT')
+                _vis_log = self.data.get('vis_ctrl_mode', '') if not in_hover else ''
                 self._logger.log_cascade(
                     time_ms       = _now * 1e3,
                     v_ned_ref     = v_ref_for_gains,
@@ -414,6 +482,8 @@ class Controller:
                     p_des=p_des, q_des=q_des, r_des=r_des,
                     rates=rates, T_coll=T_coll, R22=R22,
                     xi_vel=self.xi_vel,
+                    flight_phase=_phase_log,
+                    vis_mode=_vis_log,
                 )
 
             if _now - getattr(self, '_last_diag_t', 0.0) >= 1.0:
@@ -472,8 +542,7 @@ class Controller:
     # Outer loop: NED velocity + yaw → desired body rates + collective
     # ------------------------------------------------------------------
 
-    def _outer_loop(self, v_ned_ref, psi_ref, v_ned_meas, quat, psi_meas, R22, dt, hover_t,
-                    phi_meas_gt=None, theta_meas_gt=None):
+    def _outer_loop(self, v_ned_ref, psi_ref, v_ned_meas, quat, psi_meas, R22, dt, hover_t):
         # Low-pass filter all three EKF velocity channels before computing errors.
         # Horizontal (vN, vE): longer τ because the cold-start spurious velocity
         # (gravity misattributed as acceleration before attitude converges) is
@@ -523,26 +592,20 @@ class Controller:
         a_N = self._Kp_vN * e_vel_c[0] + self._Ki_vN * self.xi_vel[0]
         a_E = self._Kp_vE * e_vel_c[1] + self._Ki_vE * self.xi_vel[1]
 
-        # Rotate desired NED acceleration into body horizontal frame.
-        # Without this, theta_des = -a_N/g is only correct when yaw = 0 (north).
-        # At yaw = π (south) the sign of pitch is inverted, causing the
-        # controller to brake instead of accelerate, winding up the integrators.
-        cos_psi = np.cos(psi_meas)
-        sin_psi = np.sin(psi_meas)
-        a_fwd   =  cos_psi * a_N + sin_psi * a_E   # along body x (forward)
-        a_right = -sin_psi * a_N + cos_psi * a_E   # along body y (right)
-        theta_des = np.clip(-a_fwd   / g, -self._MAX_TILT, self._MAX_TILT)
-        phi_des   = np.clip( a_right / g, -self._MAX_TILT, self._MAX_TILT)
+        # Rotate desired NED acceleration into body-frame components.
+        # At psi=0 (north-facing) this is identity; at other headings it projects
+        # a_N/a_E onto the body x_b/y_b axes so tilt angles are always correct.
+        R_bn = _rot_from_quat(quat)
+        R_nb = R_bn.T
 
-        # Roll/pitch: use sim ground truth if available (EKF attitude is corrupted
-        # by motor-vibration DC offsets on both gyro and accelerometer).
-        if phi_meas_gt is not None and theta_meas_gt is not None:
-            phi_meas   = float(phi_meas_gt)
-            theta_meas = float(theta_meas_gt)
-        else:
-            qw, qx, qy, qz = quat
-            phi_meas   = np.arctan2(2.0*(qw*qx + qy*qz), 1.0 - 2.0*(qx*qx + qy*qy))
-            theta_meas = np.arcsin(np.clip(2.0*(qw*qy - qz*qx), -1.0, 1.0))
+        a_body = R_bn @ np.array([a_N, a_E, 0.0])
+
+        a_xb = a_body[0]
+        a_yb = a_body[1]
+        theta_des = np.clip( -a_xb / g, -self._MAX_TILT, self._MAX_TILT)
+        phi_des   = np.clip( a_yb / g, -self._MAX_TILT, self._MAX_TILT)
+
+        phi_meas, theta_meas, psi_meas = quat_to_euler(quat)
 
         # Attitude error → desired body rates (clamped to prevent overshooting mixer)
         p_des = np.clip(self._K_att * (phi_des   - phi_meas),   -4.0, 4.0)
@@ -570,19 +633,6 @@ class Controller:
         }
 
         return p_des, q_des, r_des, T_collective
-
-    # ------------------------------------------------------------------
-    # Inner loop: desired body rates → 4 motor thrusts
-    # ------------------------------------------------------------------
-
-    def _inner_loop(self, p_des, q_des, r_des, rates, T_collective):
-        # FRD convention: gyro_y > 0 = nose rotating UP = theta_dot > 0.
-        # All three axes use standard (des - meas) form.
-        tau_x = self._K_rate_roll  * (p_des - rates[0])
-        tau_y = self._K_rate_pitch * (q_des - rates[1])
-        tau_z = self._K_rate_yaw   * (r_des - rates[2])
-        u_raw = self._M_inv @ np.array([T_collective, tau_x, tau_y, tau_z])
-        return np.clip(u_raw, 0.0, self.T_max)
 
     # ------------------------------------------------------------------
     # Attitude-target output (body rates + collective thrust)
@@ -721,3 +771,26 @@ class Controller:
 def _wrap_pi(angle):
     """Wrap angle to [-pi, pi]."""
     return (angle + np.pi) % (2 * np.pi) - np.pi
+
+
+
+
+# Quaternion → Euler angles (roll, pitch, yaw) to unify rotation representation across the controller.
+def quat_to_euler(q):
+    qw,qx,qy,qz = q
+
+    roll = np.arctan2(
+        2*(qw*qx + qy*qz),
+        1-2*(qx*qx+qy*qy)
+    )
+
+    pitch = np.arcsin(
+        np.clip(2*(qw*qy-qz*qx),-1,1)
+    )
+
+    yaw = np.arctan2(
+        2*(qw*qz+qx*qy),
+        1-2*(qy*qy+qz*qz)
+    )
+
+    return roll,pitch,yaw

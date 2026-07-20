@@ -3,6 +3,7 @@ import socket
 import struct
 import threading
 import time
+from collections import deque
 
 import cv2
 import numpy as np
@@ -43,6 +44,14 @@ class VisionRX:
         # Blue-disturbance suppression: zero out blue pixels before YOLO inference.
         # The 41×41 dilation lets blue bleed into the YOLO input through the mask
         # boundary — suppressing it at source prevents keypoint confusion.
+        self._debug_waypoints_only = bool(_p.get('debug_waypoints_only', False))
+        if self._debug_waypoints_only:
+            print("[VisionRX] debug_waypoints_only=true — YOLO disabled", flush=True)
+
+        self._yolo_enabled = bool(_p.get('yolo_enabled', True))
+        if not self._yolo_enabled:
+            print("[VisionRX] yolo_enabled=false — YOLO inference skipped", flush=True)
+
         self._suppress_blue = bool(_p.get('suppress_blue', True))
         self._blue_lo = np.array([
             int(_p.get('suppress_blue_h_lo', 100)),
@@ -68,21 +77,45 @@ class VisionRX:
         self._consec_det    = 0      # consecutive frames with valid PnP
         self._consec_miss   = 0      # consecutive frames without valid PnP
         self._prev_agi      = None   # previous active_gate_index for change detection
+        # gate_index → last gate_info dict received from track data (includes ned, width, height, quat).
+        # Used as fallback when track_gates_ned is temporarily unavailable.
+        self._last_gate_info = {}
 
-        # Rotation from OpenCV camera frame (x=right,y=down,z=fwd) to FRD body
+        # Image preprocessing: unsharp mask (sharpening) + optional Gaussian denoise.
+        # Sharpening restores orange saturation lost to motion blur at speed, improving
+        # HSV detection rate without widening the colour gate (no false-positive increase).
+        self._sharpen_k     = int(_p.get('preproc_sharpen_k',      5))
+        self._sharpen_alpha = float(_p.get('preproc_sharpen_alpha', 0.8))
+        self._gauss_k       = int(_p.get('preproc_gauss_k',         0))
+
+        # cam→FRD body: x_b(fwd)=cam_z, y_b(right)=cam_x, z_b(down)=cam_y
         self._R_cam2body = np.array([[0, 0, 1],
                                      [1, 0, 0],
                                      [0, 1, 0]], dtype=float)
 
-        # State for PnP velocity estimation — consecutive-frame guard
-        self._prev_drone_ned = None
-        self._prev_vis_t     = None
-        self._prev_vis_fid   = None
+        # PnP velocity estimation: sliding window of (wall_t, drone_ned) pairs.
+        # Velocity = (last_ned - first_ned) / (last_t - first_t) over the window.
+        # Averaging over N frames reduces differentiation noise by ≈ N× vs 2-frame diff.
+        _vel_win = int(_p.get('vision_vel_window_frames', 10))
+        self._pnp_vel_buf = deque(maxlen=max(2, _vel_win))
+
+        # Next-gate candidate: accumulate PnP-derived NED positions of the second-largest
+        # YOLO detection across many frames.  Confirmed position = median of buffer.
+        # Buffer clears on gate-index change to discard stale measurements.
+        self._next_gate_min_frames = int(_p.get('next_gate_min_frames', 15))
+        self._next_gate_ned_buf    = deque(maxlen=self._next_gate_min_frames)
+        self._next_gate_ned        = None    # median NED once buffer is full, else None
+
+        # Live debug overlay window (enabled via vision_debug_overlay: true in params.yaml).
+        self._debug_overlay     = bool(_p.get('vision_debug_overlay', False))
+        self._overlay_last_ctr  = None   # last known gate centre_px for hold/transition display
 
         # Diagnostics counters (reset every 5 s)
         self._stat_recv           = 0
         self._stat_proc           = 0
         self._stat_det            = 0
+        self._stat_pnp            = 0     # frames with a valid PnP position fix
+        self._stat_dist_sum       = 0.0   # cumulative PnP distance [m]
         self._stat_t0             = time.time()
         self._stat_pnp_skip_reason = None
 
@@ -183,29 +216,30 @@ class VisionRX:
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
+    def _apply_blue_suppression(self, img_bgr):
+        """Replace blue/cyan pixels with grey (equal B=G=R=luminance).
+        Avoids HSV-round-trip artefacts by operating directly on BGR channels."""
+        if not self._suppress_blue:
+            return img_bgr
+        hsv     = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+        blue_px = cv2.inRange(hsv, self._blue_lo, self._blue_hi)
+        if not np.any(blue_px):
+            return img_bgr
+        grey     = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        grey_3ch = cv2.merge([grey, grey, grey])
+        return np.where(blue_px[:, :, np.newaxis] > 0,
+                        grey_3ch, img_bgr).astype(img_bgr.dtype)
+
     def _orange_mask(self, img_bgr):
-        hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-
-        # Zero out the blue disturbance before orange masking so it cannot
-        # bleed into the dilated YOLO input through the mask boundary.
-        if self._suppress_blue:
-            blue_px = cv2.inRange(hsv, self._blue_lo, self._blue_hi)
-            img_bgr = img_bgr.copy()
-            img_bgr[blue_px > 0] = 0
-            hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-
-        lo   = np.array([ 5, 100,  80], dtype=np.uint8)
+        # img_bgr has blue/cyan pixels desaturated (S=0) upstream.
+        # S threshold lowered 100→80 to catch gate pixels mixed with cyan interference.
+        hsv  = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+        lo   = np.array([ 5,  80,  80], dtype=np.uint8)
         hi   = np.array([25, 255, 255], dtype=np.uint8)
         mask = cv2.inRange(hsv, lo, hi)
-        # Close small holes in the gate frame
-        k_close  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask     = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close)
-        # Dilate to add context around the gate corners so YOLO keypoint heads
-        # can anchor on edge structure even when corners are at the mask boundary.
-        k_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (41, 41))
-        mask_inf = cv2.dilate(mask, k_dilate)
-        # mask_raw (tight) used for orange-pixel count; mask_inf used for YOLO input
-        return cv2.bitwise_and(img_bgr, img_bgr, mask=mask_inf), mask
+        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask    = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close)
+        return cv2.bitwise_and(img_bgr, img_bgr, mask=mask), mask
 
     def _orange_centroid(self, mask):
         """
@@ -229,8 +263,170 @@ class VisionRX:
         cy = M['m01'] / M['m00']
         return float(cx), float(cy), float(area)
 
+    def _preprocess(self, img):
+        """Unsharp-mask sharpening + optional Gaussian denoise before orange masking."""
+        if self._sharpen_k > 0:
+            k = self._sharpen_k | 1   # ensure odd
+            blur = cv2.GaussianBlur(img, (k, k), 0)
+            img  = cv2.addWeighted(img, 1.0 + self._sharpen_alpha,
+                                   blur, -self._sharpen_alpha, 0)
+        if self._gauss_k > 0:
+            gk = self._gauss_k | 1
+            img = cv2.GaussianBlur(img, (gk, gk), 0)
+        return img
+
+    def _draw_overlay(self, img, tvec_cam, centre_px, corners, vel_ned_pnp):
+        """Draw live debug overlay onto a copy of img and return it."""
+        vis = img.copy()
+        h, w = vis.shape[:2]
+        ic_x, ic_y = w // 2, h // 2   # image centre
+
+        ctrl_mode = self.data.get('vis_ctrl_mode', 'CARROT')
+
+        # ── Mode badge ────────────────────────────────────────────────────────
+        _MODE_CFG = {
+            'PNP':        ((0,  200,  0),  'PNP'),
+            'HOLD':       ((0,  200, 220), 'HOLD'),
+            'TRANSITION': ((30, 140, 255), 'TRANSIT'),
+            'CARROT':     ((120,120, 120), 'CARROT'),
+        }
+        badge_color, badge_label = _MODE_CFG.get(ctrl_mode, ((100,100,100), ctrl_mode))
+        cv2.rectangle(vis, (5, 5), (165, 38), badge_color, -1)
+        cv2.putText(vis, badge_label, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
+
+        # ── Lock status ───────────────────────────────────────────────────────
+        det     = self.data.get('gate_detection', {})
+        locked  = det.get('pnp_locked', False)
+        lock_lbl = 'LOCKED' if locked else 'SEARCHING'
+        lock_col = (0, 200, 0) if locked else (60, 60, 200)
+        cv2.putText(vis, lock_lbl, (5, 62),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, lock_col, 2, cv2.LINE_AA)
+
+        # ── PnP velocity status ───────────────────────────────────────────────
+        if vel_ned_pnp is not None:
+            vel_mag  = float(np.linalg.norm(vel_ned_pnp[:2]))   # horizontal only
+            vel_lbl  = f'VEL PNP  {vel_mag:.1f} m/s'
+            vel_col  = (0, 220, 0)
+        else:
+            vel_lbl = 'VEL PNP  --'
+            vel_col = (120, 120, 120)
+        cv2.putText(vis, vel_lbl, (5, 88),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, vel_col, 2, cv2.LINE_AA)
+
+        # ── Distance ──────────────────────────────────────────────────────────
+        if tvec_cam is not None:
+            dist_m   = float(tvec_cam[2])
+            dist_lbl = f'DIST  {dist_m:.1f} m'
+            dist_col = (0, 220, 0)
+        else:
+            dist_lbl = 'DIST  --'
+            dist_col = (120, 120, 120)
+        cv2.putText(vis, dist_lbl, (5, 114),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, dist_col, 2, cv2.LINE_AA)
+
+        # ── Next-gate status ──────────────────────────────────────────────────
+        ng_ned    = self.data.get('next_gate_ned')
+        ng_frames = self.data.get('next_gate_buf_frames', 0)
+        ng_min    = self.data.get('next_gate_min_frames', self._next_gate_min_frames)
+        if ng_ned is not None:
+            ng_lbl = 'NEXT GATE: CONFIRMED'
+            ng_col = (0, 220, 0)
+        elif ng_frames > 0:
+            ng_lbl = f'NEXT GATE: {ng_frames}/{ng_min}'
+            ng_col = (0, 200, 220)
+        else:
+            ng_lbl = 'NEXT GATE: --'
+            ng_col = (120, 120, 120)
+        cv2.putText(vis, ng_lbl, (5, 140),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, ng_col, 2, cv2.LINE_AA)
+
+        # ── Gate keypoints + quad outline ─────────────────────────────────────
+        if corners is not None:
+            pts = corners.astype(int)
+            for i in range(4):
+                cv2.circle(vis, tuple(pts[i]), 7, (255, 0, 220), -1)
+            for i in range(4):
+                cv2.line(vis, tuple(pts[i]), tuple(pts[(i + 1) % 4]),
+                         (255, 0, 220), 2, cv2.LINE_AA)
+
+        # ── Bearing arrow ─────────────────────────────────────────────────────
+        # Update cached gate centre when we have a live detection.
+        if centre_px is not None:
+            self._overlay_last_ctr = (int(centre_px[0]), int(centre_px[1]))
+
+        # Choose arrow target: live centre, or cached centre when holding/transit.
+        if ctrl_mode in ('HOLD', 'TRANSITION') and self._overlay_last_ctr is not None:
+            arrow_target = self._overlay_last_ctr
+        elif centre_px is not None:
+            arrow_target = (int(centre_px[0]), int(centre_px[1]))
+        else:
+            arrow_target = None
+
+        if arrow_target is not None:
+            arrow_col = badge_color
+            # Dashed style for HOLD/TRANSITION: draw segmented line then arrowhead.
+            if ctrl_mode in ('HOLD', 'TRANSITION'):
+                dx = arrow_target[0] - ic_x
+                dy = arrow_target[1] - ic_y
+                dist_px = max(1, int(np.sqrt(dx*dx + dy*dy)))
+                segs = 8
+                for s in range(segs):
+                    if s % 2 == 0:
+                        p1 = (int(ic_x + dx * s / segs),
+                              int(ic_y + dy * s / segs))
+                        p2 = (int(ic_x + dx * (s + 1) / segs),
+                              int(ic_y + dy * (s + 1) / segs))
+                        cv2.line(vis, p1, p2, arrow_col, 2, cv2.LINE_AA)
+                # Arrowhead at tip
+                cv2.arrowedLine(vis,
+                                (int(ic_x + dx * 0.85), int(ic_y + dy * 0.85)),
+                                arrow_target, arrow_col, 2, tipLength=0.25,
+                                line_type=cv2.LINE_AA)
+            else:
+                cv2.arrowedLine(vis, (ic_x, ic_y), arrow_target,
+                                arrow_col, 3, tipLength=0.15, line_type=cv2.LINE_AA)
+
+        # ── EKF velocity arrow (white) ────────────────────────────────────────
+        # Shows where the drone is actually going according to the EKF.
+        # Arrow direction = body lateral (right) + vertical (down) components of
+        # vel_ned rotated to camera frame.  Fixed pixel length so it is purely
+        # directional; speed is printed next to the tip.
+        _mav_ov = self.data.get('mav_state')
+        if _mav_ov is not None:
+            _vel_n = np.asarray(_mav_ov['vel_ned'], dtype=float)
+            _spd_ov = float(np.linalg.norm(_vel_n))
+            if _spd_ov > 0.3:
+                _qw, _qx, _qy, _qz = _mav_ov['quat']
+                _Rb2n = np.array([
+                    [1-2*(_qy*_qy+_qz*_qz),  2*(_qx*_qy-_qw*_qz),  2*(_qx*_qz+_qw*_qy)],
+                    [  2*(_qx*_qy+_qw*_qz),1-2*(_qx*_qx+_qz*_qz),  2*(_qy*_qz-_qw*_qx)],
+                    [  2*(_qx*_qz-_qw*_qy),  2*(_qy*_qz+_qw*_qx),1-2*(_qx*_qx+_qy*_qy)],
+                ], dtype=float)
+                _vb = _Rb2n.T @ _vel_n          # body frame: x=fwd, y=right, z=down
+                _VLEN = 80                       # fixed arrow length in pixels
+                _vtx = ic_x + int(_VLEN * _vb[1] / _spd_ov)   # body-right → cam-x
+                _vty = ic_y + int(_VLEN * _vb[2] / _spd_ov)   # body-down  → cam-y
+                cv2.arrowedLine(vis, (ic_x, ic_y), (_vtx, _vty),
+                                (220, 220, 220), 2, tipLength=0.2, line_type=cv2.LINE_AA)
+                cv2.putText(vis, f'EKF {_spd_ov:.1f}m/s', (_vtx + 4, _vty),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+
+        # ── Image centre crosshair ─────────────────────────────────────────────
+        cv2.drawMarker(vis, (ic_x, ic_y), (200, 200, 200),
+                       cv2.MARKER_CROSS, 20, 1, cv2.LINE_AA)
+
+        return vis
+
     def _pnp_gate(self, corners_px, gate_width, gate_height):
-        """Returns (tvec, rvec) both as flat (3,) arrays, or (None, None) on failure."""
+        """Returns (tvec, rvec) both as flat (3,) arrays, or (None, None) on failure.
+
+        IPPE produces two solutions with nearly equal reprojection error for
+        near-frontal views.  The horizontal-gate constraint resolves the ambiguity:
+        the gate Y-axis (downward direction in gate frame) must point toward NED-down.
+        We fetch both solutions and pick the one whose gate_Y_cam best aligns with
+        NED-down in camera frame (derived from EKF attitude if available).
+        """
         hw = gate_width  / 2.0
         hh = gate_height / 2.0
         obj_pts = np.array([
@@ -240,13 +436,47 @@ class VisionRX:
             [-hw,  hh, 0.0],
         ], dtype=np.float64)
         img_pts = corners_px.astype(np.float64).reshape(4, 1, 2)
-        ok, rvec, tvec = cv2.solvePnP(
+
+        n, rvecs, tvecs, _ = cv2.solvePnPGeneric(
             obj_pts, img_pts, self._cam_K, np.zeros((4, 1)),
             flags=cv2.SOLVEPNP_IPPE,
         )
-        if not ok:
+        if n < 1:
             return None, None
-        return tvec.flatten(), rvec.flatten()
+
+        # NED-down direction expressed in camera frame.
+        # For a level drone with forward-facing camera: cam_Y = NED-down.
+        # Use EKF attitude to correct for any drone tilt.
+        ned_down_cam = np.array([0.0, 1.0, 0.0])    # cam_Y fallback (level drone)
+        mav = self.data.get('mav_state')
+        if mav is not None:
+            qw, qx, qy, qz = mav['quat']
+            R_b2n = np.array([
+                [1-2*(qy*qy+qz*qz),   2*(qx*qy-qw*qz), 2*(qx*qz+qw*qy)],
+                [  2*(qx*qy+qw*qz), 1-2*(qx*qx+qz*qz), 2*(qy*qz-qw*qx)],
+                [  2*(qx*qz-qw*qy),   2*(qy*qz+qw*qx), 1-2*(qx*qx+qy*qy)],
+            ], dtype=float)
+            ned_down_body = R_b2n.T @ np.array([0.0, 0.0, 1.0])
+            ned_down_cam  = self._R_cam2body.T @ ned_down_body
+
+        # Pick the solution where gate_Y (col 1 of R_gate2cam) most aligns with
+        # NED-down in camera frame.  Gate Y = downward in gate frame = NED-down
+        # in the world when the gate is horizontal.
+        best_rvec, best_tvec = rvecs[0].flatten(), tvecs[0].flatten()
+        best_score = -np.inf
+        for rv, tv in zip(rvecs, tvecs):
+            tv_f = tv.flatten()
+            if tv_f[2] < 0.1:          # gate behind camera — physically impossible
+                continue
+            R_sol, _ = cv2.Rodrigues(rv)
+            score = float(np.dot(R_sol[:, 1], ned_down_cam))
+            if score > best_score:
+                best_score = score
+                best_rvec, best_tvec = rv.flatten(), tv_f
+
+        if best_tvec[2] < 0.5:
+            return None, None
+        return best_tvec, best_rvec
 
     def _yaw_from_pnp(self, rvec, gate_quat_wxyz):
         """
@@ -272,14 +502,25 @@ class VisionRX:
     # ── Main frame processing ───────────────────────────────────────────────
 
     def process_frame(self, frame_id, img):
+        if self._debug_waypoints_only:
+            self.data['gate_detection'] = {
+                'detected': False, 'centre_px': None, 'conf': 0.0,
+                'tvec_cam': None, 'rvec_cam': None, 'frame_id': frame_id,
+            }
+            if self.logger:
+                self.logger.log_frame(frame_id, img)
+            return
+
+        img = self._preprocess(img)
+        # Desaturate blue/cyan pixels (S=0 → grey) before YOLO and orange mask.
+        # Desaturation preserves luminance so YOLO keeps structural context from
+        # buildings and the track beam, while removing the hue that would
+        # contaminate the orange mask or produce cyan false-positive detections.
+        img = self._apply_blue_suppression(img)
         masked, mask_raw = self._orange_mask(img)
         orange_px = int(np.count_nonzero(mask_raw))
 
-        # YOLO runs on the dilated-mask image: background distractors are blacked
-        # out (detection robustness) but the mask is expanded by 41 px so that
-        # gate corners sitting at the orange boundary get enough texture context
-        # for keypoint heads to anchor correctly.
-        results = self._model.predict(masked, verbose=False, conf=0.3)
+        results = self._model.predict(img, verbose=False, conf=0.03) if self._yolo_enabled else None
 
         detected  = False
         centre_px = None
@@ -292,79 +533,145 @@ class VisionRX:
         drone_ned = None
         _pnp_skip_reason = None   # diagnostic: why PnP was skipped this frame
 
-        r = results[0]
-        if r.boxes is not None and r.keypoints is not None and len(r.boxes) > 0:
+        h_img, w_img = mask_raw.shape
+        if results is not None and results[0].boxes is not None \
+                and results[0].keypoints is not None and len(results[0].boxes) > 0:
+            r = results[0]
             boxes = r.boxes.xywh.cpu().numpy()   # (N,4): cx,cy,w,h
             confs = r.boxes.conf.cpu().numpy()
             kpts  = r.keypoints.xy.cpu().numpy() # (N,4,2)
 
-            # Pick detection with LARGEST bounding-box area (most prominent gate)
-            areas = boxes[:, 2] * boxes[:, 3]
-            best  = int(np.argmax(areas))
+            # Two-pass selection: filter → nearest by area.
+            # Pass 1: reject boxes with conf < 0.03, zero keypoints, or
+            #         orange_frac < 0.1% (removes false positives: blue beam,
+            #         background structures, unlabelled distant objects).
+            # Pass 2: among survivors pick LARGEST bbox area = nearest gate.
+            #         Confidence is not a reliable gate-distance discriminator —
+            #         a farther gate can score higher than the near one; apparent
+            #         size (bbox area) correctly selects the closest visible gate.
+            # Bbox is expanded by _PAD pixels on each side before the orange_frac check.
+            # At 40 m YOLO's bbox can be misaligned by 10–15 px from the orange gate frame;
+            # padding bridges that gap without requiring pixel-perfect localisation.
+            # Threshold 0.1% (not 0.5%) because the padded area is larger.
+            _PAD = 15
+            valid_idx = []
+            for _i in range(len(boxes)):
+                if confs[_i] < 0.03:
+                    continue
+                if kpts[_i].shape != (4, 2):
+                    continue
+                if np.any(np.all(kpts[_i] < 2.0, axis=1)):
+                    continue
+                _bx1 = max(0, int(boxes[_i][0] - boxes[_i][2] / 2) - _PAD)
+                _by1 = max(0, int(boxes[_i][1] - boxes[_i][3] / 2) - _PAD)
+                _bx2 = min(w_img, int(boxes[_i][0] + boxes[_i][2] / 2) + _PAD)
+                _by2 = min(h_img, int(boxes[_i][1] + boxes[_i][3] / 2) + _PAD)
+                _ba  = max(1, (_bx2 - _bx1) * (_by2 - _by1))
+                if np.count_nonzero(mask_raw[_by1:_by2, _bx1:_bx2]) / _ba < 0.001:
+                    continue
+                valid_idx.append(_i)
 
-            if confs[best] > 0.3 and kpts[best].shape == (4, 2):
-                # Require ≥15 % of the detection bbox to be orange (tight mask).
-                # This rejects detections that landed on dilated-mask fringe area
-                # with little actual orange content.
-                h_img, w_img = mask_raw.shape
-                bx1 = max(0, int(boxes[best][0] - boxes[best][2] / 2))
-                by1 = max(0, int(boxes[best][1] - boxes[best][3] / 2))
-                bx2 = min(w_img, int(boxes[best][0] + boxes[best][2] / 2))
-                by2 = min(h_img, int(boxes[best][1] + boxes[best][3] / 2))
-                bbox_area    = max(1, (bx2 - bx1) * (by2 - by1))
-                orange_frac  = np.count_nonzero(mask_raw[by1:by2, bx1:bx2]) / bbox_area
-                has_orange   = orange_frac >= 0.10
+            if valid_idx:
+                areas       = boxes[:, 2] * boxes[:, 3]
+                _sorted_v   = sorted(valid_idx, key=lambda i: areas[i], reverse=True)
+                best        = _sorted_v[0]
+                _second_idx = _sorted_v[1] if len(_sorted_v) >= 2 else None
 
-                if has_orange:
-                    raw_corners = kpts[best]   # (4,2) pixel coords
+                corners   = kpts[best]
+                centre_px = corners.mean(axis=0)
+                conf      = float(confs[best])
+                best_box  = tuple(float(v) for v in boxes[best])
+                detected  = True
 
-                    # Reject if any corner is at (0,0) — YOLO sets undetected
-                    # keypoints to origin, which makes solvePnP degenerate.
-                    any_zero = np.any(np.all(raw_corners < 2.0, axis=1))
-
-                    if not any_zero:
-                        corners   = raw_corners
-                        centre_px = corners.mean(axis=0)
-                        conf      = float(confs[best])
-                        best_box  = tuple(float(v) for v in boxes[best])
-                        detected  = True
-
-                        gates = self.data.get('track_gates_ned', {})
-                        # Default to 0: before first RACE_STATUS the fallback
-                        # still points at waypoints[1] (first gate).
-                        agi   = self.data.get('active_gate_index', 0)
-                        if agi is not None and int(agi) in gates:
-                            gate_info           = gates[int(agi)]
-                            tvec_cam, rvec_cam  = self._pnp_gate(
-                                corners, gate_info['width'], gate_info['height'])
-                            if tvec_cam is None:
-                                _pnp_skip_reason = "solvePnP failed"
+                gates = self.data.get('track_gates_ned', {})
+                # Default to 0: before first RACE_STATUS the fallback
+                # still points at waypoints[1] (first gate).
+                agi   = self.data.get('active_gate_index', 0)
+                if agi is not None and int(agi) in gates:
+                    gate_info = gates[int(agi)]
+                    # Cache so later frames can use it as a fallback when
+                    # track_gates_ned is temporarily unavailable.
+                    self._last_gate_info[int(agi)] = gate_info
+                    tvec_cam, rvec_cam = self._pnp_gate(
+                        corners, gate_info['width'], gate_info['height'])
+                    if tvec_cam is None:
+                        _pnp_skip_reason = "solvePnP failed"
+                else:
+                    # No live track data for this gate.
+                    # Fallback priority:
+                    #   1. Last known gate_info from track data (accurate dims + NED)
+                    #   2. Approximate NED from params.yaml waypoints
+                    #   3. Distance-only (no position update)
+                    _last = self._last_gate_info.get(int(agi)) if agi is not None else None
+                    _w = _last['width']  if _last else self._gate_w_default
+                    _h = _last['height'] if _last else self._gate_h_default
+                    tvec_cam, rvec_cam = self._pnp_gate(corners, _w, _h)
+                    gate_info = None
+                    if tvec_cam is not None and agi is not None:
+                        if _last is not None:
+                            gate_info = _last
+                        elif self._waypoints is not None:
+                            wp_idx = int(agi) + 1
+                            if wp_idx < len(self._waypoints):
+                                gate_info = {
+                                    'ned':    self._waypoints[wp_idx].copy(),
+                                    'width':  self._gate_w_default,
+                                    'height': self._gate_h_default,
+                                    'quat':   None,
+                                }
+                    if tvec_cam is None:
+                        _pnp_skip_reason = "solvePnP failed (fallback dims)"
+                    elif gate_info is None:
+                        if not gates:
+                            _pnp_skip_reason = "no track_gates_ned, no cache, no agi (dist only)"
                         else:
-                            # Fallback: solve PnP with default dims for distance readout.
-                            tvec_cam, rvec_cam = self._pnp_gate(
-                                corners, self._gate_w_default, self._gate_h_default)
-                            gate_info = None
-                            # When active_gate_index is known, supply approximate gate NED
-                            # from waypoints so EKF position/velocity updates can run.
-                            # Yaw update is skipped (gate orientation unknown without track data).
-                            if tvec_cam is not None and agi is not None and self._waypoints is not None:
-                                wp_idx = int(agi) + 1  # gate 0 → waypoint 1, gate 1 → waypoint 2, …
-                                if wp_idx < len(self._waypoints):
-                                    gate_info = {
-                                        'ned':    self._waypoints[wp_idx].copy(),
-                                        'width':  self._gate_w_default,
-                                        'height': self._gate_h_default,
-                                        'quat':   None,   # unknown → yaw update skipped
-                                    }
-                            if tvec_cam is None:
-                                _pnp_skip_reason = "solvePnP failed (fallback dims)"
-                            elif gate_info is None:
-                                if not gates:
-                                    _pnp_skip_reason = "no track_gates_ned, no agi (dist only)"
-                                else:
-                                    _pnp_skip_reason = "no active_gate_index (dist only)"
-                            else:
-                                _pnp_skip_reason = "no track_gates_ned (waypoint NED fallback)"
+                            _pnp_skip_reason = "no active_gate_index (dist only)"
+                    elif _last is not None:
+                        _pnp_skip_reason = "last-known gate NED (no track_gates_ned)"
+                    else:
+                        _pnp_skip_reason = "no track_gates_ned (waypoint NED fallback)"
+
+                # ── Next-gate candidate (second-largest valid box) ────────────
+                # Accumulates PnP-derived NED positions across many frames and
+                # publishes a confirmed median position once the buffer is full.
+                # Guard: second gate must be farther than current gate by ≥5 m so
+                # duplicate detections of the same gate are rejected.
+                _cur_dist = float(tvec_cam[2]) if tvec_cam is not None else 0.0
+                if _second_idx is not None:
+                    _sec_corners = kpts[_second_idx]
+                    # Gate dimensions for the next gate index
+                    _agi_next = (int(agi) + 1) if agi is not None else None
+                    _ng_cache = self._last_gate_info.get(_agi_next) if _agi_next is not None else None
+                    if _agi_next is not None and _agi_next in gates:
+                        _ng_w = gates[_agi_next]['width']
+                        _ng_h = gates[_agi_next]['height']
+                    elif _ng_cache is not None:
+                        _ng_w, _ng_h = _ng_cache['width'], _ng_cache['height']
+                    else:
+                        _ng_w, _ng_h = self._gate_w_default, self._gate_h_default
+                    _tvec_ng, _ = self._pnp_gate(_sec_corners, _ng_w, _ng_h)
+                    if (_tvec_ng is not None
+                            and _tvec_ng[2] > _cur_dist + 5.0   # farther than current gate
+                            and _tvec_ng[2] < self._max_gate_dist):
+                        _mav_ng = self.data.get('mav_state')
+                        if _mav_ng is not None:
+                            _qw, _qx, _qy, _qz = _mav_ng['quat']
+                            _R_b2n_ng = np.array([
+                                [1-2*(_qy*_qy+_qz*_qz),  2*(_qx*_qy-_qw*_qz),  2*(_qx*_qz+_qw*_qy)],
+                                [  2*(_qx*_qy+_qw*_qz),1-2*(_qx*_qx+_qz*_qz),  2*(_qy*_qz-_qw*_qx)],
+                                [  2*(_qx*_qz-_qw*_qy),  2*(_qy*_qz+_qw*_qx),1-2*(_qx*_qx+_qy*_qy)],
+                            ], dtype=float)
+                            _t_ng_ned = _R_b2n_ng @ (self._R_cam2body @ _tvec_ng)
+                            _gate2_ned = np.asarray(_mav_ng['pos_ned']) + _t_ng_ned
+                            self._next_gate_ned_buf.append(_gate2_ned)
+                            if len(self._next_gate_ned_buf) >= self._next_gate_min_frames:
+                                _buf = np.array(list(self._next_gate_ned_buf))
+                                self._next_gate_ned = np.median(_buf, axis=0)
+
+        # Publish next-gate state for controller and overlay.
+        self.data['next_gate_ned']        = self._next_gate_ned
+        self.data['next_gate_buf_frames'] = len(self._next_gate_ned_buf)
+        self.data['next_gate_min_frames'] = self._next_gate_min_frames
 
         # Hard range gate: the next gate is never more than 50 m away.
         # Detections beyond this are background noise or a gate from a later lap.
@@ -380,6 +687,9 @@ class VisionRX:
             self._locked_dist = None
             self._consec_det  = 0
             self._consec_miss = 0
+            self._pnp_vel_buf.clear()        # stale positions from old gate are invalid
+            self._next_gate_ned_buf.clear()  # next-gate buffer also invalid after advance
+            self._next_gate_ned = None
             print(f"[VISION] gate index {self._prev_agi}→{agi}: lock reset", flush=True)
         self._prev_agi = agi
 
@@ -430,13 +740,15 @@ class VisionRX:
             'conf':          conf,
             'tvec_cam':      tvec_cam,
             'centroid_only': tvec_cam is None and centroid_area > 0,
+            'pnp_locked':    self._locked_dist is not None,
             'frame_id':      frame_id,
         }
 
         # EKF vision update: position + velocity + yaw from PnP.
-        vel_ned   = None
-        drone_ned = None
-        yaw_ned   = None
+        vel_ned     = None
+        vel_ned_pnp = None
+        drone_ned   = None
+        yaw_ned     = None
 
         if tvec_cam is not None:
             # Yaw estimate: requires gate quaternion from track data.
@@ -480,27 +792,26 @@ class VisionRX:
                     t_gate_ned  = R_b2n @ t_gate_body
                     drone_ned   = gate_info['ned'] - t_gate_ned
 
-                    # Velocity: allow up to 3 missed detections between valid PnP frames.
-                    # Strict consecutive-frame check (==fid-1) was dropping all velocity
-                    # updates whenever YOLO missed a single frame; the dt guard
-                    # (0.01–0.15 s) still prevents stale or too-fast differences.
                     now = time.time()
-                    if (self._prev_drone_ned is not None
-                            and self._prev_vis_t   is not None
-                            and 0 < frame_id - self._prev_vis_fid <= 3):
-                        dt = now - self._prev_vis_t
-                        if 0.01 < dt < 0.15:
-                            _v = (drone_ned - self._prev_drone_ned) / dt
-                            if np.linalg.norm(_v) <= self._vis_vel_max:
-                                vel_ned = _v
-                    self._prev_drone_ned = drone_ned
-                    self._prev_vis_t     = now
-                    self._prev_vis_fid   = frame_id
+                    self._pnp_vel_buf.append((now, drone_ned.copy()))
+                    # Windowed velocity: endpoint difference over all buffered samples.
+                    # Using first vs last (not pairwise average) is equivalent and cheaper.
+                    # Requires ≥ 2 entries and a sane time span to guard against stale data.
+                    if len(self._pnp_vel_buf) >= 2:
+                        _t0, _p0 = self._pnp_vel_buf[0]
+                        _t1, _p1 = self._pnp_vel_buf[-1]
+                        _dt_win = _t1 - _t0
+                        if _dt_win >= 0.05:
+                            vel_ned_pnp = (_p1 - _p0) / _dt_win
 
-            if drone_ned is not None or yaw_ned is not None:
+            if yaw_ned is not None or vel_ned_pnp is not None:
+                # Position updates disabled: PnP pos noise causes EKF path jumps.
+                # Dead-reckoning (IMU velocity) is accurate enough over gate distances;
+                # the controller gate-waypoint update handles navigation from PnP.
+                # Velocity injection is enabled when consecutive PnP frames are available.
                 self.data['_vision_ekf_update'] = {
-                    'pos_ned':   drone_ned,    # None → position update skipped
-                    'vel_ned':   vel_ned,
+                    'pos_ned':   None,
+                    'vel_ned':   vel_ned_pnp,
                     'yaw_ned':   yaw_ned,
                     'sigma_pos': self._ekf_vis_sigma,
                     'sigma_vel': self._ekf_vis_vel_sigma,
@@ -508,6 +819,19 @@ class VisionRX:
                     'yaw_gate':  self._ekf_vis_yaw_gate,
                     'gate':      self._ekf_vis_gate,
                     'vel_gate':  self._ekf_vis_vel_gate,
+                }
+
+            if drone_ned is not None:
+                _dist_m = float(tvec_cam[2])
+                self._stat_pnp      += 1
+                self._stat_dist_sum += _dist_m
+                self.data['_vision_pnp_record'] = {
+                    'drone_ned':   drone_ned.copy(),
+                    'vel_ned_pnp': vel_ned_pnp.copy() if vel_ned_pnp is not None else None,
+                    'dist_m':      _dist_m,
+                    'conf':        conf,
+                    't_wall':      time.time(),
+                    'frame_id':    frame_id,
                 }
 
         # Diagnostics: print frame rate + detection rate every 5 s
@@ -519,32 +843,39 @@ class VisionRX:
         now_s = time.time()
         elapsed = now_s - self._stat_t0
         if elapsed >= 5.0:
-            recv_fps = self._stat_recv / elapsed
-            proc_fps = self._stat_proc / elapsed
-            det_fps  = self._stat_det  / elapsed
-            det_pct  = 100.0 * self._stat_det / max(1, self._stat_proc)
-            conf_str = f"{conf:.2f}" if detected else "—"
-            dist_str = f"{tvec_cam[2]:.1f}m" if tvec_cam is not None else "no PnP"
+            recv_fps  = self._stat_recv / elapsed
+            proc_fps  = self._stat_proc / elapsed
+            det_fps   = self._stat_det  / elapsed
+            det_pct   = 100.0 * self._stat_det / max(1, self._stat_proc)
+            pnp_pct   = 100.0 * self._stat_pnp  / max(1, self._stat_proc)
+            avg_dist  = (self._stat_dist_sum / self._stat_pnp
+                         if self._stat_pnp > 0 else float('nan'))
+            conf_str  = f"{conf:.2f}" if detected else "—"
+            dist_str  = (f"{avg_dist:.1f}m avg ({self._stat_pnp}frames)"
+                         if self._stat_pnp > 0 else "no PnP")
             orange_kpx = orange_px / 1000
             skip_str = (f"  pnp_skip={self._stat_pnp_skip_reason}"
                         if getattr(self, '_stat_pnp_skip_reason', None) else "")
             agi_str  = str(self.data.get('active_gate_index', '?'))
             ned_str  = (f"[{drone_ned[0]:.1f},{drone_ned[1]:.1f},{drone_ned[2]:.1f}]"
                         if drone_ned is not None else "no-pos")
-            vel_str  = (f"{np.linalg.norm(vel_ned):.1f}m/s"
-                        if vel_ned is not None else "no-vel")
+            vel_str  = (f"{np.linalg.norm(vel_ned_pnp):.1f}m/s"
+                        if vel_ned_pnp is not None else "no-vel")
             print(
                 f"[VISION] recv={recv_fps:.1f}fps  proc={proc_fps:.1f}fps  "
                 f"det={det_fps:.1f}fps ({det_pct:.0f}%)  "
-                f"conf={conf_str}  dist={dist_str}  agi={agi_str}  "
+                f"pnp={pnp_pct:.0f}%  dist={dist_str}  "
+                f"conf={conf_str}  agi={agi_str}  "
                 f"pos={ned_str}  vel={vel_str}  "
                 f"orange={orange_kpx:.0f}kpx{skip_str}",
                 flush=True,
             )
-            self._stat_recv = 0
-            self._stat_proc = 0
-            self._stat_det  = 0
-            self._stat_t0   = now_s
+            self._stat_recv     = 0
+            self._stat_proc     = 0
+            self._stat_det      = 0
+            self._stat_pnp      = 0
+            self._stat_dist_sum = 0.0
+            self._stat_t0       = now_s
             self._stat_pnp_skip_reason = None
 
         # Log and annotate
@@ -558,7 +889,8 @@ class VisionRX:
                 corners   = corners,
                 tvec      = tvec_cam,
                 drone_ned = drone_ned,
-                vel_ned   = vel_ned,
+                vel_ned   = vel_ned_pnp,
+                gate_ned  = gate_info['ned'] if gate_info is not None else None,
             )
 
             annotated = img.copy()
@@ -580,9 +912,9 @@ class VisionRX:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                             (0, 255, 255), 1, cv2.LINE_AA)
 
+            if self._debug_overlay:
+                annotated = self._draw_overlay(annotated, tvec_cam, centre_px, corners, vel_ned_pnp)
+
             # Always save frames with a detection; rate-limit background frames
             self.logger.log_frame(frame_id, annotated, force=detected)
 
-            # Save the orange mask alongside every saved annotated frame for debugging
-            if detected:
-                self.logger.log_frame(frame_id, masked, suffix="_mask")

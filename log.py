@@ -50,14 +50,17 @@ class Logger:
         }
 
         self._carrot = {
-            "t": [], "wp": [], "alpha": [],
+            "t": [], "wp": [],
             "vcx": [], "vcy": [], "vcz": [],
             "cx":  [], "cy":  [], "cz":  [],   # carrot NED position
+            "dx":  [], "dy":  [], "dz":  [],   # drone NED position
         }
 
         # Cascade controller signal log — one row per control tick (~250 Hz)
         self._cascade = {
             "t": [],
+            # Flight phase and vision mode
+            "flight_phase": [], "vis_mode": [],
             # Velocity: reference vs measured
             "vN_ref": [], "vE_ref": [], "vD_ref": [],
             "vN_meas": [], "vE_meas": [], "vD_meas": [],
@@ -126,6 +129,8 @@ class Logger:
             "tvec_x": [], "tvec_y": [], "tvec_z": [],   # z = forward distance
             # Drone NED position derived from PnP + known gate NED
             "pos_N": [], "pos_E": [], "pos_D": [],
+            # Known gate world NED position used for this PnP solve
+            "gate_N": [], "gate_E": [], "gate_D": [],
             # Velocity derived from consecutive PnP positions
             "vel_ok": [],
             "vel_N": [], "vel_E": [], "vel_D": [], "speed_ms": [],
@@ -192,13 +197,12 @@ class Logger:
             d["u0"].append(float(u[0])); d["u1"].append(float(u[1]))
             d["u2"].append(float(u[2])); d["u3"].append(float(u[3]))
 
-    def log_carrot(self, time_ms, wp, alpha, v_cmd, carrot_pos=None):
+    def log_carrot(self, time_ms, wp, v_cmd, carrot_pos=None, drone_pos=None):
         """Accumulate one carrot-tracker sample."""
         with self._lock:
             d = self._carrot
             d["t"].append(time_ms)
             d["wp"].append(int(wp))
-            d["alpha"].append(float(alpha))
             d["vcx"].append(float(v_cmd[0]))
             d["vcy"].append(float(v_cmd[1]))
             d["vcz"].append(float(v_cmd[2]))
@@ -206,6 +210,10 @@ class Logger:
             d["cx"].append(float(cp[0]))
             d["cy"].append(float(cp[1]))
             d["cz"].append(float(cp[2]))
+            dp = drone_pos if drone_pos is not None else [float('nan')] * 3
+            d["dx"].append(float(dp[0]))
+            d["dy"].append(float(dp[1]))
+            d["dz"].append(float(dp[2]))
 
     def log_ekf(self, t_us, wall_t, x, P_diag,
                 acc_applied, acc_innov,
@@ -253,11 +261,14 @@ class Logger:
                     phi_meas_deg, theta_meas_deg,
                     psi_meas_deg, psi_ref_deg,
                     p_des, q_des, r_des,
-                    rates, T_coll, R22, xi_vel):
+                    rates, T_coll, R22, xi_vel,
+                    flight_phase='', vis_mode=''):
         """Accumulate one cascade controller sample (called at control rate)."""
         with self._lock:
             d = self._cascade
             d["t"].append(float(time_ms))
+            d["flight_phase"].append(str(flight_phase))
+            d["vis_mode"].append(str(vis_mode))
             d["vN_ref"].append(float(v_ned_ref[0]));  d["vE_ref"].append(float(v_ned_ref[1]));  d["vD_ref"].append(float(v_ned_ref[2]))
             d["vN_meas"].append(float(v_ned_meas[0])); d["vE_meas"].append(float(v_ned_meas[1])); d["vD_meas"].append(float(v_ned_meas[2]))
             d["eN"].append(float(v_ned_ref[0] - v_ned_meas[0]))
@@ -298,7 +309,7 @@ class Logger:
 
     def log_vision(self, wall_t, frame_id, detected,
                    conf=0.0, bb=None, corners=None,
-                   tvec=None, drone_ned=None, vel_ned=None):
+                   tvec=None, drone_ned=None, vel_ned=None, gate_ned=None):
         """
         Accumulate one vision/YOLO/PnP sample (called at camera frame rate).
 
@@ -344,6 +355,12 @@ class Logger:
                 d["pos_D"].append(float(drone_ned[2]))
             else:
                 d["pos_N"].append(_nan); d["pos_E"].append(_nan); d["pos_D"].append(_nan)
+            # Gate world NED used for this PnP solve
+            if gate_ned is not None and pnp_ok:
+                d["gate_N"].append(float(gate_ned[0])); d["gate_E"].append(float(gate_ned[1]))
+                d["gate_D"].append(float(gate_ned[2]))
+            else:
+                d["gate_N"].append(_nan); d["gate_E"].append(_nan); d["gate_D"].append(_nan)
             # Velocity
             vel_ok = vel_ned is not None
             d["vel_ok"].append(int(vel_ok))
@@ -586,9 +603,8 @@ class Logger:
         fig, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
         ax_wp, ax_v, ax_c = axes
 
-        ax_wp.step(t, d["wp"],    label="waypoint index", where="post", linewidth=1.2)
-        ax_wp.plot(t, d["alpha"], label="blend α",        linewidth=0.8, linestyle="--")
-        ax_wp.set_ylabel("Waypoint / α")
+        ax_wp.step(t, d["wp"], label="waypoint index", where="post", linewidth=1.2)
+        ax_wp.set_ylabel("Waypoint index")
         ax_wp.set_title("Carrot Tracker — Active Waypoint")
         ax_wp.legend(loc="upper left")
         ax_wp.grid(True, alpha=0.4)
@@ -663,18 +679,20 @@ class Logger:
         t0 = d["t"][0]
         out = os.path.join(self.session_dir, "carrot.csv")
         with open(out, "w") as f:
-            f.write("time_s,wp,blend_alpha,"
+            f.write("time_s,wp,"
                     "vc_N_ms,vc_E_ms,vc_D_ms,v_cmd_ms,"
-                    "carrot_N_m,carrot_E_m,carrot_D_m\n")
+                    "carrot_N_m,carrot_E_m,carrot_D_m,"
+                    "drone_N_m,drone_E_m,drone_D_m\n")
             for i in range(len(d["t"])):
                 t_s   = (d["t"][i] - t0) / 1e3
                 v_mag = (d["vcx"][i]**2 + d["vcy"][i]**2 + d["vcz"][i]**2) ** 0.5
                 f.write(
                     f"{t_s:.4f},"
-                    f"{d['wp'][i]},{d['alpha'][i]:.4f},"
+                    f"{d['wp'][i]},"
                     f"{d['vcx'][i]:.4f},{d['vcy'][i]:.4f},{d['vcz'][i]:.4f},"
                     f"{v_mag:.4f},"
-                    f"{d['cx'][i]:.4f},{d['cy'][i]:.4f},{d['cz'][i]:.4f}\n"
+                    f"{d['cx'][i]:.4f},{d['cy'][i]:.4f},{d['cz'][i]:.4f},"
+                    f"{d['dx'][i]:.4f},{d['dy'][i]:.4f},{d['dz'][i]:.4f}\n"
                 )
         print(f"Logger: carrot CSV -> {out}")
 
@@ -895,6 +913,7 @@ class Logger:
         with self._lock:
             d  = {k: list(v) for k, v in self._ekf.items()}
             dc = {k: list(v) for k, v in self._carrot.items()}
+            dv = {k: list(v) for k, v in self._vision.items()}
         if not d["t_us"]:
             print("Logger: no EKF data for path plot, skipping.")
             return
@@ -925,6 +944,21 @@ class Logger:
 
         wp = self._waypoints   # (M, 3) NED or None
 
+        # ── Gate positions from vision log ───────────────────────────────
+        # gate_N/E/D are in world NED (track data from sim).  Deduplicate by
+        # rounding to 0.5 m so each physical gate appears as one marker.
+        gate_positions = None
+        if dv.get("gate_N"):
+            _gN = np.array(dv["gate_N"], dtype=float)
+            _gE = np.array(dv["gate_E"], dtype=float)
+            _gD = np.array(dv["gate_D"], dtype=float)
+            _ok = ~(np.isnan(_gN) | np.isnan(_gE) | np.isnan(_gD))
+            if _ok.any():
+                _pts   = np.stack([_gN[_ok], _gE[_ok], _gD[_ok]], axis=1)
+                _round = np.round(_pts * 2) / 2   # 0.5 m grid for dedup
+                _, _ui = np.unique(_round, axis=0, return_index=True)
+                gate_positions = _pts[np.sort(_ui)]   # (K, 3) world NED
+
         # ── Figure with 2 panels ─────────────────────────────────────────
         fig, (ax_map, ax_alt) = plt.subplots(1, 2, figsize=(16, 7))
         fig.suptitle("EKF Dead-Reckoned Path vs Planned Waypoints", fontsize=13)
@@ -946,14 +980,23 @@ class Logger:
         ax_map.plot(pE[0],  pN[0],  "g^", ms=10, zorder=6, label="Start")
         ax_map.plot(pE[-1], pN[-1], "rs", ms=10, zorder=6, label="End")
 
+        # ── Gate positions from vision (world NED) ───────────────────────
+        if gate_positions is not None:
+            for i, (gn, ge, gd) in enumerate(gate_positions):
+                ax_map.plot(ge, gn, "D", color="magenta", ms=10, zorder=8,
+                            label="Gates (world NED)" if i == 0 else "_nolegend_")
+                ax_map.annotate(f"G{i}", (ge, gn),
+                                textcoords="offset points", xytext=(6, 4),
+                                fontsize=8, color="magenta", zorder=9)
+
         # ── Carrot quivers ───────────────────────────────────────────────
         # Show where the carrot point is and which direction it is commanding,
         # subsampled to ~40 arrows so the map stays readable.
         if dc["t"] and len(dc["t"]) >= 2:
             _n   = len(dc["t"])
             _step = max(1, _n // 40)
-            _cE  = np.array(dc["cy"])[::_step]    # carrot East  position
-            _cN  = np.array(dc["cx"])[::_step]    # carrot North position
+            _dE  = np.array(dc["dy"])[::_step]    # drone East  position
+            _dN  = np.array(dc["dx"])[::_step]    # drone North position
             _vE  = np.array(dc["vcy"])[::_step]   # velocity East  component
             _vN  = np.array(dc["vcx"])[::_step]   # velocity North component
             # Normalise arrow length so scale is independent of v_ref value
@@ -961,7 +1004,7 @@ class Logger:
             _mask = _spd > 0.01
             if _mask.any():
                 ax_map.quiver(
-                    _cE[_mask], _cN[_mask],
+                    _dE[_mask], _dN[_mask],
                     _vE[_mask] / _spd[_mask], _vN[_mask] / _spd[_mask],
                     color="darkorange", alpha=0.75,
                     scale=25, scale_units="width", width=0.004,
@@ -1013,6 +1056,14 @@ class Logger:
                          "k--o", lw=1.2, ms=6, label="Planned path")
                 for i, wpt in enumerate(wp):
                     ax3.text(wpt[1], wpt[0], -wpt[2], f" WP{i}", fontsize=8)
+
+            if gate_positions is not None:
+                ax3.scatter(gate_positions[:, 1], gate_positions[:, 0],
+                            -gate_positions[:, 2],
+                            c="magenta", s=120, marker="D", zorder=8,
+                            label="Gates (world NED)")
+                for i, (gn, ge, gd) in enumerate(gate_positions):
+                    ax3.text(ge, gn, -gd, f" G{i}", fontsize=8, color="magenta")
 
             ax3.set_xlabel("East (m)")
             ax3.set_ylabel("North (m)")
@@ -1112,7 +1163,7 @@ class Logger:
         out = os.path.join(self.session_dir, "cascade.csv")
         with open(out, "w") as f:
             f.write(
-                "time_s,"
+                "time_s,flight_phase,vis_mode,"
                 "vN_ref,vE_ref,vD_ref,vN_meas,vE_meas,vD_meas,"
                 "eN,eE,eD,xi_N,xi_E,xi_D,"
                 "phi_des_deg,theta_des_deg,phi_meas_deg,theta_meas_deg,"
@@ -1125,6 +1176,7 @@ class Logger:
                 t_s = (d["t"][i] - t0) / 1e3
                 f.write(
                     f"{t_s:.4f},"
+                    f"{d['flight_phase'][i]},{d['vis_mode'][i]},"
                     f"{d['vN_ref'][i]:.4f},{d['vE_ref'][i]:.4f},{d['vD_ref'][i]:.4f},"
                     f"{d['vN_meas'][i]:.4f},{d['vE_meas'][i]:.4f},{d['vD_meas'][i]:.4f},"
                     f"{d['eN'][i]:.4f},{d['eE'][i]:.4f},{d['eD'][i]:.4f},"

@@ -43,6 +43,7 @@ controller.arm()
 time.sleep(1.0)
 if logger is not None:
     logger.reset_flight_data()
+
 print("Starting control loop...", flush=True)
 try:
     while True:

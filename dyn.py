@@ -58,7 +58,6 @@ def load_params(yaml_path="params.yaml"):
     p['waypoints']       = np.array(raw['waypoints'], dtype=float)  # (M, 3)
     p['v_ref']           = float(raw['v_ref'])
     p['lookahead_gain']  = float(raw['lookahead_gain'])
-    p['tau']             = float(raw['tau'])
     p['T_max_motor']     = float(raw['T_max_motor'])
     p['tau_motor']       = float(raw.get('tau_motor', 0.05))
 
@@ -92,6 +91,13 @@ def load_params(yaml_path="params.yaml"):
         Q_diag    = Q_vel + Q_quat + Q_rates + Q_int_vel + [Q_int_psi]
         p['Q_aug'] = np.diag(Q_diag)
         p['R_cost'] = np.eye(4) * float(raw['R_cost'])
+
+    # Pass through any YAML keys not already explicitly extracted above
+    # (e.g. vision params, logging flags, blip tuning).
+    # Physics keys already in p keep their transformed numpy forms.
+    for k, v in raw.items():
+        if k not in p:
+            p[k] = v
 
     return p
 

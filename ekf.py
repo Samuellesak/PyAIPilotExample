@@ -236,6 +236,17 @@ class QuadEKF:
         # Normalise to guard against floating-point drift
         self.x[self._IQ] /= np.linalg.norm(self.x[self._IQ])
 
+    def set_attitude(self, phi, theta, psi):
+        """Rebuild quaternion from explicit roll/pitch/yaw (ZYX Tait-Bryan)."""
+        cp, sp = np.cos(phi/2),   np.sin(phi/2)
+        ct, st = np.cos(theta/2), np.sin(theta/2)
+        cy, sy = np.cos(psi/2),   np.sin(psi/2)
+        self.x[6]  = cy*ct*cp + sy*st*sp   # qw
+        self.x[7]  = cy*ct*sp - sy*st*cp   # qx
+        self.x[8]  = cy*st*cp + sy*ct*sp   # qy
+        self.x[9]  = sy*ct*cp - cy*st*sp   # qz
+        self.x[self._IQ] /= np.linalg.norm(self.x[self._IQ])
+
     def set_roll(self, phi):
         """
         Inject a roll angle [rad] into the quaternion while preserving
