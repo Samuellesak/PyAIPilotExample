@@ -48,10 +48,16 @@ time.sleep(1.0)
 if logger is not None:
     logger.reset_flight_data()
 
+FLIGHT_TIMEOUT_S = 70.0
+
 print("Starting control loop...", flush=True)
+_flight_start = time.time()
 try:
     while True:
         controller.update()
+        if time.time() - _flight_start >= FLIGHT_TIMEOUT_S:
+            print(f"\nFlight timeout ({FLIGHT_TIMEOUT_S:.0f}s), saving logs...", flush=True)
+            break
 except KeyboardInterrupt:
     print("\nCtrl+C received, saving logs...", flush=True)
 finally:

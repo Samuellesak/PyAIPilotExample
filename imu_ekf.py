@@ -114,6 +114,7 @@ class IMUEKFHandler:
                 'acc_imu_x', 'acc_imu_y', 'acc_imu_z',
                 'acc_model_x', 'acc_model_y', 'acc_model_z',
                 'err_x', 'err_y', 'err_z', 'err_norm',
+                'vel_N', 'vel_E', 'vel_D',
             ])
             print(f'[IMUEKFHandler] model_predict_shadow → {self._mp_shadow_path}', flush=True)
 
@@ -283,7 +284,7 @@ class IMUEKFHandler:
                     acc_model  = ((np.array([0.0, 0.0, -_T_total]) + _F_drag)
                                   / float(self._param['m']))
                     # Shadow log: compare model vs raw IMU (every 10th tick ≈ 25 Hz)
-                    if _use_shd and self._hover_reset_done:
+                    if _use_shd and self._hover_reset_done and self._mp_shadow_writer is not None:
                         self._mp_shadow_tick += 1
                         if self._mp_shadow_tick % 10 == 0:
                             _err = acc_model - acc
@@ -295,6 +296,7 @@ class IMUEKFHandler:
                                 f'{acc_model[0]:.4f}', f'{acc_model[1]:.4f}', f'{acc_model[2]:.4f}',
                                 f'{_err[0]:.4f}', f'{_err[1]:.4f}', f'{_err[2]:.4f}',
                                 f'{float(np.linalg.norm(_err)):.4f}',
+                                f'{self._ekf.x[3]:.3f}', f'{self._ekf.x[4]:.3f}', f'{self._ekf.x[5]:.3f}',
                             ])
 
         acc_predict = acc_model if (_use_mp and acc_model is not None) else acc
@@ -441,9 +443,14 @@ class IMUEKFHandler:
         """Close shadow CSV and generate a comparison plot PNG."""
         if self._mp_shadow_file is None:
             return
-        self._mp_shadow_file.flush()
-        self._mp_shadow_file.close()
-        self._mp_shadow_file = None
+        # Null out writer first — on_imu_msg checks writer is not None before writing,
+        # so after this assignment the MAVLink thread will skip any further writes.
+        _writer = self._mp_shadow_writer
+        _file   = self._mp_shadow_file
+        self._mp_shadow_writer = None
+        self._mp_shadow_file   = None
+        _file.flush()
+        _file.close()
 
         if self._mp_shadow_path is None:
             return
@@ -485,7 +492,7 @@ class IMUEKFHandler:
         err_norm    = np.array([r['err_norm']     for r in rows])
         T_total     = np.array([r['T_total_N']    for r in rows])
 
-        fig, axes = plt.subplots(5, 1, figsize=(12, 14), sharex=True)
+        fig, axes = plt.subplots(6, 1, figsize=(12, 16), sharex=True)
         fig.suptitle('Model-predict shadow: IMU vs model acceleration', fontsize=13)
 
         for ax, imu, mdl, label in [
@@ -505,8 +512,18 @@ class IMUEKFHandler:
 
         axes[4].plot(t, T_total, color='tab:green', lw=1.0)
         axes[4].set_ylabel('T_total [N]', fontsize=9)
-        axes[4].set_xlabel('time [s]', fontsize=9)
         axes[4].grid(True, lw=0.4)
+
+        vel_N = np.array([r['vel_N'] for r in rows])
+        vel_E = np.array([r['vel_E'] for r in rows])
+        vel_D = np.array([r['vel_D'] for r in rows])
+        axes[5].plot(t, vel_N, label='vN', lw=1.0)
+        axes[5].plot(t, vel_E, label='vE', lw=1.0)
+        axes[5].plot(t, vel_D, label='vD', lw=1.0)
+        axes[5].set_ylabel('vel_ned [m/s]', fontsize=9)
+        axes[5].set_xlabel('time [s]', fontsize=9)
+        axes[5].legend(fontsize=8, loc='upper right')
+        axes[5].grid(True, lw=0.4)
 
         fig.tight_layout()
         png_path = os.path.splitext(self._mp_shadow_path)[0] + '.png'

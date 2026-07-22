@@ -49,13 +49,20 @@ initial_yaw_deg: 180.0
 waypoints: # Ground truth NED coordinates of the gates (from sim TRACK messages).
   - [    0.0,   0.0,   0.0]   #Start
   - [-23.29796791,  -0.39990234,  -1.03195801]   
-  - [-46.89374924,  -2.49999022,   3.0680418]    
+  - [-46.89374924,  -2.49999022,   4.0680418]    
   - [-74.59375,      1.2000097,   12.66804123]    
   - [-111.4937439,   -5.09998989,   23.56804085]    
   - [-135.4937439,    -0.79999024,   24.35565376]
   - [-159.19374084,   -4.39999008,   24.96804047]   
   # Drone faces North (psi=0°).  Gates are 25 m apart along the +N axis.
   # D=0 keeps the reference altitude at launch height.
+
+  #[TRACK] gate 0: NED=[-23.29796791  -0.39990234  -0.03195801]  2.7x2.7m
+#[TRACK] gate 1: NED=[-46.89374924  -2.49999022   5.0680418 ]  2.7x2.7m
+#[TRACK] gate 2: NED=[-74.59375      1.2000097   13.66804123]  2.7x2.7m
+#[TRACK] gate 3: NED=[-111.4937439    -5.09998989   24.56804085]  2.7x2.7m
+#[TRACK] gate 4: NED=[-135.4937439    -0.79999024   25.35565376]  2.7x2.7m
+#[TRACK] gate 5: NED=[-159.19374084   -4.39999008   25.96804047]  2.7x2.7m
 
 # ── Camera intrinsics (pinhole, no distortion) ────────────────────────
 # Starting assumption: 640×480, 90° horizontal FOV → fx = fy = image_width/2.
@@ -145,8 +152,8 @@ model_predict_shadow:    true   # log acc_model vs acc_imu to logs/model_predict
 ground_truth_mode:  true
 
 
-v_ref:          3.0   # reference cruise speed [m/s]
-lookahead_gain: 0.6   # lookahead distance = lookahead_gain * v_ref [m] 1
+v_ref:          6.0   # reference cruise speed [m/s]
+lookahead_gain: 2.0   # lookahead distance = lookahead_gain * v_ref [m]; larger = smoother carrot direction
 
 # ── Controller selection ─────────────────────────────────────────────────────
 # 1 = Cascade PI  (analytical gains, no offline solve required)
@@ -177,13 +184,15 @@ yolo_enabled: true
 # maintain altitude.  Appears constant in logs because the drone flies near-level.
 # Per-axis velocity PI gains (NED frame).  No position hold loop — altitude is managed
 # by vD alone: v_ref_D=0 in hover, carrot D component during race.
-Kp_vN:  0.4496   # North velocity P  [1/s]  — sysid_vel: τ_v=4.59 s, T_settle=1.5 s
+Kp_vN:  1.8496   # North velocity P  [1/s]  — sysid_vel: τ_v=4.59 s, T_settle=1.5 s
 Ki_vN:  0.2812   # North velocity I  [1/s²]
-Kp_vE:  0.4489   # East  velocity P  [1/s]  — sysid_vel: τ_v=4.44 s, T_settle=1.5 s
+Kp_vE:  1.8489   # East  velocity P  [1/s]  — sysid_vel: τ_v=4.44 s, T_settle=1.5 s
 Ki_vE:  0.2812   # East  velocity I  [1/s²]
 tau_vN: 4.59     # North velocity plant time constant [s]  — used for feedforward
 tau_vE: 4.44     # East  velocity plant time constant [s]  — used for feedforward
-Kp_vD:  0.08    # Down  velocity P  [1/s]  — higher: stronger correction for vD drift
+K_dv:   0.5      # reference-derivative lag compensator gain [s]; 0=off, tune 0.3–0.5 after fixing carrot oscillation
+tau_ref_smooth: 0.15  # [s] 1st-order LP on v_ned_ref before PI; smooths carrot direction oscillation; 0=off
+Kp_vD:  1.5    # Down  velocity P  [1/s]  — higher: stronger correction for vD drift
 Ki_vD:  0.1  # Down  velocity I  [1/s²] — small integral to trim steady-state vD offset
 
 # ── Velocity measurement filter time constants ────────────────────────────────
@@ -198,10 +207,10 @@ tau_vel_d: 0  # vertical   (vD)     filter τ [s]
 # triggering multiple waypoint advances.
 gate_debounce_sec: 2.0
 
-K_att:  2.5      # halved from 6.0: sim inner loop has ~2× rate overshoot (sysid measured q_meas/q_des=2.29)1      # attitude P: tilt error [rad] -> rate command [rad/s]
+K_att:  4.5      # halved from 6.0: sim inner loop has ~2× rate overshoot (sysid measured q_meas/q_des=2.29)1      # attitude P: tilt error [rad] -> rate command [rad/s]
                   # TUNE THIS after rate loop is identified — must stay < rate_bandwidth/3
 
-K_psi:   2.5      # yaw P   [1/s] 2
+K_psi:   4.5      # yaw P   [1/s] 2
 Ki_psi:  0.0002    # yaw I   [1/s^2]  = K_psi^2 / 5 0.2
 
 MAX_TILT_DEG: 35.0   # outer loop tilt limit [deg]  (max horiz accel ~3.4 m/s^2)

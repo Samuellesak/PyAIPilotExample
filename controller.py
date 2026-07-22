@@ -66,6 +66,15 @@ class Controller:
         _tau_vE = float(param.get('tau_vE', 0.0))
         self._ff_vN    = (1.0 / _tau_vN) if _tau_vN > 0.0 else 0.0
         self._ff_vE    = (1.0 / _tau_vE) if _tau_vE > 0.0 else 0.0
+        # Reference-derivative feedforward: a_lag = K_dv * dv_ref/dt
+        # Pre-commands acceleration for changing reference, reducing tracking lag.
+        # Applied to the smoothed reference (post-LP) so noise is not amplified.
+        self._K_dv        = float(param.get('K_dv', 0.0))
+        self._v_ref_prev  = np.zeros(3)
+        # First-order LP on v_ned_ref: smooths carrot oscillation before PI.
+        # tau_ref_smooth=0 disables (pass-through). Applied before PT2 and PI.
+        self._tau_ref_smooth = float(param.get('tau_ref_smooth', 0.0))
+        self._v_ref_smooth   = None   # initialised on first carrot tick
         self._K_att    = float(param['K_att'])
         self._K_psi    = float(param['K_psi'])
         self._Ki_psi   = float(param['Ki_psi'])
@@ -298,6 +307,7 @@ class Controller:
             # Carrot tracking: use EKF position to follow the waypoint path.
             if not self._carrot_active:
                 self._carrot_active  = True
+                self._v_ref_smooth   = None   # reset LP so it init from first carrot reference
                 # params.yaml waypoints are in WORLD NED (WP0 = launch point).
                 # The EKF has been zeroed to LOCAL NED at hover entry.  Convert
                 # all waypoints to local once so the tracker stays frame-consistent.
@@ -582,6 +592,27 @@ class Controller:
         self._vD_filt = alpha_vD * self._vD_filt + (1.0 - alpha_vD) * v_ned_meas[2]
         v_ned_meas_filt = np.array([self._vN_filt, self._vE_filt, self._vD_filt])
 
+        # ── 1st-order LP on v_ned_ref ─────────────────────────────────────────
+        # Smooths carrot oscillation before it reaches the PI and lag FF.
+        # tau_ref_smooth=0 (default) disables.
+        if self._tau_ref_smooth > 0.0:
+            _alpha_ref = np.exp(-dt / self._tau_ref_smooth)
+            if self._v_ref_smooth is None:
+                self._v_ref_smooth = v_ned_ref.copy()
+            self._v_ref_smooth = _alpha_ref * self._v_ref_smooth + (1.0 - _alpha_ref) * v_ned_ref
+            v_ned_ref = self._v_ref_smooth.copy()
+
+        # ── Reference-derivative feedforward ──────────────────────────────────
+        # a_lag = K_dv * dv_ref/dt: pre-commands the acceleration needed to track
+        # a changing reference, reducing velocity tracking lag during transitions.
+        if self._K_dv > 0.0:
+            _dv = np.clip((v_ned_ref - self._v_ref_prev) / max(dt, 0.001), -20.0, 20.0)
+            _a_lag_N = self._K_dv * _dv[0]
+            _a_lag_E = self._K_dv * _dv[1]
+        else:
+            _a_lag_N = _a_lag_E = 0.0
+        self._v_ref_prev = v_ned_ref.copy()
+
         e_vel = v_ned_ref - v_ned_meas_filt
 
         # Velocity integrators with input clamping (anti-windup) and delayed activation.
@@ -616,9 +647,9 @@ class Controller:
         # (~11 m/s upward) would otherwise cut collective to ~0.5 N/motor.
         g   = self._g
         a_N = (self._Kp_vN * e_vel_c[0] + self._Ki_vN * self.xi_vel[0]
-               + self._ff_vN * v_ned_ref[0])
+               + self._ff_vN * v_ned_ref[0] + _a_lag_N)
         a_E = (self._Kp_vE * e_vel_c[1] + self._Ki_vE * self.xi_vel[1]
-               + self._ff_vE * v_ned_ref[1])
+               + self._ff_vE * v_ned_ref[1] + _a_lag_E)
 
         # Rotate desired NED acceleration into body-frame components.
         # At psi=0 (north-facing) this is identity; at other headings it projects
