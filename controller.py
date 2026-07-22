@@ -60,6 +60,12 @@ class Controller:
         self._Ki_vE    = float(param['Ki_vE'])
         self._Kp_vD    = float(param['Kp_vD'])
         self._Ki_vD    = float(param['Ki_vD'])
+        # Velocity feedforward coefficients: ff = v_ref / tau_v adds the acceleration
+        # needed to hold v_ref against drag without waiting for integrator wind-up.
+        _tau_vN = float(param.get('tau_vN', 0.0))
+        _tau_vE = float(param.get('tau_vE', 0.0))
+        self._ff_vN    = (1.0 / _tau_vN) if _tau_vN > 0.0 else 0.0
+        self._ff_vE    = (1.0 / _tau_vE) if _tau_vE > 0.0 else 0.0
         self._K_att    = float(param['K_att'])
         self._K_psi    = float(param['K_psi'])
         self._Ki_psi   = float(param['Ki_psi'])
@@ -410,7 +416,7 @@ class Controller:
                                                PSI_RATE_MAX * _actual_dt))
         # PT2 filter on velocity reference — smooths step-changes from mode transitions.
         # Applied in carrot mode only; hover holds v_ref=0 unchanged.
-        if not in_hover and self._carrot_active:
+        if not in_hover and self._carrot_active and self._pt2_omega0 > 0:
             _w0  = self._pt2_omega0
             _z   = self._pt2_zeta
             _err = v_ref_for_gains - self._v_ref_pt2_x
@@ -442,6 +448,26 @@ class Controller:
                 self.tracker.wp = new_wp
                 print(f"[GATE PASSED id={self.data.get('last_gate_id')}] "
                       f"tracker.wp → {self.tracker.wp}", flush=True)
+
+        # Path-progress fallback: advance wp when drone reaches within 3 m of the target
+        # waypoint along the segment.  Fires when the sim does not send COLLISION (e.g.
+        # before race_started=True).  Harmless when COLLISION already fired — the
+        # tracker.wp will already equal or exceed the computed new_wp so the guard below
+        # prevents any double-advance.
+        if (self._carrot_active and not in_hover
+                and self.tracker.wp < self.tracker.n_waypoints - 1):
+            _r0  = np.asarray(self.tracker.waypoints[self.tracker.wp - 1], dtype=float)
+            _r1  = np.asarray(self.tracker.waypoints[self.tracker.wp],     dtype=float)
+            _seg = _r1 - _r0
+            _seg_len = float(np.linalg.norm(_seg))
+            if _seg_len > 0.1:
+                _lam = float(np.dot(pos_ned - _r0, _seg / _seg_len))
+                if _lam >= _seg_len - 3.0:
+                    _nwp = self.tracker.wp + 1
+                    if _nwp > self.tracker.wp:
+                        self.tracker.wp = _nwp
+                        print(f"[PATH ADVANCE wp→{self.tracker.wp}]  "
+                              f"lambda={_lam:.1f}/{_seg_len:.1f}m", flush=True)
 
         _, _, psi_meas = quat_to_euler(quat)
 
@@ -589,8 +615,10 @@ class Controller:
         # Use clamped error for proportional path too: unclamped liftoff vz
         # (~11 m/s upward) would otherwise cut collective to ~0.5 N/motor.
         g   = self._g
-        a_N = self._Kp_vN * e_vel_c[0] + self._Ki_vN * self.xi_vel[0]
-        a_E = self._Kp_vE * e_vel_c[1] + self._Ki_vE * self.xi_vel[1]
+        a_N = (self._Kp_vN * e_vel_c[0] + self._Ki_vN * self.xi_vel[0]
+               + self._ff_vN * v_ned_ref[0])
+        a_E = (self._Kp_vE * e_vel_c[1] + self._Ki_vE * self.xi_vel[1]
+               + self._ff_vE * v_ned_ref[1])
 
         # Rotate desired NED acceleration into body-frame components.
         # At psi=0 (north-facing) this is identity; at other headings it projects
@@ -645,6 +673,10 @@ class Controller:
         thrust_norm = T_collective [N, total over 4 motors] / (4 * T_max_motor).
         """
         thrust_norm = float(np.clip(T_collective / (4.0 * self.T_max), 0.0, 1.0))
+        # Sign map (mavlink_rx negates sim pitch → sign_q now +1, sign_r still -1):
+        #   p: FRD-compatible → send as-is
+        #   q: FRD-compatible after pitch sign fix in mavlink_rx → send as-is
+        #   r: reversed in sim → negate
         self.sim_conn.mav.set_attitude_target_send(
             int(time.time() * 1e3) & 0xFFFFFFFF,
             self.sim_conn.target_system,
@@ -653,7 +685,7 @@ class Controller:
             [1.0, 0.0, 0.0, 0.0],      # attitude quaternion (ignored)
             float(p_des),
             float(q_des),
-            float(r_des),
+            float(-r_des),
             thrust_norm,
         )
         if self._logger is not None:

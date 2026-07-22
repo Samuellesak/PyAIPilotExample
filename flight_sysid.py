@@ -56,6 +56,7 @@ from pymavlink import mavutil
 
 from dyn import load_params
 from mavlink_rx import MAVLinkRX
+from imu_ekf import IMUEKFHandler
 
 # ── Connection ───────────────────────────────────────────────────────────────
 SIM_IP   = "127.0.0.1"
@@ -67,7 +68,7 @@ DT          = 1.0 / CONTROL_HZ
 
 WAIT_SEC     = 3.5
 BLIP_OBS_SEC = 2.0
-HOVER_SEC    = 10.0
+HOVER_SEC    = 5.0
 EXCITE_SEC   = 0.5
 SETTLE_SEC   = 1.0
 
@@ -75,11 +76,12 @@ SETTLE_SEC   = 1.0
 Q_TEST = 0.4          # [rad/s] — small enough to stay controllable
 
 # ── Hover altitude controller ────────────────────────────────────────────────
-# Uses IMU body-z specific force (az) instead of EKF vD.
-# At any attitude with thrust T along -body_z: az = -T/m (independent of tilt).
-# At hover (T = m*g): az = -g.  Deviation from -g → proportional thrust correction.
-# Tight clamp prevents runaway if the IMU reading is temporarily unreliable.
-KP_AZ  = 0.015        # az deviation [m/s²] → T_norm correction
+# Primary: GT PD on pD / vD (when ground_truth_mode: true).
+# Fallback: body-z specific force (az) — used when GT not available.
+KP_AZ  = 0.015        # az fallback: deviation [m/s²] → T_norm correction
+KP_ALT = 0.12         # GT alt P: pD error [m]   → thrust correction
+KD_ALT = 0.15         # GT alt D: vD error [m/s] → thrust correction
+ALT_TARGET_M = 3.5    # takeoff / hover target altitude above ground [m]
 
 # ── Attitude hold (outer P loop: angle [rad] → rate cmd [rad/s]) ─────────────
 K_ATT        = 3.0    # pitch/roll P gain
@@ -88,9 +90,13 @@ Q_PSI_MAX    = 0.20   # max yaw rate for heading-hold settle [rad/s]
 
 
 # ── Analysis thresholds ───────────────────────────────────────────────────────
-ATT_ERROR_WARN_DEG = 3.0    # EKF theta vs acc-implied theta discrepancy [deg]
-MASS_ERROR_WARN    = 0.30   # relative mass discrepancy (30 %)
-SIGN_THRESH_DEG    = 1.0    # min |Δangle| to call a sign [deg]
+ATT_ERROR_WARN_DEG  = 3.0    # EKF theta vs acc-implied theta discrepancy [deg]
+MASS_ERROR_WARN     = 0.30   # relative mass discrepancy (30 %)
+SIGN_THRESH_DEG     = 1.0    # min |Δangle| to call a sign [deg]
+
+# ── Spin / crash detection thresholds ────────────────────────────────────────
+SPIN_RATE_LIMIT_RPS = 8.0    # |ω| abort threshold [rad/s]  (~286 deg/s)
+TILT_LIMIT_DEG      = 55   # |phi| or |theta| abort threshold [deg] 55.0 
 
 MAVLINK_CMD_SIM_RESET = 31000
 
@@ -139,13 +145,20 @@ def _send_motors(conn, u_norm):
 
 
 def _send_attitude_target(conn, p, q, r, thrust_norm):
-    """Send body-rate setpoint + collective thrust (type_mask=0x80: ignore quat)."""
+    """Send body-rate setpoint + collective thrust (type_mask=0x80: ignore quat).
+
+    Sysid-confirmed sign map (flight_sysid_gt.py):
+      p axis: FRD-compatible  → send as-is
+      q axis: reversed in sim → negate
+      r axis: reversed in sim → negate
+    Callers use standard FRD convention; correction is applied here.
+    """
     conn.mav.set_attitude_target_send(
         int(time.time() * 1e3) & 0xFFFFFFFF,
         conn.target_system, conn.target_component,
         0x80,
         [1.0, 0.0, 0.0, 0.0],
-        float(p), float(q), float(r),
+        float(p), float(-q), float(-r),
         float(np.clip(thrust_norm, 0.0, 1.0)),
     )
 
@@ -166,25 +179,30 @@ def _arm(conn):
     )
 
 
-def _level_rates(shared):
+def _level_rates(shared, param):
     """Return (p_des, q_des) that drive phi/theta toward zero.
 
-    Before the post-blip EKF reset: uses raw IMU acc (gives phi=theta≈0 in
-    flight at hover thrust — harmless, drone just floats).
-    After the post-blip EKF reset: uses EKF quaternion, which is now accurate
-    to within ~3°.  This is necessary because IMU acc at hover thrust always
-    reads [0,0,-g] in body frame regardless of physical tilt, so acc-based
-    attitude estimation cannot detect roll or pitch angles in flight.
+    In ground truth mode mav_state['quat'] is always the sim GT quaternion —
+    use it immediately without waiting for the post-blip EKF reset.
+    In EKF mode, fall back to acc-implied attitude until the post-blip
+    re-init fires (acc at hover thrust reads [0,0,-g] regardless of tilt,
+    so the fallback always returns ≈0, which is safe but blind).
     """
-    if shared.get('post_blip_att_reset_done'):
-        # EKF is accurate after the reset — use quaternion for real attitude feedback.
-        mav = shared.get('mav_state')
+    mav = shared.get('mav_state')
+
+    if param.get('ground_truth_mode', False):
         if mav is None:
             return 0.0, 0.0
         phi, theta, _ = _quat_to_euler(mav['quat'])
         return float(-K_ATT * phi), float(-K_ATT * theta)
 
-    # EKF not yet corrected — fall back to acc (returns 0 in flight, which is safe)
+    if shared.get('post_blip_att_reset_done'):
+        if mav is None:
+            return 0.0, 0.0
+        phi, theta, _ = _quat_to_euler(mav['quat'])
+        return float(-K_ATT * phi), float(-K_ATT * theta)
+
+    # Fallback: acc-implied attitude (returns ≈0 during flight — safe but blind)
     imu = shared.get('imu_raw')
     if imu is None:
         return 0.0, 0.0
@@ -192,11 +210,30 @@ def _level_rates(shared):
     ay = float(imu.get('ay', 0.0))
     az = float(imu.get('az', 0.0))
     acc_norm = float(np.sqrt(ax**2 + ay**2 + az**2))
-    if abs(acc_norm - 9.81) > 2.5:   # blip thrust — acc is unreliable
+    if abs(acc_norm - 9.81) > 2.5:
         return 0.0, 0.0
     theta = float(np.arcsin(np.clip(ax / 9.81, -1.0, 1.0)))
     phi   = float(np.arcsin(np.clip(ay / (9.81 * max(np.cos(theta), 0.1)), -1.0, 1.0)))
     return float(-K_ATT * phi), float(-K_ATT * theta)
+
+
+def _thrust_from_alt(shared, param, pD_ref, T_hover_norm, T_min=0.20, T_max_th=0.50):
+    """Altitude hold thrust command.
+
+    When ground_truth_mode: true, uses a PD controller on GT pos/vel (NED):
+      pD - pD_ref > 0  (below target, D positive down) → add thrust
+      vD > 0           (descending)                    → add thrust
+    Falls back to body-az proportional control otherwise.
+    """
+    if param.get('ground_truth_mode', False):
+        mav = shared.get('mav_state')
+        if mav is not None:
+            pD = float(mav['pos_ned'][2])
+            vD = float(mav['vel_ned'][2])
+            T_corr = KP_ALT * (pD - pD_ref) + KD_ALT * vD
+            return float(np.clip(T_hover_norm + T_corr, T_min, T_max_th))
+    az = float(shared.get('imu_raw', {}).get('az', -9.81))
+    return float(np.clip(T_hover_norm + KP_AZ * (az + 9.81), T_min, min(T_max_th, 0.38)))
 
 
 def _read_state(shared):
@@ -225,7 +262,7 @@ def main():
     T_max      = float(param['T_max_motor'])
     m_yaml     = float(param['m'])
     g          = float(param['g'])
-    blip_frac  = float(param.get('blip_thrust_frac', 0.35))
+    blip_frac  = float(param.get('blip_thrust_frac', 0.5))
     blip_dur   = float(param.get('blip_dur_sec',     0.15))
 
     T_hover_theory = m_yaml * g          # total hover thrust [N]
@@ -246,10 +283,14 @@ def main():
     shared = {}
     rx = MAVLinkRX.create_mavlink_rx(conn, shared, logger=None)
 
+    ekf_handler = IMUEKFHandler(shared, param)
+    ekf_handler.register(rx)
+
     # ── Reset + arm ────────────────────────────────────────────────────────
     print("Resetting sim…", flush=True)
     _send_reset(conn)
     time.sleep(2.0)
+    rx.request_ground_truth_streams(rate_hz=50)
 
     print("\nPress 's' to arm and start the sysid pipeline…", flush=True)
     while True:
@@ -287,6 +328,54 @@ def main():
     blip_min_theta  = 0.0    # most negative theta during blip+recovery [deg]
     blip_max_theta  = 0.0    # most positive theta during blip+recovery [deg]
 
+    # ── Analysis defaults (safe if abort occurs before a phase completes) ──
+    att_error_deg       = float('nan')
+    theta_post_blip_ekf = float('nan')
+    theta_acc_implied   = float('nan')
+    psi_post_blip       = 0.0
+    m_identified        = m_yaml
+    az_hover            = float('nan')
+    T_norm_meas         = T_hover_norm
+    theta_hover_ekf     = float('nan')
+    theta_hover_acc     = float('nan')
+    att_error_hover     = float('nan')
+    dtheta_plus = dtheta_minus = dphi_plus = dpsi_plus = 0.0
+
+    # ── Abort detection ────────────────────────────────────────────────────
+    # _aborted is empty (falsy) until the first limit violation, then holds
+    # [(reason_str, t_wall_s)].  _guard() is called each loop iteration.
+    _aborted = []
+
+    def _guard(phase):
+        """Kill motors and flag abort when spin / over-tilt is detected."""
+        if _aborted:
+            return
+        mav = shared.get('mav_state')
+        if mav is None:
+            return
+        phi, theta, _ = _quat_to_euler(mav['quat'])
+        phi_d   = float(np.rad2deg(phi))
+        theta_d = float(np.rad2deg(theta))
+        imu = shared.get('imu_raw')
+        rate_mag = 0.0
+        if imu is not None:
+            rate_mag = float(np.sqrt(imu['gx']**2 + imu['gy']**2 + imu['gz']**2))
+        if abs(phi_d) > TILT_LIMIT_DEG:
+            reason = f"roll={phi_d:+.1f}° > ±{TILT_LIMIT_DEG:.0f}° [{phase}]"
+        elif abs(theta_d) > TILT_LIMIT_DEG:
+            reason = f"pitch={theta_d:+.1f}° > ±{TILT_LIMIT_DEG:.0f}° [{phase}]"
+        elif rate_mag > SPIN_RATE_LIMIT_RPS:
+            reason = f"|ω|={rate_mag:.2f} rad/s > {SPIN_RATE_LIMIT_RPS:.1f} [{phase}]"
+        else:
+            return
+        _send_motors(conn, 0.0)
+        _aborted.append((reason, time.time()))
+        print(f"\n{'!'*60}", flush=True)
+        print(f"  ABORT: {reason}", flush=True)
+        print(f"  phi={phi_d:+.1f}°  theta={theta_d:+.1f}°  |ω|={rate_mag:.2f} rad/s",
+              flush=True)
+        print(f"{'!'*60}\n", flush=True)
+
     # ── WAIT PHASE ─────────────────────────────────────────────────────────
     t0     = time.time()
     phase  = "WAIT"
@@ -295,7 +384,10 @@ def main():
     _send_motors(conn, 0.0)
 
     while time.time() - t0 < WAIT_SEC:
+        if _aborted:
+            break
         t = time.time() - t0
+        _guard("WAIT")
         _record(phase, t, 0.0, 0.0, 0.0, 0.0)
         if time.time() - last_p >= 1.0:
             last_p = time.time()
@@ -323,13 +415,48 @@ def main():
     shared['zupt_enabled']   = False   # disable ZUPT — we will be airborne
     time.sleep(0.01)                   # give MAVLinkRX one callback cycle
 
+    pD_target = -ALT_TARGET_M   # NED: negative = above ground
+
+    # ── TAKEOFF PHASE ─────────────────────────────────────────────────────
+    phase      = "TAKEOFF"
+    t_takeoff  = time.time()
+    t_base     = t_takeoff
+    TAKEOFF_TIMEOUT_SEC = 10.0
+    print(f"\n[TAKEOFF] climbing to {ALT_TARGET_M:.1f} m…", flush=True)
+
+    while not _aborted and time.time() - t_takeoff < TAKEOFF_TIMEOUT_SEC:
+        _guard("TAKEOFF")
+        if _aborted:
+            break
+        t     = time.time() - t_base
+        T_to  = _thrust_from_alt(shared, param, pD_target, T_hover_norm)
+        p_lv, q_lv = _level_rates(shared, param)
+        _send_attitude_target(conn, p_lv, q_lv, 0.0, T_to)
+        _record(phase, t, p_lv, q_lv, 0.0, T_to)
+
+        mav = shared.get('mav_state')
+        if mav is not None:
+            pD_now = float(mav['pos_ned'][2])
+            if pD_now < pD_target + 0.15:   # within 15 cm of target
+                print(f"  [TAKEOFF] reached {-pD_now:.2f} m", flush=True)
+                break
+            if int(t) != int(t - DT):
+                print(f"  [TAKEOFF t={t:.1f}s]  alt={-pD_now:.2f} m  T={T_to:.3f}",
+                      flush=True)
+        time.sleep(DT)
+    else:
+        print("  [TAKEOFF] timeout — proceeding", flush=True)
+
     # ── BLIP PHASE ─────────────────────────────────────────────────────────
     phase   = "BLIP"
     t_blip  = time.time()
     t_base  = t_blip   # new time base after reset
     print(f"\n[BLIP] {blip_frac*100:.0f}% thrust for {blip_dur:.2f}s…", flush=True)
 
-    while time.time() - t_blip < blip_dur:
+    while not _aborted and time.time() - t_blip < blip_dur:
+        _guard("BLIP")
+        if _aborted:
+            break
         t = time.time() - t_base
         _send_motors(conn, blip_frac)
         _record(phase, t, 0.0, 0.0, 0.0, blip_frac)
@@ -345,13 +472,16 @@ def main():
     # ── BLIP OBSERVATION ───────────────────────────────────────────────────
     phase      = "BLIP_OBS"
     t_obs      = time.time()
-    T_obs_norm = T_hover_norm    # command hover thrust to stabilise
-    print(f"\n[BLIP_OBS] {BLIP_OBS_SEC:.1f} s observation (commanding hover thrust)…",
+    print(f"\n[BLIP_OBS] {BLIP_OBS_SEC:.1f} s observation (altitude hold at {ALT_TARGET_M:.1f} m)…",
           flush=True)
 
-    while time.time() - t_obs < BLIP_OBS_SEC:
+    while not _aborted and time.time() - t_obs < BLIP_OBS_SEC:
+        _guard("BLIP_OBS")
+        if _aborted:
+            break
         t = time.time() - t_base
-        p_lv, q_lv = _level_rates(shared)
+        p_lv, q_lv = _level_rates(shared, param)
+        T_obs_norm = _thrust_from_alt(shared, param, pD_target, T_hover_norm)
         _send_attitude_target(conn, p_lv, q_lv, 0.0, T_obs_norm)
         _record(phase, t, p_lv, q_lv, 0.0, T_obs_norm)
 
@@ -361,9 +491,6 @@ def main():
             blip_peak_gy   = max(blip_peak_gy,   abs(gy_frd))
             blip_min_theta = min(blip_min_theta, st[1])
             blip_max_theta = max(blip_max_theta, st[1])
-
-            if time.time() - t_obs >= BLIP_OBS_SEC - 1.0:  # last second
-                pass
         time.sleep(DT)
 
     # Snapshot: post-blip steady state (last 0.5 s of BLIP_OBS)
@@ -391,11 +518,14 @@ def main():
     T_norm_hov = T_hover_norm
     print(f"\n[HOVER] {HOVER_SEC:.1f} s hover (T_norm={T_norm_hov:.3f})…", flush=True)
 
-    while time.time() - t_hover < HOVER_SEC:
-        t    = time.time() - t_base
-        az   = float(shared.get('imu_raw', {}).get('az', -9.81))
-        T_norm_hov = float(np.clip(T_hover_norm + KP_AZ * (az + 9.81), 0.22, 0.38))
-        p_lv, q_lv = _level_rates(shared)
+    while not _aborted and time.time() - t_hover < HOVER_SEC:
+        _guard("HOVER")
+        if _aborted:
+            break
+        t          = time.time() - t_base
+        az         = float(shared.get('imu_raw', {}).get('az', -9.81))
+        T_norm_hov = _thrust_from_alt(shared, param, pD_target, T_hover_norm)
+        p_lv, q_lv = _level_rates(shared, param)
 
         _send_attitude_target(conn, p_lv, q_lv, 0.0, T_norm_hov)
         _record(phase, t, p_lv, q_lv, 0.0, T_norm_hov)
@@ -404,7 +534,7 @@ def main():
             st = _read_state(shared)
             if st:
                 print(f"  [HOVER t={time.time()-t_hover:.1f}s]  "
-                      f"theta={st[1]:+.1f}°  az={az:+.2f}m/s²  "
+                      f"theta={st[1]:+.1f}°  alt={-st[14]:.2f} m  az={az:+.2f}m/s²  "
                       f"T_norm={T_norm_hov:.3f}", flush=True)
         time.sleep(DT)
 
@@ -447,10 +577,12 @@ def main():
 
         # Fire excitation
         t_exc = time.time()
-        while time.time() - t_exc < EXCITE_SEC:
+        while not _aborted and time.time() - t_exc < EXCITE_SEC:
+            _guard(label)
+            if _aborted:
+                break
             t     = time.time() - t_base
-            az    = float(shared.get('imu_raw', {}).get('az', -9.81))
-            T_exc = float(np.clip(T_hover_norm + KP_AZ * (az + 9.81), 0.22, 0.38))
+            T_exc = _thrust_from_alt(shared, param, pD_target, T_hover_norm)
 
             p_c = sign * Q_TEST if axis == 'roll'  else 0.0
             q_c = sign * Q_TEST if axis == 'pitch' else 0.0
@@ -485,11 +617,13 @@ def main():
         Standard FRD convention applies: r>0 → psi increases. r_cmd = +K_PSI_SETTLE * e_psi_rad.
         """
         t_set = time.time()
-        while time.time() - t_set < dur:
+        while not _aborted and time.time() - t_set < dur:
+            _guard(label)
+            if _aborted:
+                break
             t   = time.time() - t_base
-            az  = float(shared.get('imu_raw', {}).get('az', -9.81))
-            T_s = float(np.clip(T_hover_norm + KP_AZ * (az + 9.81), 0.22, 0.38))
-            p_lv, q_lv = _level_rates(shared)
+            T_s = _thrust_from_alt(shared, param, pD_target, T_hover_norm)
+            p_lv, q_lv = _level_rates(shared, param)
 
             r_cmd = 0.0
             if psi_ref_deg is not None:
@@ -512,35 +646,51 @@ def main():
             time.sleep(DT)
 
     # ── PITCH SIGN TEST ────────────────────────────────────────────────────
-    print(f"\n[PITCH+] q_des=+{Q_TEST:.2f} rad/s for {EXCITE_SEC:.1f}s…", flush=True)
-    dtheta_plus, theta_end_plus = _excitation('pitch', +1, 'PITCH_PLUS')
-    _settle('SETTLE_P1')
+    if not _aborted:
+        print(f"\n[PITCH+] q_des=+{Q_TEST:.2f} rad/s for {EXCITE_SEC:.1f}s…", flush=True)
+        dtheta_plus, _ = _excitation('pitch', +1, 'PITCH_PLUS')
+        _settle('SETTLE_P1')
+        print(f"  Δtheta(q+) = {dtheta_plus:+.2f}°", flush=True)
 
-    print(f"  Δtheta(q+) = {dtheta_plus:+.2f}°", flush=True)
-
-    print(f"\n[PITCH-] q_des=-{Q_TEST:.2f} rad/s for {EXCITE_SEC:.1f}s…", flush=True)
-    dtheta_minus, theta_end_minus = _excitation('pitch', -1, 'PITCH_MINUS')
-    _settle('SETTLE_P2')
-
-    print(f"  Δtheta(q-) = {dtheta_minus:+.2f}°", flush=True)
+    if not _aborted:
+        print(f"\n[PITCH-] q_des=-{Q_TEST:.2f} rad/s for {EXCITE_SEC:.1f}s…", flush=True)
+        dtheta_minus, _ = _excitation('pitch', -1, 'PITCH_MINUS')
+        _settle('SETTLE_P2')
+        print(f"  Δtheta(q-) = {dtheta_minus:+.2f}°", flush=True)
 
     # ── ROLL SIGN TEST ─────────────────────────────────────────────────────
-    print(f"\n[ROLL+] p_des=+{Q_TEST:.2f} rad/s for {EXCITE_SEC:.1f}s…", flush=True)
-    dphi_plus, phi_end_plus = _excitation('roll', +1, 'ROLL_PLUS')
-    _settle('SETTLE_R1')
-
-    print(f"  Δphi(p+) = {dphi_plus:+.2f}°", flush=True)
+    if not _aborted:
+        print(f"\n[ROLL+] p_des=+{Q_TEST:.2f} rad/s for {EXCITE_SEC:.1f}s…", flush=True)
+        dphi_plus, _ = _excitation('roll', +1, 'ROLL_PLUS')
+        _settle('SETTLE_R1')
+        print(f"  Δphi(p+) = {dphi_plus:+.2f}°", flush=True)
 
     # ── YAW SIGN TEST ──────────────────────────────────────────────────────
-    # Capture heading before excitation so the settle can command back to it.
-    _st_pre_yaw  = _read_state(shared)
-    _psi_ref_deg = _st_pre_yaw[2] if _st_pre_yaw is not None else 0.0
-    print(f"\n[YAW+] r_des=+{Q_TEST:.2f} rad/s for {EXCITE_SEC:.1f}s "
-          f"(psi_ref={_psi_ref_deg:.1f}°)…", flush=True)
-    dpsi_plus, psi_end_plus = _excitation('yaw', +1, 'YAW_PLUS')
-    _settle('SETTLE_Y1', dur=2.0, psi_ref_deg=_psi_ref_deg)
+    if not _aborted:
+        _st_pre_yaw  = _read_state(shared)
+        _psi_ref_deg = _st_pre_yaw[2] if _st_pre_yaw is not None else 0.0
+        print(f"\n[YAW+] r_des=+{Q_TEST:.2f} rad/s for {EXCITE_SEC:.1f}s "
+              f"(psi_ref={_psi_ref_deg:.1f}°)…", flush=True)
+        dpsi_plus, _ = _excitation('yaw', +1, 'YAW_PLUS')
+        _settle('SETTLE_Y1', dur=2.0, psi_ref_deg=_psi_ref_deg)
+        print(f"  Δpsi(r+) = {dpsi_plus:+.2f}°", flush=True)
 
-    print(f"  Δpsi(r+) = {dpsi_plus:+.2f}°", flush=True)
+    # ── ABORT: log final state row and print summary ───────────────────────
+    if _aborted:
+        _, t_wall = _aborted[0]
+        t_abort = t_wall - t0
+        st = _read_state(shared)
+        if st is not None:
+            phi_d, theta_d, psi_d, vN, vE, vD, ax, ay, az, gx, gy, gz, pN, pE, pD = st
+            log_rows.append({
+                'phase': 'ABORT', 't': t_abort,
+                'phi_deg': phi_d, 'theta_deg': theta_d, 'psi_deg': psi_d,
+                'vN': vN, 'vE': vE, 'vD': vD,
+                'pN': pN, 'pE': pE, 'pD': pD,
+                'ax': ax, 'ay': ay, 'az': az,
+                'gx': gx, 'gy': gy, 'gz': gz,
+                'p_cmd': 0.0, 'q_cmd': 0.0, 'r_cmd': 0.0, 'T_norm': 0.0,
+            })
 
     # ── KILL ───────────────────────────────────────────────────────────────
     _send_motors(conn, 0.0)
@@ -598,6 +748,12 @@ def main():
     sep   = "=" * 60
 
     lines += [sep, "FLIGHT SYSID REPORT", sep, ""]
+    if _aborted:
+        abort_reason_str, abort_t_wall = _aborted[0]
+        abort_t_rel = abort_t_wall - t0
+        lines += ["!! FLIGHT ABORTED — data covers pre-abort interval only !!"]
+        lines += [f"  Reason : {abort_reason_str}"]
+        lines += [f"  Time   : t={abort_t_rel:.2f} s from start", ""]
     lines += [f"  params.yaml m       : {m_yaml:.3f} kg"]
     lines += [f"  params.yaml T_max   : {T_max:.2f} N/motor"]
     lines += [f"  T_hover_theory/motor: {T_hover_theory/4:.2f} N  "

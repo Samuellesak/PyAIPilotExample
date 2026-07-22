@@ -97,12 +97,16 @@ def _send_motors(conn, u_norm):
 
 
 def _send_attitude_target(conn, p, q, r, thrust_norm):
+    # Sysid-confirmed sign map (flight_sysid_gt.py):
+    #   p: FRD-compatible → send as-is
+    #   q: reversed in sim → negate
+    #   r: reversed in sim → negate
     conn.mav.set_attitude_target_send(
         int(time.time() * 1e3) & 0xFFFFFFFF,
         conn.target_system, conn.target_component,
         0x80,
         [1.0, 0.0, 0.0, 0.0],
-        float(p), float(q), float(r),
+        float(p), float(-q), float(-r),
         float(np.clip(thrust_norm, 0.0, 1.0)),
     )
 

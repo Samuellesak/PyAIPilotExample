@@ -19,11 +19,12 @@ shared_data = {}
 
 # setup components
 components = setup_components(shared_data, system_boot_ms, SIM_SERVER_UDP_IP, SIM_SERVER_UDP_PORT)
-controller = components['controller']
-ts_loop = components['ts_loop']
-mavlink_rx = components['mavlink_rx']
-vision_rx = components['vision_rx']
-logger = components['logger']
+controller  = components['controller']
+ts_loop     = components['ts_loop']
+mavlink_rx  = components['mavlink_rx']
+vision_rx   = components['vision_rx']
+logger      = components['logger']
+ekf_handler = components['ekf_handler']
 
 print("Press 's' to arm and start...", flush=True)
 while True:
@@ -34,6 +35,9 @@ while True:
 print("Resetting sim...", flush=True)
 controller.send_sim_reset_command()
 time.sleep(2.0)   # wait for sim to settle into clean initial state
+
+# Re-request ground truth streams after reset (sim may clear message intervals on reset)
+mavlink_rx.request_ground_truth_streams(rate_hz=50)
 
 print("Arming drone...", flush=True)
 controller.arm()
@@ -53,6 +57,7 @@ except KeyboardInterrupt:
 finally:
     if logger is not None:
         logger.save()
+    ekf_handler.save()
     for _c in [ts_loop, mavlink_rx, vision_rx]:
         _t = _c.get_thread_for_join()
         if _t is not None:

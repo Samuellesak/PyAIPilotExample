@@ -22,7 +22,7 @@ m_motor: 0.050  # mass of one motor [kg]  (4 * m_motor must be < m)
 # ── Aerodynamic drag ──────────────────────────────────────────────────
 # Force drag:  F = -Dv * |v| .* v   [N / (m/s)^2]  — diagonal elements
 # (Dv unidentified from ground sysid — needs in-flight velocity data)
-Dv: [0.05, 0.05, 0.020]
+Dv: [1.2, 1.2, 1.2] 
 
 # Torque drag: M = -Dw * |w| .* w   [N·m / (rad/s)^2] — diagonal elements
 # Dw_xy identified from ground roll/pitch excitation (sysid.py).
@@ -39,20 +39,21 @@ C_M_q: 0.0
 # convention: drone faces North at startup → psi = 0°.  Body x_b (forward)
 # then equals NED-North, making all heading-compensation rotations identity at
 # startup and eliminating sign ambiguity in the approach controller.
-initial_yaw_deg: 0.0
+initial_yaw_deg: 180.0
 
 # ── Carrot tracker ────────────────────────────────────────────────────────────
 # Waypoints in NED frame [North, East, Down] [m].
 # First entry is the starting point (world origin).
 # NED z is negative upward: z = -10 means 10 m altitude.
 # Drone faces North (psi=0°) — gates are along the +N axis.
-waypoints:
-  - [    0.0,   0.0,   0.0]    # 0  start / world origin
-  - [  +25.0,   0.0,   0.0]    # 1  gate 0 (25 m North, straight ahead)
-  - [  +50.0,   0.0,   0.0]    # 2  gate 1
-  - [  +75.0,   0.0,   0.0]    # 3  gate 2
-  - [ +100.0,   0.0,   0.0]    # 4  gate 3
-  - [ +125.0,   0.0,   0.0]    # 5  gate 4
+waypoints: # Ground truth NED coordinates of the gates (from sim TRACK messages).
+  - [    0.0,   0.0,   0.0]   #Start
+  - [-23.29796791,  -0.39990234,  -1.03195801]   
+  - [-46.89374924,  -2.49999022,   3.0680418]    
+  - [-74.59375,      1.2000097,   12.66804123]    
+  - [-111.4937439,   -5.09998989,   23.56804085]    
+  - [-135.4937439,    -0.79999024,   24.35565376]
+  - [-159.19374084,   -4.39999008,   24.96804047]   
   # Drone faces North (psi=0°).  Gates are 25 m apart along the +N axis.
   # D=0 keeps the reference altitude at launch height.
 
@@ -88,7 +89,7 @@ vision_lock_miss:     30     # consecutive missed frames before lock is released
 vision_spike_tol:     5.0    # reject PnP if distance > locked_dist + this [m]
 vision_vel_window_frames: 10 # PnP velocity window size [frames]; endpoint diff over window
 vision_hold_frames:       5  # frames to hold last locked tvec after YOLO flicker
-vision_ref_omega0:        1.67  # [rad/s] PT2 natural freq for v_ref smoothing (~1.5 s settle)
+vision_ref_omega0:        0     # [rad/s] PT2 natural freq for v_ref smoothing; 0 = disabled (raw carrot reference)
 vision_ref_zeta:          1.0   # PT2 damping ratio (1.0 = critically damped, no overshoot)
 vision_debug_overlay:   true  # set true to open a live OpenCV window with mode + bearing overlay
 next_gate_min_frames:   15    # frames second-gate PnP must be consistent before waypoint update
@@ -118,25 +119,31 @@ blip_dur_sec:      0.05
 blip_thrust_frac:  0.35
 blip_acc_extra_sec: 5.5  # acc update window after blip ends [s]; covers BLIP_OBS(2s)+HOVER(3s)
 
-# ── Ramp-start (alternative to BLIP in gate_vision_calib.py) ─────────────────
-# When use_ramp_start: true the BLIP + BLIP_OBS phases are replaced by a single
-# RAMP phase that linearly increases all four motor thrusts from 60% of hover to
-# hover over ramp_dur_sec.  Equal ramp on all motors → no net yaw torque →
-# heading stays at psi=0°.  Use this to test whether the blip causes yaw drift.
+
 use_ramp_start:  true
 ramp_dur_sec:    4.0
-# Ramp ceiling as a multiple of T_hover_norm.  Must exceed 1/cos(slope_deg) to
-# lift off on the launch ramp.  At theta=-17° that threshold is 1.046; 1.20 gives
-# margin for steeper slopes.  HOVER altitude hold corrects the overshoot.
 ramp_overshoot:  1.20
 
 # ── Logging ──────────────────────────────────────────────────────────────────
-# 0 = no logs written to disk (faster, no disk I/O)
-# 1 = full logs (IMU, EKF, control, vision frames, MAVLink)
-logging: 1
+logging: 1         # 0 = no logs
+mavlink_monitor: false  # true = print 1 Hz MAVLink rate monitor + first-seen msgs to terminal
 
 T_max_motor:    49.9  # maximum thrust per motor [N]  (used for normalization) 49.9
 tau_motor:      0.05  # first-order motor lag time constant [s]  (typ. 20–100 ms for brushless)
+# ── Model-aided EKF predict ───────────────────────────────────────────────────
+# true  → EKF predict uses dyn.py physics (motor thrusts → specific force)
+#          instead of raw IMU accelerometer.  More accurate during high thrust.
+# false → fall back to raw IMU acc (previous behavior, safe baseline).
+use_model_predict:       false
+model_predict_shadow:    true   # log acc_model vs acc_imu to logs/model_predict_shadow_*.csv
+
+# ── Ground truth mode ─────────────────────────────────────────────────────────
+# true  → override EKF pos_ned and vel_ned with LOCAL_POSITION_NED from sim.
+#          Attitude and rates still come from the IMU/EKF.
+#          Use to isolate whether EKF drift is causing flight performance issues.
+# false → normal EKF dead-reckoning + vision corrections.
+ground_truth_mode:  true
+
 
 v_ref:          3.0   # reference cruise speed [m/s]
 lookahead_gain: 0.6   # lookahead distance = lookahead_gain * v_ref [m] 1
@@ -156,7 +163,7 @@ hover_only: false
 # Set to true to skip YOLO detection entirely and fly only on the params.yaml waypoints.
 # Gate-NED overrides and visual yaw blending are disabled; waypoint advance still
 # happens via the sim COLLISION signal.  Use this to isolate path-following bugs.
-debug_waypoints_only: false
+debug_waypoints_only: true
 
 # Set to false to skip YOLO inference entirely (model.predict is never called).
 # The orange-centroid fallback and all other vision logic still run.
@@ -170,32 +177,34 @@ yolo_enabled: true
 # maintain altitude.  Appears constant in logs because the drone flies near-level.
 # Per-axis velocity PI gains (NED frame).  No position hold loop — altitude is managed
 # by vD alone: v_ref_D=0 in hover, carrot D component during race.
-Kp_vN:  0.5   # North velocity P  [1/s]
-Ki_vN:  0.0001   # North velocity I  [1/s²]
-Kp_vE:  0.5    # East  velocity P  [1/s]
-Ki_vE:  0.0001    # East  velocity I  [1/s²]
-Kp_vD:  0.8    # Down  velocity P  [1/s]  — higher: stronger correction for vD drift
+Kp_vN:  0.4496   # North velocity P  [1/s]  — sysid_vel: τ_v=4.59 s, T_settle=1.5 s
+Ki_vN:  0.2812   # North velocity I  [1/s²]
+Kp_vE:  0.4489   # East  velocity P  [1/s]  — sysid_vel: τ_v=4.44 s, T_settle=1.5 s
+Ki_vE:  0.2812   # East  velocity I  [1/s²]
+tau_vN: 4.59     # North velocity plant time constant [s]  — used for feedforward
+tau_vE: 4.44     # East  velocity plant time constant [s]  — used for feedforward
+Kp_vD:  0.08    # Down  velocity P  [1/s]  — higher: stronger correction for vD drift
 Ki_vD:  0.1  # Down  velocity I  [1/s²] — small integral to trim steady-state vD offset
 
 # ── Velocity measurement filter time constants ────────────────────────────────
 # Low-pass filter applied to EKF vel_ned before the outer-loop PI.
 # Smaller τ = faster response but noisier; larger τ = smoother but laggier.
 # τ_vD was 0.40 s (sluggish altitude response) — reduced to match τ_vH.
-tau_vel_h: 0.15   # horizontal (vN, vE) filter τ [s]
-tau_vel_d: 0.15   # vertical   (vD)     filter τ [s]
+tau_vel_h: 0   # horizontal (vN, vE) filter τ [s]
+tau_vel_d: 0  # vertical   (vD)     filter τ [s]
 
 # Gate collision debounce — ignore repeated COLLISION messages for the same
 # gate_id within this window [s] to prevent a single physical gate pass from
 # triggering multiple waypoint advances.
 gate_debounce_sec: 2.0
 
-K_att:  1      # halved from 6.0: sim inner loop has ~2× rate overshoot (sysid measured q_meas/q_des=2.29)1      # attitude P: tilt error [rad] -> rate command [rad/s]
+K_att:  2.5      # halved from 6.0: sim inner loop has ~2× rate overshoot (sysid measured q_meas/q_des=2.29)1      # attitude P: tilt error [rad] -> rate command [rad/s]
                   # TUNE THIS after rate loop is identified — must stay < rate_bandwidth/3
 
-K_psi:   2      # yaw P   [1/s] 2
+K_psi:   2.5      # yaw P   [1/s] 2
 Ki_psi:  0.0002    # yaw I   [1/s^2]  = K_psi^2 / 5 0.2
 
-MAX_TILT_DEG: 20.0   # outer loop tilt limit [deg]  (max horiz accel ~3.4 m/s^2)
+MAX_TILT_DEG: 35.0   # outer loop tilt limit [deg]  (max horiz accel ~3.4 m/s^2)
 
 
 
@@ -228,3 +237,17 @@ Q_rates:   [20.0, 20.0, 20.0]     # body rates  [p, q, r]          [1/(rad/s)^2]
 Q_int_vel: [1.0, 1.0, 1.0]        # velocity integrators [N, E, D]  [1/m^2]
 Q_int_psi: 1.0                    # yaw integrator                  [1/rad^2]
 R_cost:    5.0                    # control cost (scalar × I_4)     [1/N^2]
+
+
+
+
+
+
+
+
+#[TRACK] gate 0: NED=[-23.29796791  -0.39990234  -0.03195801]  2.7x2.7m
+#[TRACK] gate 1: NED=[-46.89374924  -2.49999022   5.0680418 ]  2.7x2.7m
+#[TRACK] gate 2: NED=[-74.59375      1.2000097   13.66804123]  2.7x2.7m
+#[TRACK] gate 3: NED=[-111.4937439    -5.09998989   24.56804085]  2.7x2.7m
+#[TRACK] gate 4: NED=[-135.4937439    -0.79999024   25.35565376]  2.7x2.7m
+#[TRACK] gate 5: NED=[-159.19374084   -4.39999008   25.96804047]  2.7x2.7m

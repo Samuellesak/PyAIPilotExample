@@ -2,6 +2,7 @@ from pymavlink import mavutil
 from timesync import TimeSync
 from vision_rx import VisionRX
 from mavlink_rx import MAVLinkRX
+from imu_ekf import IMUEKFHandler
 from controller import Controller
 from log import Logger
 from dyn import load_params
@@ -32,7 +33,19 @@ def setup_components(shared_data, system_boot_ms, server_ip, server_udp_port):
     # Setup Mavlink msg receiver
     # -------------------------------
     print("Setting up MAVLink rx...", flush=True)
-    mavlink_rx = MAVLinkRX.create_mavlink_rx(sim_conn, shared_data, logger)
+    monitor_enabled = bool(param.get('mavlink_monitor', True))
+    mavlink_rx = MAVLinkRX.create_mavlink_rx(sim_conn, shared_data, logger,
+                                             monitor_enabled=monitor_enabled)
+
+    # -------------------------------
+    # IMU + EKF handler
+    # -------------------------------
+    print("Setting up IMU EKF handler...", flush=True)
+    ekf_handler = IMUEKFHandler(shared_data, param, logger=logger)
+    ekf_handler.register(mavlink_rx)
+
+    # Request LOCAL_POSITION_NED stream (re-requested after sim reset in main.py)
+    mavlink_rx.request_ground_truth_streams(rate_hz=50)
 
     # -------------------------------
     # Timesync request Loop
@@ -53,6 +66,7 @@ def setup_components(shared_data, system_boot_ms, server_ip, server_udp_port):
     return {
         'vision_rx': vision_rx,
         'mavlink_rx': mavlink_rx,
+        'ekf_handler': ekf_handler,
         'ts_loop': ts_loop,
         'sim_conn': sim_conn,
         'controller': controller,
