@@ -99,6 +99,7 @@ class IMUEKFHandler:
         self._mp_shadow_writer  = None
         self._mp_shadow_file    = None
         self._mp_shadow_path    = None
+        self._v_model_ned       = None   # integrated model velocity [m/s] in NED
         if self._mp_shadow_enabled:
             import csv, os
             _dir = (logger.session_dir
@@ -109,12 +110,13 @@ class IMUEKFHandler:
             self._mp_shadow_file   = open(self._mp_shadow_path, 'w', newline='', buffering=1)
             self._mp_shadow_writer = csv.writer(self._mp_shadow_file)
             self._mp_shadow_writer.writerow([
-                't_wall_s', 'T_total_N',
+                't_wall_s', 'T_total_N', 'actuator_sum',
                 'vb_x', 'vb_y', 'vb_z',
                 'acc_imu_x', 'acc_imu_y', 'acc_imu_z',
                 'acc_model_x', 'acc_model_y', 'acc_model_z',
                 'err_x', 'err_y', 'err_z', 'err_norm',
                 'vel_N', 'vel_E', 'vel_D',
+                'v_model_N', 'v_model_E', 'v_model_D',
             ])
             print(f'[IMUEKFHandler] model_predict_shadow → {self._mp_shadow_path}', flush=True)
 
@@ -285,18 +287,39 @@ class IMUEKFHandler:
                                   / float(self._param['m']))
                     # Shadow log: compare model vs raw IMU (every 10th tick ≈ 25 Hz)
                     if _use_shd and self._hover_reset_done and self._mp_shadow_writer is not None:
+                        # Integrate model velocity in NED at every IMU tick for accuracy.
+                        # acc_model is body-frame specific force; add gravity to get true NED accel.
+                        # Guard: only integrate when thrust is near hover level — avoids corrupting
+                        # v_model during the blip (T>>hover) and the motor-ramp/low-thrust transient
+                        # (T<<hover) where the model would predict near-freefall.
+                        _T_hover = float(self._param['m']) * float(self._param.get('g', 9.81))
+                        _g_ned = np.array([0.0, 0.0, float(self._param.get('g', 9.81))])
+                        _acc_model_ned = _R_nb.T @ acc_model + _g_ned
+                        if self._v_model_ned is None:
+                            if _T_total > 0.5 * _T_hover:
+                                # Only initialise once motors are meaningfully loaded
+                                self._v_model_ned = self._ekf.x[3:6].copy()
+                        elif 0.3 * _T_hover < _T_total < 2.5 * _T_hover:
+                            # Integrate only within a sensible thrust band; outside this band
+                            # (blip peak or near-idle) resync to GT to prevent drift accumulation
+                            self._v_model_ned = self._v_model_ned + _acc_model_ned * dt
+                        else:
+                            self._v_model_ned = self._ekf.x[3:6].copy()
                         self._mp_shadow_tick += 1
                         if self._mp_shadow_tick % 10 == 0:
                             _err = acc_model - acc
+                            _act_sum = float(np.sum(_act['actuator'][:4]))
                             self._mp_shadow_writer.writerow([
                                 f'{now:.4f}',
                                 f'{_T_total:.2f}',
+                                f'{_act_sum:.4f}',
                                 f'{_vel_b[0]:.3f}', f'{_vel_b[1]:.3f}', f'{_vel_b[2]:.3f}',
                                 f'{acc[0]:.4f}', f'{acc[1]:.4f}', f'{acc[2]:.4f}',
                                 f'{acc_model[0]:.4f}', f'{acc_model[1]:.4f}', f'{acc_model[2]:.4f}',
                                 f'{_err[0]:.4f}', f'{_err[1]:.4f}', f'{_err[2]:.4f}',
                                 f'{float(np.linalg.norm(_err)):.4f}',
                                 f'{self._ekf.x[3]:.3f}', f'{self._ekf.x[4]:.3f}', f'{self._ekf.x[5]:.3f}',
+                                f'{self._v_model_ned[0]:.3f}', f'{self._v_model_ned[1]:.3f}', f'{self._v_model_ned[2]:.3f}',
                             ])
 
         acc_predict = acc_model if (_use_mp and acc_model is not None) else acc
@@ -367,8 +390,11 @@ class IMUEKFHandler:
                 self._data['post_blip_att_reset_done'] = True
 
         # ── Vision position / velocity / yaw correction ───────────────────────
+        # Suppress vision EKF updates in GT mode: ekf.x is overwritten by GT anyway,
+        # so update_velocity/update_yaw only shrink P without improving x, leaving P
+        # inconsistently small when GT is later disabled.
         vis = self._data.pop('_vision_ekf_update', None)
-        if vis is not None:
+        if vis is not None and not self._param.get('ground_truth_mode', False):
             if vis.get('pos_ned') is not None:
                 # PnP is world-frame; EKF is local-frame (zeroed at hover entry).
                 local_pos = np.asarray(vis['pos_ned']) - self._pos_offset_ned
@@ -517,12 +543,20 @@ class IMUEKFHandler:
         vel_N = np.array([r['vel_N'] for r in rows])
         vel_E = np.array([r['vel_E'] for r in rows])
         vel_D = np.array([r['vel_D'] for r in rows])
-        axes[5].plot(t, vel_N, label='vN', lw=1.0)
-        axes[5].plot(t, vel_E, label='vE', lw=1.0)
-        axes[5].plot(t, vel_D, label='vD', lw=1.0)
-        axes[5].set_ylabel('vel_ned [m/s]', fontsize=9)
+        has_vmodel = 'v_model_N' in rows[0]
+        axes[5].plot(t, vel_N, color='tab:blue',  lw=1.0, label='GT vN')
+        axes[5].plot(t, vel_E, color='tab:orange',lw=1.0, label='GT vE')
+        axes[5].plot(t, vel_D, color='tab:green', lw=1.0, label='GT vD')
+        if has_vmodel:
+            vm_N = np.array([r['v_model_N'] for r in rows])
+            vm_E = np.array([r['v_model_E'] for r in rows])
+            vm_D = np.array([r['v_model_D'] for r in rows])
+            axes[5].plot(t, vm_N, color='tab:blue',  lw=1.0, ls='--', alpha=0.7, label='model vN')
+            axes[5].plot(t, vm_E, color='tab:orange',lw=1.0, ls='--', alpha=0.7, label='model vE')
+            axes[5].plot(t, vm_D, color='tab:green', lw=1.0, ls='--', alpha=0.7, label='model vD')
+        axes[5].set_ylabel('vel NED [m/s]', fontsize=9)
         axes[5].set_xlabel('time [s]', fontsize=9)
-        axes[5].legend(fontsize=8, loc='upper right')
+        axes[5].legend(fontsize=8, loc='upper right', ncol=2)
         axes[5].grid(True, lw=0.4)
 
         fig.tight_layout()

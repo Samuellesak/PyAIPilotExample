@@ -22,7 +22,7 @@ m_motor: 0.050  # mass of one motor [kg]  (4 * m_motor must be < m)
 # ── Aerodynamic drag ──────────────────────────────────────────────────
 # Force drag:  F = -Dv * |v| .* v   [N / (m/s)^2]  — diagonal elements
 # (Dv unidentified from ground sysid — needs in-flight velocity data)
-Dv: [1.2, 1.2, 1.2] 
+Dv: [0.25, 0.25, 0.6] 
 
 # Torque drag: M = -Dw * |w| .* w   [N·m / (rad/s)^2] — diagonal elements
 # Dw_xy identified from ground roll/pitch excitation (sysid.py).
@@ -94,7 +94,7 @@ vision_vel_max_factor: 2.5   # reject PnP velocity > v_ref * this (e.g. 2.5 × 2
 vision_lock_frames:   5      # consecutive valid PnP frames required to acquire lock
 vision_lock_miss:     30     # consecutive missed frames before lock is released
 vision_spike_tol:     5.0    # reject PnP if distance > locked_dist + this [m]
-vision_vel_window_frames: 10 # PnP velocity window size [frames]; endpoint diff over window
+vision_vel_window_frames: 3  # PnP velocity window [frames]; reduced from 10 for low-lag estimates at high speed
 vision_hold_frames:       5  # frames to hold last locked tvec after YOLO flicker
 vision_ref_omega0:        0     # [rad/s] PT2 natural freq for v_ref smoothing; 0 = disabled (raw carrot reference)
 vision_ref_zeta:          1.0   # PT2 damping ratio (1.0 = critically damped, no overshoot)
@@ -152,8 +152,8 @@ model_predict_shadow:    true   # log acc_model vs acc_imu to logs/model_predict
 ground_truth_mode:  true
 
 
-v_ref:          6.0   # reference cruise speed [m/s]
-lookahead_gain: 2.0   # lookahead distance = lookahead_gain * v_ref [m]; larger = smoother carrot direction
+v_ref:          11.0   # reference cruise speed [m/s]
+lookahead_gain: 1.3   # lookahead distance = lookahead_gain * v_ref [m]; larger = smoother carrot direction
 
 # ── Controller selection ─────────────────────────────────────────────────────
 # 1 = Cascade PI  (analytical gains, no offline solve required)
@@ -185,9 +185,9 @@ yolo_enabled: true
 # Per-axis velocity PI gains (NED frame).  No position hold loop — altitude is managed
 # by vD alone: v_ref_D=0 in hover, carrot D component during race.
 Kp_vN:  1.8496   # North velocity P  [1/s]  — sysid_vel: τ_v=4.59 s, T_settle=1.5 s
-Ki_vN:  0.2812   # North velocity I  [1/s²]
+Ki_vN:  0.3   # North velocity I  [1/s²]
 Kp_vE:  1.8489   # East  velocity P  [1/s]  — sysid_vel: τ_v=4.44 s, T_settle=1.5 s
-Ki_vE:  0.2812   # East  velocity I  [1/s²]
+Ki_vE:  0.3   # East  velocity I  [1/s²]
 tau_vN: 4.59     # North velocity plant time constant [s]  — used for feedforward
 tau_vE: 4.44     # East  velocity plant time constant [s]  — used for feedforward
 K_dv:   0.5      # reference-derivative lag compensator gain [s]; 0=off, tune 0.3–0.5 after fixing carrot oscillation
@@ -207,13 +207,29 @@ tau_vel_d: 0  # vertical   (vD)     filter τ [s]
 # triggering multiple waypoint advances.
 gate_debounce_sec: 2.0
 
-K_att:  4.5      # halved from 6.0: sim inner loop has ~2× rate overshoot (sysid measured q_meas/q_des=2.29)1      # attitude P: tilt error [rad] -> rate command [rad/s]
-                  # TUNE THIS after rate loop is identified — must stay < rate_bandwidth/3
+# Waypoint advance delay after gate collision signal.
+# Drone must travel gate_pass_dist_m past the gate waypoint along the segment
+# before wp increments.  Prevents early turning at high speed.
+# gate_pass_timeout_sec is a fallback in case the drone overshoots without
+# crossing the threshold (e.g. missed gate).  Set dist=0 to disable (immediate).
+gate_pass_dist_m:      1   # m — at 20 m/s: ~0.15 s delay
+gate_pass_timeout_sec: 2.0   # s — hard cap
 
+K_att:  4.5      
 K_psi:   4.5      # yaw P   [1/s] 2
 Ki_psi:  0.0002    # yaw I   [1/s^2]  = K_psi^2 / 5 0.2
 
-MAX_TILT_DEG: 35.0   # outer loop tilt limit [deg]  (max horiz accel ~3.4 m/s^2)
+MAX_TILT_DEG: 55.0   # outer loop tilt limit [deg]; 55° → ~8 m/s² heading authority for high-speed flight
+
+# ── Velocity gain scheduling ──────────────────────────────────────────────────
+# K_att, Kp_vN/E/D are linearly interpolated between (v_lo, baseline) and (v_hi, hi).
+# Scheduling variable: |v_ned_ref|.  Set hi = lo (or omit) to disable scheduling.
+gain_sched_v_lo: 6.0    # speed where baseline gains apply [m/s]
+gain_sched_v_hi: 20.0   # speed where hi-speed gains apply [m/s]
+K_att_hi:  8.0          # K_att at v_hi  (baseline K_att=4.5)
+Kp_vN_hi:  5.5          # Kp_vN at v_hi  (baseline 1.8496)
+Kp_vE_hi:  5.5          # Kp_vE at v_hi  (baseline 1.8489)
+Kp_vD_hi:  5.5         # Kp_vD at v_hi  (baseline 1.5)
 
 
 

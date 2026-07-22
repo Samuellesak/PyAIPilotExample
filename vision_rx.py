@@ -67,9 +67,8 @@ class VisionRX:
         # the distance, then reject any measurement farther than the lock + tolerance.
         # This drops spurious detections of more distant gates that spike the distance.
         self._max_gate_dist = float(_p.get('vision_max_gate_dist', 50.0))
-        _v_ref              = float(_p.get('v_ref', 2.0))
-        _vel_factor         = float(_p.get('vision_vel_max_factor', 2.5))
-        self._vis_vel_max   = _v_ref * _vel_factor
+        self._v_ref         = float(_p.get('v_ref', 2.0))
+        self._vel_max_factor = float(_p.get('vision_vel_max_factor', 2.5))
         self._lock_frames   = int(_p.get('vision_lock_frames', 5))
         self._lock_miss_max = int(_p.get('vision_lock_miss',   30))
         self._spike_tol     = float(_p.get('vision_spike_tol', 5.0))
@@ -803,6 +802,16 @@ class VisionRX:
                         _dt_win = _t1 - _t0
                         if _dt_win >= 0.05:
                             vel_ned_pnp = (_p1 - _p0) / _dt_win
+
+            if vel_ned_pnp is not None:
+                # Gate PnP velocity against max(current_speed, v_ref) × factor.
+                # Dynamic: at high flight speeds the gate scales with actual speed so
+                # valid high-velocity estimates are not rejected.
+                _v_now = float(np.linalg.norm(
+                    self.data.get('mav_state', {}).get('vel_ned', np.zeros(3))))
+                _vel_max = max(_v_now, self._v_ref) * self._vel_max_factor
+                if float(np.linalg.norm(vel_ned_pnp)) > _vel_max:
+                    vel_ned_pnp = None
 
             if yaw_ned is not None or vel_ned_pnp is not None:
                 # Position updates disabled: PnP pos noise causes EKF path jumps.

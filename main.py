@@ -48,7 +48,7 @@ time.sleep(1.0)
 if logger is not None:
     logger.reset_flight_data()
 
-FLIGHT_TIMEOUT_S = 70.0
+FLIGHT_TIMEOUT_S = 23.0
 
 print("Starting control loop...", flush=True)
 _flight_start = time.time()

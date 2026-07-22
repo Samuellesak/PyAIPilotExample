@@ -81,6 +81,16 @@ class Controller:
         self._MAX_TILT = np.deg2rad(float(param['MAX_TILT_DEG']))
         self._g        = param['g']
 
+        # Velocity gain scheduling: linearly interpolate K_att, Kp_vN/E/D between
+        # low-speed (v_lo) and high-speed (v_hi) setpoints.  Scheduling variable is
+        # |v_ned_ref| so gains ramp up before speed is reached, not after.
+        self._gs_v_lo   = float(param.get('gain_sched_v_lo',  6.0))
+        self._gs_v_hi   = float(param.get('gain_sched_v_hi', 20.0))
+        self._K_att_hi  = float(param.get('K_att_hi',  self._K_att))
+        self._Kp_vN_hi  = float(param.get('Kp_vN_hi',  self._Kp_vN))
+        self._Kp_vE_hi  = float(param.get('Kp_vE_hi',  self._Kp_vE))
+        self._Kp_vD_hi  = float(param.get('Kp_vD_hi',  self._Kp_vD))
+
         self._hover_only = bool(param.get('hover_only', False))
         self._debug_waypoints_only = bool(param.get('debug_waypoints_only', False))
         if self._debug_waypoints_only:
@@ -95,7 +105,7 @@ class Controller:
         self.xi_psi      = 0.0                      # yaw integral [rad·s]
         self._XI_VEL_LIM = np.array([3.0, 3.0, 2.0])
         self._XI_PSI_LIM = np.pi
-        self._VEL_CLAMP  = 5.0                      # m/s — integrator input clamp
+        self._VEL_CLAMP  = 10.0                      # m/s — integrator input clamp
 
         # Low-pass filters to reduce T_collective noise.
         # vD from the EKF is dead-reckoned (no baro/GPS) and carries high-frequency
@@ -108,6 +118,13 @@ class Controller:
         self._TAU_VH       = float(param.get('tau_vel_h', 0.15))   # horizontal velocity filter τ [s]
         self._TAU_VD       = float(param.get('tau_vel_d', 0.15))   # vertical   velocity filter τ [s]
         self._TAU_T_COLL   = 0.30                   # T_coll output filter τ [s]
+
+        # Gate-pass delay: hold wp advance until drone clears the gate by N metres.
+        # At v=20 m/s, gate_pass_dist_m=3 → ~0.15 s after collision before turn.
+        # A timeout_sec cap prevents deadlock if the drone overshoots without advancing.
+        self._gate_pass_dist    = float(param.get('gate_pass_dist_m', 0.0))
+        self._gate_pass_timeout = float(param.get('gate_pass_timeout_sec', 2.0))
+        self._wp_pending        = None   # (new_wp, gate_wp_ned, ea, t_fired) or None
 
         # Rate-limited yaw command — initialised at measured yaw on first update
         self._psi_cmd = None
@@ -445,37 +462,61 @@ class Controller:
 
         # Advance carrot waypoint when sim signals gate passage.
         if self.data.pop('gate_passed', False):
-            # Always advance by at least 1 from current wp.  The old formula
-            # new_wp = agi + 1 failed when tracker.wp was already agi + 1 (the
-            # common case where sim reports the gate index that was just passed).
-            # Additionally sync forward if sim's active_gate_index is ahead.
-            agi = self.data.get('active_gate_index', -1)
+            agi    = self.data.get('active_gate_index', -1)
             new_wp = self.tracker.wp + 1
             if agi >= 0:
                 new_wp = max(new_wp, int(agi) + 1)
             new_wp = min(new_wp, self.tracker.n_waypoints - 1)
             if new_wp > self.tracker.wp:
-                self.tracker.wp = new_wp
-                print(f"[GATE PASSED id={self.data.get('last_gate_id')}] "
-                      f"tracker.wp → {self.tracker.wp}", flush=True)
+                if self._gate_pass_dist > 0.0:
+                    # Defer: wait until drone is gate_pass_dist_m past the gate along segment.
+                    _r0  = np.asarray(self.tracker.waypoints[self.tracker.wp - 1], dtype=float)
+                    _r1  = np.asarray(self.tracker.waypoints[self.tracker.wp],     dtype=float)
+                    _d   = _r1 - _r0
+                    _len = float(np.linalg.norm(_d))
+                    _ea  = _d / _len if _len > 1e-6 else _d
+                    self._wp_pending = (new_wp, _r1.copy(), _ea, time.time())
+                    print(f"[GATE PASSED id={self.data.get('last_gate_id')}] "
+                          f"wp advance to {new_wp} pending ({self._gate_pass_dist:.1f} m clearance)",
+                          flush=True)
+                else:
+                    self.tracker.wp = new_wp
+                    self._wp_pending = None
+                    print(f"[GATE PASSED id={self.data.get('last_gate_id')}] "
+                          f"tracker.wp → {self.tracker.wp}", flush=True)
 
-        # Path-progress fallback: advance wp when drone reaches within 3 m of the target
-        # waypoint along the segment.  Fires when the sim does not send COLLISION (e.g.
-        # before race_started=True).  Harmless when COLLISION already fired — the
-        # tracker.wp will already equal or exceed the computed new_wp so the guard below
-        # prevents any double-advance.
+        # Resolve pending wp advance: fire when drone clears gate by gate_pass_dist_m
+        # or when the timeout elapses (prevents deadlock on missed gate).
+        if self._wp_pending is not None:
+            _new_wp, _gate_ned, _ea, _t_fired = self._wp_pending
+            _elapsed = time.time() - _t_fired
+            _along   = float(np.dot(pos_ned - _gate_ned, _ea))
+            if _along >= self._gate_pass_dist or _elapsed >= self._gate_pass_timeout:
+                self.tracker.wp  = _new_wp
+                self._wp_pending = None
+                self._wp_transition_reset()
+                print(f"[WP ADVANCE] tracker.wp → {_new_wp}  "
+                      f"(along={_along:.1f} m  elapsed={_elapsed:.2f} s)", flush=True)
+
+        # Path-progress fallback: advance wp when drone clears the target waypoint by
+        # gate_pass_dist_m along the segment.  Fires when the sim does not send COLLISION
+        # (e.g. before race_started=True) or when COLLISION never arrives.
+        # Suppressed while a collision-triggered pending advance is active — in that
+        # case the pending check above already manages the transition.
         if (self._carrot_active and not in_hover
-                and self.tracker.wp < self.tracker.n_waypoints - 1):
+                and self.tracker.wp < self.tracker.n_waypoints - 1
+                and self._wp_pending is None):
             _r0  = np.asarray(self.tracker.waypoints[self.tracker.wp - 1], dtype=float)
             _r1  = np.asarray(self.tracker.waypoints[self.tracker.wp],     dtype=float)
             _seg = _r1 - _r0
             _seg_len = float(np.linalg.norm(_seg))
             if _seg_len > 0.1:
                 _lam = float(np.dot(pos_ned - _r0, _seg / _seg_len))
-                if _lam >= _seg_len - 3.0:
+                if _lam >= _seg_len + self._gate_pass_dist:
                     _nwp = self.tracker.wp + 1
                     if _nwp > self.tracker.wp:
                         self.tracker.wp = _nwp
+                        self._wp_transition_reset()
                         print(f"[PATH ADVANCE wp→{self.tracker.wp}]  "
                               f"lambda={_lam:.1f}/{_seg_len:.1f}m", flush=True)
 
@@ -575,10 +616,44 @@ class Controller:
         time.sleep(DT)
 
     # ------------------------------------------------------------------
+    # Waypoint transition reset
+    # ------------------------------------------------------------------
+
+    def _wp_transition_reset(self):
+        """Called the instant tracker.wp advances to a new segment.
+
+        1. Flush xi_vel: the integrator was compensating old-segment drag and now
+           fights the new reference direction.  P-term alone starts the turn.
+        2. Zero the lag-FF derivative for one tick: set _v_ref_prev = _v_ref_smooth
+           so dv_ref/dt = 0 on the first post-transition call, preventing a spike
+           from any small residual step in the smoothed reference.
+        Do NOT reseed _v_ref_smooth — the LP filter carries over naturally and the
+        carrot extrapolation (past-gate fix in carrot_tracker.py) keeps the
+        reference moving forward during the delay window.
+        """
+        self.xi_vel[:] = 0.0
+        if self._v_ref_smooth is not None:
+            self._v_ref_prev = self._v_ref_smooth.copy()
+
+    # ------------------------------------------------------------------
     # Outer loop: NED velocity + yaw → desired body rates + collective
     # ------------------------------------------------------------------
 
     def _outer_loop(self, v_ned_ref, psi_ref, v_ned_meas, quat, psi_meas, R22, dt, hover_t):
+        # ── Gain scheduling ───────────────────────────────────────────────────
+        # Interpolate K_att and Kp_v* linearly with |v_ned_ref| so gains ramp up
+        # as commanded speed increases, improving attitude bandwidth at high speed.
+        _v_sched = float(np.linalg.norm(v_ned_ref))
+        if self._gs_v_hi > self._gs_v_lo:
+            _gs_alpha = np.clip(
+                (_v_sched - self._gs_v_lo) / (self._gs_v_hi - self._gs_v_lo), 0.0, 1.0)
+        else:
+            _gs_alpha = 0.0
+        _K_att_eff = self._K_att + _gs_alpha * (self._K_att_hi - self._K_att)
+        _Kp_vN_eff = self._Kp_vN + _gs_alpha * (self._Kp_vN_hi - self._Kp_vN)
+        _Kp_vE_eff = self._Kp_vE + _gs_alpha * (self._Kp_vE_hi - self._Kp_vE)
+        _Kp_vD_eff = self._Kp_vD + _gs_alpha * (self._Kp_vD_hi - self._Kp_vD)
+
         # Low-pass filter all three EKF velocity channels before computing errors.
         # Horizontal (vN, vE): longer τ because the cold-start spurious velocity
         # (gravity misattributed as acceleration before attitude converges) is
@@ -646,9 +721,9 @@ class Controller:
         # Use clamped error for proportional path too: unclamped liftoff vz
         # (~11 m/s upward) would otherwise cut collective to ~0.5 N/motor.
         g   = self._g
-        a_N = (self._Kp_vN * e_vel_c[0] + self._Ki_vN * self.xi_vel[0]
+        a_N = (_Kp_vN_eff * e_vel_c[0] + self._Ki_vN * self.xi_vel[0]
                + self._ff_vN * v_ned_ref[0] + _a_lag_N)
-        a_E = (self._Kp_vE * e_vel_c[1] + self._Ki_vE * self.xi_vel[1]
+        a_E = (_Kp_vE_eff * e_vel_c[1] + self._Ki_vE * self.xi_vel[1]
                + self._ff_vE * v_ned_ref[1] + _a_lag_E)
 
         # Rotate desired NED acceleration into body-frame components.
@@ -667,14 +742,14 @@ class Controller:
         phi_meas, theta_meas, psi_meas = quat_to_euler(quat)
 
         # Attitude error → desired body rates (clamped to prevent overshooting mixer)
-        p_des = np.clip(self._K_att * (phi_des   - phi_meas),   -4.0, 4.0)
-        q_des = np.clip(self._K_att * (theta_des - theta_meas), -4.0, 4.0)
+        p_des = np.clip(_K_att_eff * (phi_des   - phi_meas),   -4.0, 4.0)
+        q_des = np.clip(_K_att_eff * (theta_des - theta_meas), -4.0, 4.0)
         r_des = np.clip(self._K_psi * e_psi + self._Ki_psi * self.xi_psi, -2.0, 2.0)
 
         # Collective thrust (tilt-corrected); a_z > 0 = NED-down = less lift needed.
         # T_collective is the TOTAL thrust fed into the mixer's first row (T1+T2+T3+T4),
         # so use 4*T_hover (=m*g), not T_hover (=m*g/4) which is per-motor hover thrust.
-        a_z = self._Kp_vD * e_vel_c[2] + self._Ki_vD * self.xi_vel[2]
+        a_z = _Kp_vD_eff * e_vel_c[2] + self._Ki_vD * self.xi_vel[2]
         T_raw = 4.0 * self.T_hover * (1.0 - a_z / g) / R22
         # Output filter: removes R22 (attitude) noise that the vD filter cannot catch.
         alpha_T = np.exp(-dt / self._TAU_T_COLL)
