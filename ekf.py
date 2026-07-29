@@ -75,6 +75,42 @@ class QuadEKF:
         self._vel_reject_streak = 0
         self._yaw_reject_streak = 0
 
+        # Raw-measurement-to-measurement speed check for update_position (see
+        # its docstring). Tracks the immediately preceding PnP position
+        # measurement (regardless of whether it was applied), so it never
+        # free-runs/drifts the way an open-loop dead-reckoned reference would
+        # — position is a double integral of acceleration and drifts far too
+        # fast for that approach (tried and reverted: rejected 76% of fixes
+        # on a real log and made overall error much worse). Comparing
+        # consecutive raw measurements directly avoids that entirely.
+        self._last_pos_meas   = None
+        self._last_pos_meas_t = None
+
+        # Vision-immune shadow velocity — see predict()'s note and
+        # update_velocity's IMU-consistency check for why this exists. Only
+        # resynced to the (vision-corrected) state after _V_IMU_REF_RESYNC_SEC
+        # has elapsed since the last resync (see update_velocity) — NOT on
+        # every accepted correction. Resyncing every time would let this
+        # reference get dragged along by the same slow, self-consistent
+        # sequence of small corrections it exists to catch, one tick behind
+        # the state it's supposed to be independently checking (found via a
+        # synthetic "consensus attack" test: with per-update resync, a run of
+        # individually-small-but-cumulatively-wrong velocity fixes was
+        # accepted 15/15 times regardless of this check — identical to not
+        # having it at all).
+        self._v_imu_ref     = self.x[self._IV].copy()
+        self._v_imu_ref_age = 0.0
+
+        # Same idea, for yaw: a gyro-only shadow quaternion, checked in
+        # update_yaw alongside the state gate. Needed because a PnP 180°-flip-
+        # type yaw outlier is discrete and self-consistent once accepted (the
+        # flipped detection keeps looking flipped), so it can ride the same
+        # streak-widening path that let the velocity consensus-attack through.
+        self._q_imu_ref       = self.x[self._IQ].copy()
+        self._q_imu_ref_age   = 0.0
+
+    _V_IMU_REF_RESYNC_SEC = 3.0  # min time between _v_imu_ref resyncs from vision
+
     _GATE_WIDEN_AFTER = 10    # consecutive rejections before the gate starts widening
     _GATE_WIDEN_STEP  = 0.5  # gate-multiples added per rejection beyond that
     _GATE_WIDEN_MAX   = 15.0 # cap on the widening multiplier
@@ -114,6 +150,29 @@ class QuadEKF:
         self.x[self._IV]  = v_new
         self.x[self._IQ]  = q_new
         # bias unchanged: self.x[self._IBG] stays
+
+        # Vision-immune shadow velocity: integrates the same IMU(+model)
+        # specific force as the real state but is never touched by a vision
+        # update. update_velocity gates incoming PnP velocity against this
+        # reference in addition to self.x[self._IV] — the real state's
+        # velocity can co-drift with a run of self-consistent-but-wrong PnP
+        # fixes (e.g. tracking a false gate structure visible through the
+        # true one's beams during a transit, which has its own smooth
+        # relative motion), each individually inside gate_dist of the
+        # *previous*, already-nudged state. _v_imu_ref can't be dragged that
+        # way, so it stays an honest, independent witness to what IMU+model
+        # alone predicts.
+        self._v_imu_ref     = self._v_imu_ref + a_ned * dt
+        self._v_imu_ref_age = self._v_imu_ref_age + dt
+
+        # Gyro-only shadow quaternion for update_yaw's IMU-consistency check
+        # (see __init__'s note) — same kinematics as the real quaternion
+        # above, using the same bias-corrected rate, but never touched by a
+        # vision yaw update.
+        q_ref_new = self._q_imu_ref + 0.5 * dt * _omega_mat(omega) @ self._q_imu_ref
+        nrm_ref = np.linalg.norm(q_ref_new)
+        self._q_imu_ref     = q_ref_new / nrm_ref if nrm_ref > 1e-9 else self._q_imu_ref
+        self._q_imu_ref_age = self._q_imu_ref_age + dt
 
         # Propagate covariance  P ← (I + F·dt) P (I + F·dt)ᵀ + Q
         F  = _jacobian_F(q, omega, acc_raw)
@@ -168,14 +227,38 @@ class QuadEKF:
         H[0, 3] = H[1, 4] = H[2, 5] = 1.0              # measures v_ned at indices 3:6
 
         self._apply_update(innov, H, self._R_z)
+        # ZUPT's own gating (near-zero gyro/accel/velocity) is a reliable,
+        # vision-independent truth signal, so it's safe to always resync here
+        # (unlike update_velocity's cooldown-gated resync below).
+        self._v_imu_ref     = self.x[self._IV].copy()
+        self._v_imu_ref_age = 0.0
         return True, float(np.linalg.norm(innov))
 
-    def update_position(self, pos_ned_meas, sigma_pos=0.5, gate_dist=10.0):
+    def update_position(self, pos_ned_meas, sigma_pos=0.5, gate_dist=10.0,
+                         t=None, max_speed=15.0):
         """
         NED position measurement from visual PnP against a known gate landmark.
         Rejects innovations larger than gate_dist metres (outlier/bad PnP), but
         the effective gate widens after a long run of consecutive rejections
         (see __init__'s note) so a diverged filter can eventually recover.
+
+        Also rejects a measurement whose implied speed from the immediately
+        preceding raw measurement exceeds max_speed [m/s] (only checked when
+        `t` — the measurement's wall-clock time — is given). Confirmed in a
+        flight log: a run of self-consistent-but-wrong PnP position fixes
+        smoothly ramped ~3.5m over ~0.26s (implying 18-42 m/s, well above the
+        vehicle's observed ~12 m/s top speed), each step individually small
+        enough relative to the *already-dragged* state to slip past the gate
+        above — the same consensus-attack mechanism already fixed for
+        velocity/yaw. Deliberately NOT an open-loop dead-reckoned reference
+        like _v_imu_ref/_q_imu_ref: position is a double integral of
+        acceleration and drifts far too fast for that (tried and reverted —
+        rejected 76% of fixes on a real log and made things much worse).
+        Comparing consecutive raw measurements avoids any free-running drift
+        entirely, at the cost of only catching the initial jump into a false
+        lock rather than a sustained one — sufficient here because once the
+        jump is blocked, the state never moves, so subsequent self-consistent
+        bad measurements still fail the ordinary gate above.
         Returns (applied: bool, innov_norm: float).
         """
         pos_ned_meas = np.asarray(pos_ned_meas, dtype=float)
@@ -187,6 +270,26 @@ class QuadEKF:
             # permanently. Reject outright and don't count it toward the
             # reject streak — it's not a "far away" measurement, just garbage.
             return False, float('nan')
+
+        if t is not None and self._last_pos_meas_t is not None:
+            dt_meas = t - self._last_pos_meas_t
+            if dt_meas > 1e-3:
+                jump = float(np.linalg.norm(pos_ned_meas - self._last_pos_meas))
+                if jump / dt_meas > max_speed:
+                    self._last_pos_meas   = pos_ned_meas.copy()
+                    self._last_pos_meas_t = t
+                    # Deliberately does NOT touch _pos_reject_streak: a
+                    # physically-implausible jump is evidence the MEASUREMENT
+                    # is garbage, not that the filter has diverged, so it must
+                    # not feed the widening logic below (confirmed by testing:
+                    # letting it increment the streak eventually widened
+                    # eff_gate enough to admit a later, equally-bad point
+                    # anyway — the same class of bug as update_velocity/
+                    # update_yaw's imu-ref checks, just reached differently).
+                    return False, jump
+        self._last_pos_meas   = pos_ned_meas.copy()
+        self._last_pos_meas_t = t
+
         innov = pos_ned_meas - self.x[self._IP]
         innov_norm = float(np.linalg.norm(innov))
         eff_gate = self._effective_gate(gate_dist, self._pos_reject_streak)
@@ -214,9 +317,33 @@ class QuadEKF:
         vel_ned_meas = np.asarray(vel_ned_meas, dtype=float)
         if not np.all(np.isfinite(vel_ned_meas)):
             return False, float('nan')   # see update_position's note on why this guard exists
+
+        eff_gate = self._effective_gate(gate_dist, self._vel_reject_streak)
+
+        # IMU-consistency check against the vision-immune reference (see
+        # predict()'s note). Runs first and independently of the state-based
+        # gate below: a false-target lock that smoothly tracks its own
+        # relative motion across several frames can pass the state gate one
+        # small step at a time (each within eff_gate of the *previous*,
+        # already-nudged state) while still being far from what pure
+        # IMU+model integration says velocity should be. This check catches
+        # that accumulated drift even when each individual step looked fine.
+        # Deliberately gated on the *unwidened* gate_dist, not eff_gate: this
+        # reference can't be dragged by a streak of bad vision fixes the way
+        # the state can, so there's no "filter has genuinely diverged, let it
+        # back in" case to accommodate here — gating it on eff_gate would let
+        # exactly the outliers this check exists to catch ride through once
+        # the streak (from whatever cause) widens past their size, which is
+        # what happened in practice (confirmed in a flight log: a 78° yaw
+        # innovation — the analogous bug in update_yaw — was accepted at
+        # streak=12, eff_gate=114.6°, same root cause).
+        imu_innov_norm = float(np.linalg.norm(vel_ned_meas - self._v_imu_ref))
+        if imu_innov_norm > gate_dist:
+            self._vel_reject_streak += 1
+            return False, imu_innov_norm
+
         innov = vel_ned_meas - self.x[self._IV]
         innov_norm = float(np.linalg.norm(innov))
-        eff_gate = self._effective_gate(gate_dist, self._vel_reject_streak)
         if innov_norm > eff_gate:
             self._vel_reject_streak += 1
             return False, innov_norm
@@ -227,6 +354,16 @@ class QuadEKF:
         R       = (sigma_vel ** 2) * np.eye(3)
 
         self._apply_update(innov, H, R)
+        # Resync _v_imu_ref only after a cooldown, not on every acceptance —
+        # see __init__'s note. This bounds _v_imu_ref's worst-case drift to
+        # whatever pure IMU+model integration accumulates over
+        # _V_IMU_REF_RESYNC_SEC (preventing a permanent lockout from genuine
+        # long-run IMU drift) while keeping it immune to attack over any
+        # shorter window, which is where the failure mode this check guards
+        # against actually plays out.
+        if self._v_imu_ref_age >= self._V_IMU_REF_RESYNC_SEC:
+            self._v_imu_ref     = self.x[self._IV].copy()
+            self._v_imu_ref_age = 0.0
         return True, innov_norm
 
     def update_yaw(self, yaw_meas, sigma_yaw=0.1, gate_dist=np.pi):
@@ -239,6 +376,24 @@ class QuadEKF:
         """
         if not np.isfinite(yaw_meas):
             return False, float('nan')   # see update_position's note on why this guard exists
+
+        eff_gate = self._effective_gate(gate_dist, self._yaw_reject_streak)
+
+        # IMU-consistency check against the vision-immune gyro-only shadow
+        # quaternion (see __init__'s note and predict()'s _q_imu_ref update).
+        # Catches a discrete, self-consistent yaw outlier (e.g. a PnP 180°
+        # flip) that the state gate's streak-widening would otherwise admit —
+        # confirmed in a flight log: 50-80° yaw innovations were being
+        # accepted via widening, each one immediately dragging the estimate
+        # and looking "consistent" to the next flipped detection. Gated on the
+        # unwidened gate_dist, not eff_gate — see update_velocity's identical
+        # note on why this reference must not honor streak-widening.
+        imu_innov = float(yaw_meas) - _yaw_of_quat(self._q_imu_ref)
+        imu_innov = (imu_innov + np.pi) % (2.0 * np.pi) - np.pi
+        if abs(imu_innov) > gate_dist:
+            self._yaw_reject_streak += 1
+            return False, abs(imu_innov)
+
         qw, qx, qy, qz = self.x[self._IQ]
         f = 2.0 * (qw * qz + qx * qy)
         g = 1.0 - 2.0 * (qy * qy + qz * qz)
@@ -246,7 +401,6 @@ class QuadEKF:
 
         innov = float(yaw_meas) - yaw_est
         innov = (innov + np.pi) % (2.0 * np.pi) - np.pi   # wrap to [-π, π]
-        eff_gate = self._effective_gate(gate_dist, self._yaw_reject_streak)
         if abs(innov) > eff_gate:
             self._yaw_reject_streak += 1
             return False, abs(innov)
@@ -262,6 +416,11 @@ class QuadEKF:
         R = np.array([[sigma_yaw ** 2]])
         self._apply_update(np.array([innov]), H, R)
         self.x[self._IQ] /= np.linalg.norm(self.x[self._IQ])
+        # Resync only after a cooldown, not on every acceptance — see
+        # update_velocity's identical pattern and __init__'s note.
+        if self._q_imu_ref_age >= self._V_IMU_REF_RESYNC_SEC:
+            self._q_imu_ref     = self.x[self._IQ].copy()
+            self._q_imu_ref_age = 0.0
         return True, abs(innov)
 
     def reset(self):
@@ -276,6 +435,12 @@ class QuadEKF:
         self._pos_reject_streak = 0
         self._vel_reject_streak = 0
         self._yaw_reject_streak = 0
+        self._last_pos_meas   = None
+        self._last_pos_meas_t = None
+        self._v_imu_ref     = self.x[self._IV].copy()
+        self._v_imu_ref_age = 0.0
+        self._q_imu_ref     = self.x[self._IQ].copy()
+        self._q_imu_ref_age = 0.0
 
     def set_yaw(self, psi):
         """
@@ -300,6 +465,8 @@ class QuadEKF:
         self.x[9]  = sy*ct*cp - cy*st*sp   # qz
         # Normalise to guard against floating-point drift
         self.x[self._IQ] /= np.linalg.norm(self.x[self._IQ])
+        self._q_imu_ref     = self.x[self._IQ].copy()
+        self._q_imu_ref_age = 0.0
 
     def set_attitude(self, phi, theta, psi):
         """Rebuild quaternion from explicit roll/pitch/yaw (ZYX Tait-Bryan)."""
@@ -311,6 +478,8 @@ class QuadEKF:
         self.x[8]  = cy*st*cp + sy*ct*sp   # qy
         self.x[9]  = sy*ct*cp - cy*st*sp   # qz
         self.x[self._IQ] /= np.linalg.norm(self.x[self._IQ])
+        self._q_imu_ref     = self.x[self._IQ].copy()
+        self._q_imu_ref_age = 0.0
 
     def set_roll(self, phi):
         """
@@ -331,6 +500,8 @@ class QuadEKF:
         self.x[8]  = cy*st*cp + sy*ct*sp   # qy
         self.x[9]  = sy*ct*cp - cy*st*sp   # qz
         self.x[self._IQ] /= np.linalg.norm(self.x[self._IQ])
+        self._q_imu_ref     = self.x[self._IQ].copy()
+        self._q_imu_ref_age = 0.0
 
     # ── Properties ────────────────────────────────────────────────────────
 
@@ -374,6 +545,15 @@ class QuadEKF:
 
 
 # ── Module-level pure helpers ─────────────────────────────────────────────
+
+def _yaw_of_quat(q):
+    """Extract NED yaw [rad] from q = [qw, qx, qy, qz]. Shared by update_yaw
+    and its IMU-consistency check so both use the identical formula."""
+    qw, qx, qy, qz = q
+    f = 2.0 * (qw * qz + qx * qy)
+    g = 1.0 - 2.0 * (qy * qy + qz * qz)
+    return float(np.arctan2(f, g))
+
 
 def _rot_b2n(q):
     """R_body_to_NED: v_NED = R @ v_body.  q = [qw, qx, qy, qz]."""

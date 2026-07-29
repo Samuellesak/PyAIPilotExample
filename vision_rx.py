@@ -517,7 +517,7 @@ class VisionRX:
         return vis
 
     def _pnp_gate(self, corners_px, gate_width, gate_height,
-                  continuity_attr='_last_pnp_R_primary'):
+                  continuity_attr='_last_pnp_R_primary', gate_ned=None):
         """Returns (tvec, rvec) both as flat (3,) arrays, or (None, None) on failure.
 
         IPPE produces two solutions with nearly equal reprojection error for
@@ -525,6 +525,19 @@ class VisionRX:
         the gate Y-axis (downward direction in gate frame) must point toward NED-down.
         We fetch both solutions and pick the one whose gate_Y_cam best aligns with
         NED-down in camera frame (derived from EKF attitude if available).
+
+        gate_ned, when given (the gate's known absolute NED position), lets a
+        near-tied ambiguity be broken by which candidate's IMPLIED drone
+        position is closer to mav_state['pos_ned'] — an independent anchor
+        (ground truth in this test config; the EKF's own multi-sensor
+        estimate otherwise) that the vision pipeline can't have already
+        poisoned. Falls back to rotational continuity with the last ACCEPTED
+        solution when no independent anchor is available. Confirmed in a
+        flight log: continuity-only tie-breaking can lock onto the wrong IPPE
+        solution and then keep favouring it for 20+ consecutive frames, since
+        the wrong pick becomes its own "closest to recent history" — a
+        self-reinforcing failure the position check catches immediately
+        instead, because mav_state isn't updated by a single bad vision frame.
         """
         hw = gate_width  / 2.0
         hh = gate_height / 2.0
@@ -587,26 +600,52 @@ class VisionRX:
         # Near-frontal views give two IPPE solutions with almost equal NED-down
         # score (see docstring). ned_down_cam is derived from the EKF's current
         # attitude, so tiny attitude noise can flip which candidate "wins" from
-        # one frame to the next even though the true pose hasn't changed —
-        # confirmed in a flight log: keypoints perfectly stable, but the picked
-        # solution flipped and stuck on the wrong one for 8+ consecutive frames,
-        # producing a sustained ~8 m position error the smoothing/outlier checks
-        # elsewhere can't catch since it isn't a single-frame glitch. When the
-        # top two scores are close, break the tie toward whichever candidate is
-        # rotationally closer to the last frame's ACCEPTED solution instead —
-        # continuity with the vision pipeline's own recent history is a much
-        # more stable signal here than instantaneous EKF attitude.
-        last_R = getattr(self, continuity_attr, None)
-        if len(candidates) >= 2 and last_R is not None:
-            second_score = candidates[1][0]
-            if best_score - second_score < 0.05:
-                def _rot_dist(Ra, Rb):
-                    _cos = (np.trace(Ra.T @ Rb) - 1.0) / 2.0
-                    return np.arccos(np.clip(_cos, -1.0, 1.0))
-                d0 = _rot_dist(candidates[0][3], last_R)
-                d1 = _rot_dist(candidates[1][3], last_R)
+        # one frame to the next even though the true pose hasn't changed.
+        if len(candidates) >= 2 and best_score - candidates[1][0] < 0.05:
+            mav = self.data.get('mav_state')
+            resolved = False
+            if gate_ned is not None and mav is not None and mav.get('pos_ned') is not None:
+                # Position-consistency tie-break: prefer whichever candidate's
+                # implied absolute drone position is closer to mav_state — an
+                # independent anchor a single bad vision frame can't have
+                # already poisoned (see docstring for why the rotational-
+                # continuity fallback below can self-reinforce a wrong lock).
+                qw, qx, qy, qz = mav['quat']
+                R_b2n = np.array([
+                    [1-2*(qy*qy+qz*qz),  2*(qx*qy-qw*qz),  2*(qx*qz+qw*qy)],
+                    [  2*(qx*qy+qw*qz),1-2*(qx*qx+qz*qz),  2*(qy*qz-qw*qx)],
+                    [  2*(qx*qz-qw*qy),  2*(qy*qz+qw*qx),1-2*(qx*qx+qy*qy)],
+                ])
+                mav_pos = np.asarray(mav['pos_ned'])
+
+                def _implied_pos(tv_cand):
+                    t_gate_body = self._R_cam2body @ tv_cand
+                    t_gate_ned  = R_b2n @ t_gate_body
+                    return gate_ned - t_gate_ned
+
+                d0 = float(np.linalg.norm(_implied_pos(candidates[0][2]) - mav_pos))
+                d1 = float(np.linalg.norm(_implied_pos(candidates[1][2]) - mav_pos))
                 if d1 < d0:
                     best_score, best_rvec, best_tvec, best_R = candidates[1]
+                resolved = True
+
+            if not resolved:
+                # Fall back to rotational continuity with the last ACCEPTED
+                # solution when no independent position anchor is available.
+                # Confirmed in a flight log: this can lock onto the wrong IPPE
+                # solution and keep favouring it for 20+ consecutive frames,
+                # since the wrong pick becomes its own "closest to recent
+                # history" once accepted — a self-reinforcing failure the
+                # position check above exists to avoid.
+                last_R = getattr(self, continuity_attr, None)
+                if last_R is not None:
+                    def _rot_dist(Ra, Rb):
+                        _cos = (np.trace(Ra.T @ Rb) - 1.0) / 2.0
+                        return np.arccos(np.clip(_cos, -1.0, 1.0))
+                    d0 = _rot_dist(candidates[0][3], last_R)
+                    d1 = _rot_dist(candidates[1][3], last_R)
+                    if d1 < d0:
+                        best_score, best_rvec, best_tvec, best_R = candidates[1]
 
         if best_tvec[2] < 0.5:
             return None, None
@@ -805,7 +844,8 @@ class VisionRX:
                     # track_gates_ned is temporarily unavailable.
                     self._last_gate_info[int(agi)] = gate_info
                     tvec_cam, rvec_cam = self._pnp_gate(
-                        corners, gate_info['width'], gate_info['height'])
+                        corners, gate_info['width'], gate_info['height'],
+                        gate_ned=gate_info['ned'])
                     if tvec_cam is None:
                         _pnp_skip_reason = "solvePnP failed"
                 else:
@@ -818,21 +858,29 @@ class VisionRX:
                     # Gate dims are always the fixed inner-opening constant — never taken
                     # from track data's outer-frame width/height (see note above).
                     _last = self._last_gate_info.get(int(agi)) if agi is not None else None
+                    # Resolve a fallback NED (independent of whether PnP below
+                    # succeeds) so _pnp_gate can use it for its position-
+                    # consistency ambiguity check too.
+                    _wp_ned = None
+                    if _last is None and agi is not None and self._waypoints is not None:
+                        wp_idx = int(agi) + 1
+                        if wp_idx < len(self._waypoints):
+                            _wp_ned = self._waypoints[wp_idx]
+                    _fallback_ned = _last['ned'] if _last is not None else _wp_ned
                     tvec_cam, rvec_cam = self._pnp_gate(
-                        corners, self._gate_w_default, self._gate_h_default)
+                        corners, self._gate_w_default, self._gate_h_default,
+                        gate_ned=_fallback_ned)
                     gate_info = None
                     if tvec_cam is not None and agi is not None:
                         if _last is not None:
                             gate_info = _last
-                        elif self._waypoints is not None:
-                            wp_idx = int(agi) + 1
-                            if wp_idx < len(self._waypoints):
-                                gate_info = {
-                                    'ned':    self._waypoints[wp_idx].copy(),
-                                    'width':  self._gate_w_default,
-                                    'height': self._gate_h_default,
-                                    'quat':   None,
-                                }
+                        elif _wp_ned is not None:
+                            gate_info = {
+                                'ned':    _wp_ned.copy(),
+                                'width':  self._gate_w_default,
+                                'height': self._gate_h_default,
+                                'quat':   None,
+                            }
                     if tvec_cam is None:
                         _pnp_skip_reason = "solvePnP failed (fallback dims)"
                     elif gate_info is None:

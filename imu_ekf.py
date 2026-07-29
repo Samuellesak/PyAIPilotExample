@@ -487,7 +487,8 @@ class IMUEKFHandler:
                             break
                     local_pos = local_pos + (self._ekf.x[0:3] - _pos_hist)
                 self._ekf.update_position(
-                    local_pos, sigma_pos=vis['sigma_pos'], gate_dist=vis['gate'])
+                    local_pos, sigma_pos=vis['sigma_pos'], gate_dist=vis['gate'],
+                    t=_vis_t, max_speed=self._param.get('ekf_vision_pos_max_speed', 15.0))
             if vis.get('vel_ned') is not None:
                 self._ekf.update_velocity(
                     vis['vel_ned'], sigma_vel=vis['sigma_vel'],

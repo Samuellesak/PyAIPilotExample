@@ -125,6 +125,8 @@ def run_replay(sigma_acc_imu, sigma_acc_model, use_model, use_vision,
     ekf.x[3:6]   = ekf0_vel
     ekf.x[6:10]  = ekf0_quat
     ekf.x[10:13] = gyro_bias0
+    ekf._v_imu_ref = ekf.x[3:6].copy()   # keep the IMU-consistency references in sync with the seeded IC
+    ekf._q_imu_ref = ekf.x[6:10].copy()
 
     Dv         = param['Dv']
     m          = float(param['m'])
@@ -206,7 +208,9 @@ def run_replay(sigma_acc_imu, sigma_acc_model, use_model, use_vision,
                                 pos_hist = bp
                                 break
                         local_pos = local_pos + (ekf.x[0:3] - pos_hist)
-                    ap, ai = ekf.update_position(local_pos, sigma_pos=vr['sigma_pos'], gate_dist=vr['gate'])
+                    ap, ai = ekf.update_position(
+                        local_pos, sigma_pos=vr['sigma_pos'], gate_dist=vr['gate'],
+                        t=vr['wall_t'], max_speed=float(raw_params.get('ekf_vision_pos_max_speed', 15.0)))
                     vis_pos_applied[i], vis_pos_innov[i] = float(ap), ai
                 if int(vr['has_vel']):
                     ap, ai = ekf.update_velocity(

@@ -62,7 +62,9 @@ waypoints: # Ground truth NED coordinates of the gates (from sim TRACK messages)
   - [-74.59375,      1.2000097,   12.66804123]    
   - [-111.4937439,   -5.09998989,   23.56804085]    
   - [-135.4937439,    -0.79999024,   24.35565376]
-  - [-159.19374084,   -4.39999008,   24.96804047]   
+  - [-159.19374084,   -4.39999008,   24.96804047] 
+
+gate_beam_to_center_offset_m: 1.0   # [m]   
   # Drone spawns North-facing (psi=0°) and turns South to fly through gates.
   # Gates are along the -N axis (South); N values are negative throughout.
 
@@ -73,11 +75,8 @@ waypoints: # Ground truth NED coordinates of the gates (from sim TRACK messages)
 #[TRACK] gate 4: NED=[-135.4937439    -0.79999024   25.35565376]  2.7x2.7m
 #[TRACK] gate 5: NED=[-159.19374084   -4.39999008   25.96804047]  2.7x2.7m
 
-# Both the [TRACK] tags above and the live track_gates_ned MAVLink messages mark a
-# gate's bottom beam, not the opening centre the drone flies through — the centre
-# sits this far above the beam (smaller D). The waypoints: list above already has
-# it baked in; check_yolo.py and vision_rx.py apply it to the raw beam NED instead.
-gate_beam_to_center_offset_m: 1.0   # [m]
+
+
 
 # ── Camera intrinsics (pinhole, no distortion) ────────────────────────
 # Starting assumption: 640×480, 90° horizontal FOV → fx = fy = image_width/2.
@@ -105,6 +104,17 @@ ekf_vision_sigma_range_k: 0.08  # additional 1-sigma per metre of PnP range [m/m
 # roll (phi grew -17deg->-56deg over 9s, never correcting). 3.0 m rejects that
 # class of error while still allowing legitimate gate-relative corrections.
 ekf_vision_gate:      3.0   # reject PnP position innovation > this [m]
+# Separate from ekf_vision_gate above: rejects a fix whose implied speed from
+# the immediately preceding raw PnP position measurement exceeds this, before
+# the gate check even runs. Confirmed in a flight log: a run of self-
+# consistent-but-wrong position fixes ramped smoothly enough (each step small
+# relative to the state the *previous* step had already dragged along) to
+# walk past ekf_vision_gate one step at a time, implying 18-42 m/s between
+# consecutive raw fixes — well above the ~12 m/s top speed actually observed
+# in flight. See ekf.py update_position's docstring for why this is a
+# consecutive-raw-measurement check rather than an open-loop dead-reckoned
+# reference (the latter was tried for position specifically and reverted).
+ekf_vision_pos_max_speed: 15.0   # reject a PnP position fix implying more than this [m/s]
 ekf_vision_vel_sigma: 1.0    # 1-sigma velocity noise from PnP differencing [m/s]
 ekf_vision_vel_gate:  5.0    # reject PnP velocity innovation > this [m/s]
 ekf_vision_yaw_sigma: 0.1    # 1-sigma yaw noise from PnP [rad] (~6 deg)
@@ -140,7 +150,7 @@ gate_height_default:  1.5    # [m]
 vision_conf_min:      0.6
 
 # Gate distance lock — prevents distant-gate detections from corrupting PnP
-vision_max_gate_dist: 30.0   # reject PnP solutions farther than this [m]
+vision_max_gate_dist: 32.0   # reject PnP solutions farther than this [m]
 vision_vel_max_factor: 2.5   # reject PnP velocity > v_ref * this (e.g. 2.5 × 2 m/s = 5 m/s)
 vision_lock_frames:   5      # consecutive valid PnP frames required to acquire lock
 vision_lock_miss:     30     # consecutive missed frames before lock is released
@@ -171,7 +181,7 @@ vision_hold_frames:       5  # frames to hold last locked tvec after YOLO flicke
 vision_ref_omega0:        0     # [rad/s] PT2 natural freq for v_ref smoothing; 0 = disabled (raw carrot reference)
 vision_ref_zeta:          1.0   # PT2 damping ratio (1.0 = critically damped, no overshoot)
 vision_debug_overlay:   true  # set true to open a live OpenCV window with mode + bearing overlay
-next_gate_min_frames:   15    # frames second-gate PnP must be consistent before waypoint update
+next_gate_min_frames:   10    # frames second-gate PnP must be consistent before waypoint update
 
 # ── Image preprocessing (applied before orange mask) ─────────────────────────
 # Unsharp mask recovers orange saturation lost to motion blur without widening
@@ -199,14 +209,6 @@ suppress_blue_v_lo: 50    # min value — avoids suppressing dark/shadow regions
 level_tol_deg:     2.0   # roll/pitch tolerance to declare "level" [deg]
 level_timeout_sec: 1.5   # safety cap — blip fires anyway if not level by then [s]
 
-# ── Legacy blip params (kept for thrust_test.py / flight_sysid.py only) ───────
-# controller.py no longer fires a liftoff blip or freeze (see PHASE 1.5 / the
-# hover-entry ramp) — these two are unused by the main flight path now, but
-# other standalone scripts still read them for their own test sequences.
-# blip_dur_sec    : duration of the blip [s]
-# blip_thrust_frac: thrust fraction during blip (0–1, relative to T_max_motor)
-blip_dur_sec:      0.05
-blip_thrust_frac:  0.35
 
 # Window (post hover-reset) during which update_accel() (gravity-alignment
 # correction) stays active — see _accel_settle_window in imu_ekf.py. Was 5.5s
@@ -239,7 +241,7 @@ ramp_dur_sec:    4.0
 ramp_overshoot:  1.20
 
 # ── Logging ──────────────────────────────────────────────────────────────────
-logging: 1         # 0 = no logs
+logging: 1        # 0 = no logs
 mavlink_monitor: false  # true = print 1 Hz MAVLink rate monitor + first-seen msgs to terminal
 
 
@@ -261,7 +263,7 @@ mavlink_monitor: false  # true = print 1 Hz MAVLink rate monitor + first-seen ms
 # ── Data fusion extras ────────────────────────────────────────────────────────
 # Item 1: velocity-heading yaw update (continuous weak yaw between gate sightings)
 vel_heading_min_mps: 4.0   # min horizontal speed [m/s] to apply velocity-heading yaw
-sigma_vel_heading:   0.5   # 1-sigma yaw noise for vel-heading update [rad] (~29°)
+sigma_vel_heading:   0.1   # 1-sigma yaw noise for vel-heading update [rad] (~29°)
 gate_vel_heading:    1.0   # Mahalanobis gate for vel-heading yaw update [rad]
 
 # Item 2: gate-pass position fix (EKF position correction on COLLISION event)
@@ -272,12 +274,10 @@ vision_latency_s: 0.08     # image-to-EKF-update pipeline delay [s]; 0 = disable
 
 
 
-model_predict_shadow:    true   # log acc_model vs acc_imu to logs/model_predict_shadow_*.csv
+model_predict_shadow:    false   # log acc_model vs acc_imu to logs/model_predict_shadow_*.csv
 
 
 
-v_ref:          5.0   # reference cruise speed [m/s]
-lookahead_gain: 1.3   # lookahead distance = lookahead_gain * v_ref [m]; larger = smoother carrot direction 1.6
 
 
 # Distance to the gate at which the carrot stops advancing past it and pins to
@@ -286,7 +286,7 @@ lookahead_gain: 1.3   # lookahead distance = lookahead_gain * v_ref [m]; larger 
 # Defaults to the lookahead distance itself (lookahead_gain * v_ref) if unset.
 commit_dist_m: 3.5
 
-# ── Controller selection ─────────────────────────────────────────────────────
+# ── Controller selections ─────────────────────────────────────────────────────
 # 1 = Cascade PI  (analytical gains, no offline solve required)
 # 2 = LQI         (requires lqi_gains.npz — run `python lqi.py` first)
 controller_type: 1
@@ -311,7 +311,7 @@ vision_detect_for_logging: true
 ground_truth_mode:  true
 
 
-use_model_predict:  false
+use_model_predict:  true
 sigma_acc_imu:   5.0   # raw IMU specific force 1-sigma [m/s²]  — weight in blend
 sigma_acc_model: 0.05  # motor model specific force 1-sigma [m/s²] — lower = trust model more; adaptive at runtime
 # Fitted via ekf_shadow.py --fit-config +model against logs/20260729_154249
@@ -327,6 +327,10 @@ sigma_bias_z_proc: 5.0e-6  # bgz (yaw gyro bias) random-walk std [rad/s/√s]; 0
 # Use this to isolate EKF dead-reckoning from any vision-induced heading drift.
 yolo_enabled: true
 
+
+v_ref:          5   # reference cruise speed [m/s]
+lookahead_gain: 1.3   # lookahead distance = lookahead_gain * v_ref [m]; larger = smoother carrot direction 1.6
+
 # Outer loop: velocity PI -> desired tilt angle -> P on tilt error -> desired rates
 # R22 = cos(roll)*cos(pitch): thrust compensation factor for tilt.  At level flight
 # R22≈1; it rises toward 1/cos(tilt) as the drone tilts so collective is boosted to
@@ -337,6 +341,17 @@ Kp_vN:  2   # North velocity P  [1/s]  — sysid_vel: τ_v=4.59 s, T_settle=1.5 
 Ki_vN:  0.3   # North velocity I  [1/s²]
 Kp_vE:  2   # East  velocity P  [1/s]  — sysid_vel: τ_v=4.44 s, T_settle=1.5 s
 Ki_vE:  0.3   # East  velocity I  [1/s²]
+Kp_vD:  2.5    # Down  velocity P  [1/s]  — higher: stronger correction for vD drift
+Ki_vD:  0.1  # Down  velocity I  [1/s²] — small integral to trim steady-state vD offset
+
+
+K_att:  4.5      
+K_psi:   4      # yaw P   [1/s] 2
+Ki_psi:  0.0002    # yaw I   [1/s^2]  = K_psi^2 / 5 0.2
+
+MAX_TILT_DEG: 60.0   # outer loop tilt limit [deg]; 55° → ~8 m/s² heading authority for high-speed flight
+
+
 tau_vN: 4.59     # North velocity plant time constant [s]  — used for feedforward
 tau_vE: 4.44     # East  velocity plant time constant [s]  — used for feedforward
 K_dv:   0.5      # reference-derivative lag compensator gain [s]; 0=off, tune 0.3–0.5 after fixing carrot oscillation
@@ -352,8 +367,7 @@ K_dv:   0.5      # reference-derivative lag compensator gain [s]; 0=off, tune 0.
 # out. Tradeoff: more lag between a real course change and the commanded
 # tilt — watch the commit-phase approach (commit_dist_m) for sluggishness.
 tau_ref_smooth: 0.4
-Kp_vD:  2.5    # Down  velocity P  [1/s]  — higher: stronger correction for vD drift
-Ki_vD:  0.1  # Down  velocity I  [1/s²] — small integral to trim steady-state vD offset
+
 
 # ── Velocity measurement filter time constants ────────────────────────────────
 # Low-pass filter applied to EKF vel_ned before the outer-loop PI.
@@ -382,13 +396,9 @@ gate_pass_timeout_sec: 2.0   # s — hard cap
 # Rule: d_before + d_after < shortest inter-gate segment length (~23 m here).
 # Set both to 0 to disable (original 1-wp-per-gate behavior).
 helper_d_before: 0   # [m]
-helper_d_after:  3.0   # [m]
+helper_d_after:  0.0   # [m]
 
-K_att:  4.5      
-K_psi:   4.5      # yaw P   [1/s] 2
-Ki_psi:  0.0002    # yaw I   [1/s^2]  = K_psi^2 / 5 0.2
 
-MAX_TILT_DEG: 60.0   # outer loop tilt limit [deg]; 55° → ~8 m/s² heading authority for high-speed flight
 
 # ── Velocity gain scheduling ──────────────────────────────────────────────────
 # K_att, Kp_vN/E/D are linearly interpolated between (v_lo, baseline) and (v_hi, hi).
