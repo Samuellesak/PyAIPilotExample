@@ -20,7 +20,7 @@ Pipeline
   WAIT        3.5 s   Static calibration (gyro bias, slope attitude)
   BLIP        0.15 s  High-thrust burst — mirrors main.py exactly
   BLIP_OBS    2.0 s   Log post-blip dynamics
-  HOVER_TRIM  3.0 s   Level hover — identify mass
+  HOVER_TRIM  3.0 s   Level hover — identify mass 
   PITCH_PLUS  0.5 s   q_des = +Q_TEST → sign test (FRD: q>0 = nose UP)
   SETTLE      1.0 s
   PITCH_MINUS 0.5 s   q_des = -Q_TEST → confirm sign
@@ -147,18 +147,20 @@ def _send_motors(conn, u_norm):
 def _send_attitude_target(conn, p, q, r, thrust_norm):
     """Send body-rate setpoint + collective thrust (type_mask=0x80: ignore quat).
 
-    Sysid-confirmed sign map (flight_sysid_gt.py):
+    Sim SET_ATTITUDE_TARGET sign conventions (cascade-confirmed):
       p axis: FRD-compatible  → send as-is
-      q axis: reversed in sim → negate
-      r axis: reversed in sim → negate
-    Callers use standard FRD convention; correction is applied here.
+      q axis: FRD-compatible (q>0 = nose-UP confirmed from logs) → send as-is
+      r axis: sign-inverted vs standard NED psi convention; negate
+              (psi in mav_state quat = -psi_NED; _settle/level callers already
+               account for this via consistent -psi_NED arithmetic)
+    Callers use standard FRD convention; r correction applied here.
     """
     conn.mav.set_attitude_target_send(
         int(time.time() * 1e3) & 0xFFFFFFFF,
         conn.target_system, conn.target_component,
         0x80,
         [1.0, 0.0, 0.0, 0.0],
-        float(p), float(-q), float(-r),
+        float(p), float(q), float(-r),
         float(np.clip(thrust_norm, 0.0, 1.0)),
     )
 

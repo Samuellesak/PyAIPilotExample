@@ -44,6 +44,8 @@ def find_latest_log():
 
 
 save_annotated = '--save-annotated' in sys.argv
+_model_arg = next((a.split('=', 1)[1] for a in sys.argv[1:] if a.startswith('--model=')), None)
+_tag_arg   = next((a.split('=', 1)[1] for a in sys.argv[1:] if a.startswith('--tag=')),   None)
 positional = [a for a in sys.argv[1:] if not a.startswith('--')]
 log_dir = positional[0] if positional else find_latest_log()
 print(f'Log dir : {log_dir}')
@@ -64,14 +66,17 @@ cam_K = np.array([
 ], dtype=np.float64)
 dist_coef = np.zeros((4, 1))
 
-gate_w        = float(param.get('gate_width_default',  1.5))   # inner opening [m]
-gate_h        = float(param.get('gate_height_default', 1.5))
-max_gate_dist = float(param.get('vision_max_gate_dist', 50.0))
+gate_w           = float(param.get('gate_width_default',  1.5))   # inner opening [m]
+gate_h           = float(param.get('gate_height_default', 1.5))
+max_gate_dist    = float(param.get('vision_max_gate_dist', 50.0))
+ground_truth_mode = bool(param.get('ground_truth_mode', False))
 
-# cam→body: x_b(fwd)=cam_Z, y_b(right)=cam_X, z_b(down)=cam_Y  (vision_rx.py)
-R_cam2body = np.array([[0, 0, 1],
-                        [1, 0, 0],
-                        [0, 1, 0]], dtype=float)
+# cam→body with upward tilt; reads cam_tilt_deg from params.yaml (positive = nose up)
+_tilt = math.radians(float(param.get('cam_tilt_deg', 20.0)))
+_st, _ct = math.sin(_tilt), math.cos(_tilt)
+R_cam2body = np.array([[0, _st, _ct],
+                        [1,  0,   0 ],
+                        [0, _ct, -_st]], dtype=float)
 
 # Blue-suppression HSV range (from params.yaml)
 _blue_lo = np.array([
@@ -95,17 +100,26 @@ _TRACK_RE = re.compile(
 gate_neds  = {}   # gi → np.array([N, E, D])
 gate_outer = {}   # gi → (width_m, height_m) outer frame
 
+# The sim's raw TRACK NED marks the gate's bottom beam, not the opening centre
+# the drone actually flies through — the centre sits ~1 m above the beam.
+# params.yaml's `waypoints:` list already has this baked in (each entry is the
+# matching [TRACK] D minus the offset); the [TRACK] comment tags themselves are
+# the raw/uncorrected beam position, so apply the same correction here. Shared
+# with vision_rx.py's live PnP-to-NED conversion via the same params.yaml key.
+GATE_BEAM_TO_CENTER_D_OFFSET = float(param.get('gate_beam_to_center_offset_m', 1.0))
+
 for line in raw_yaml.splitlines():
     m = _TRACK_RE.search(line)
     if m:
         gi  = int(m.group(1))
         ned = np.array([float(x) for x in m.group(2).split()])
+        ned[2] -= GATE_BEAM_TO_CENTER_D_OFFSET
         gate_neds[gi]  = ned
         gate_outer[gi] = (float(m.group(3)), float(m.group(4)))
 
 if not gate_neds:
     print('[WARN] No [TRACK] entries in params.yaml — using waypoints[1:] as gate NEDs '
-          '(may have ~1 m altitude offset from true gate center).')
+          '(already beam→centre corrected there).')
     for i, wp in enumerate(param.get('waypoints', [])[1:]):
         gate_neds[i]  = np.array(wp, dtype=float)
         gate_outer[i] = (2.7, 2.7)
@@ -131,6 +145,7 @@ if not os.path.exists(ekf_path):
 
 ekf_t, ekf_pN, ekf_pE, ekf_pD = [], [], [], []
 ekf_qw, ekf_qx, ekf_qy, ekf_qz = [], [], [], []
+ekf_wall_t = []
 
 with open(ekf_path, newline='') as f:
     for row in csv.DictReader(f):
@@ -140,6 +155,7 @@ with open(ekf_path, newline='') as f:
             ekf_pD.append(float(row['pD']))
             ekf_qw.append(float(row['qw']));  ekf_qx.append(float(row['qx']))
             ekf_qy.append(float(row['qy']));  ekf_qz.append(float(row['qz']))
+            ekf_wall_t.append(float(row['wall_t']))
         except (ValueError, KeyError):
             continue
 
@@ -147,6 +163,7 @@ ekf_t  = np.array(ekf_t)
 ekf_pN = np.array(ekf_pN);  ekf_pE = np.array(ekf_pE);  ekf_pD = np.array(ekf_pD)
 ekf_qw = np.array(ekf_qw);  ekf_qx = np.array(ekf_qx)
 ekf_qy = np.array(ekf_qy);  ekf_qz = np.array(ekf_qz)
+ekf_wall_t = np.array(ekf_wall_t)
 t_start, t_end = float(ekf_t[0]), float(ekf_t[-1])
 print(f'EKF     : {len(ekf_t)} rows  t=[{t_start:.2f}, {t_end:.2f}] s')
 
@@ -171,12 +188,40 @@ frame_ids = np.array([
     for p in frame_files], dtype=int)
 fid_min, fid_max = int(frame_ids[0]), int(frame_ids[-1])
 
-# Linear map: frame_id range → EKF time range.
-# frame_id is a monotonic sim-step counter, so relative spacing tracks real time.
-span = float(fid_max - fid_min) if fid_max > fid_min else 1.0
-frame_t = t_start + (frame_ids - fid_min) / span * (t_end - t_start)
+# Frame → EKF-time mapping, from the recorded per-frame sim_time_ns (frame_timestamps.csv).
+# NOTE: the old approach linearly stretched [fid_min, fid_max] onto [t_start, t_end] —
+# i.e. it assumed frame recording exactly spans the EKF log. It doesn't: the camera starts
+# recording before EKF logging begins and keeps going after it stops, so that stretch
+# compresses/shifts every frame time and desyncs GT vs PnP more as time goes on.
+# sim_time_ns and ekf.csv's wall_t are the same wall-clock epoch (both ~time.time()-based),
+# so frame_time_s = sim_time_ns/1e9 - ekf_wall_t[0] lines up exactly with ekf.csv's time_s.
+ts_path = os.path.join(log_dir, 'frame_timestamps.csv')
+if os.path.exists(ts_path):
+    ts_fid, ts_ns = [], []
+    with open(ts_path, newline='') as f:
+        for row in csv.DictReader(f):
+            try:
+                ts_fid.append(int(row['frame_id']));  ts_ns.append(int(row['sim_time_ns']))
+            except (ValueError, KeyError):
+                continue
+    ts_fid = np.array(ts_fid);  ts_ns = np.array(ts_ns, dtype=np.float64)
+    order = np.argsort(ts_fid)
+    ts_fid, ts_ns = ts_fid[order], ts_ns[order]
+    # A handful of saved frames can be missing a timestamp row (e.g. one at session
+    # shutdown); interpolate those against neighboring known (frame_id, sim_time_ns) pairs.
+    frame_ns = np.interp(frame_ids, ts_fid, ts_ns)
+    frame_t  = frame_ns / 1e9 - float(ekf_wall_t[0])
+    n_missing = int(np.sum(~np.isin(frame_ids, ts_fid)))
+    if n_missing:
+        print(f'[WARN] {n_missing} frame(s) missing from frame_timestamps.csv — interpolated.')
+else:
+    print('[WARN] frame_timestamps.csv not found — falling back to linear frame_id/EKF-span '
+          'interpolation (inaccurate if frame recording does not exactly span the EKF log).')
+    span = float(fid_max - fid_min) if fid_max > fid_min else 1.0
+    frame_t = t_start + (frame_ids - fid_min) / span * (t_end - t_start)
 est_fps = n_frames / (t_end - t_start) if t_end > t_start else 0.0
-print(f'Frames  : {n_frames}  id=[{fid_min}, {fid_max}]  ≈{est_fps:.1f} fps (est.)')
+print(f'Frames  : {n_frames}  id=[{fid_min}, {fid_max}]  '
+      f't=[{frame_t[0]:.2f}, {frame_t[-1]:.2f}] s  ≈{est_fps:.1f} fps (est.)')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -193,7 +238,25 @@ def quat_to_R(qw, qx, qy, qz):
 
 
 def interp_pose(t):
-    """Return (pos_ned [3], R_b2n [3×3]) interpolated from EKF at time t."""
+    """Return (pos_ned [3], R_b2n [3×3]) interpolated from EKF at time t.
+
+    In ground_truth_mode, ekf.csv's quaternion comes from mavlink_rx.py's
+    on_attitude(), which deliberately leaves the sim's yaw sign inverted
+    (see its docstring: "yaw — sign-inverted vs standard ZYX; NOT negated
+    here (GT mode relies on the inverted sign; see _send_attitude_target
+    r_des for correction)"). That's fine for the live controller, which has
+    its own compensating negation on the GT branch of r_des — but it means
+    ekf.csv's logged attitude has yaw = -yaw_true. Left uncorrected here,
+    R_b2n rotates the PnP tvec by the wrong-sign yaw, which is invisible at
+    zero range but grows linearly with distance to the gate and flips sign
+    with whichever way the drone is actually crabbing — exactly the pattern
+    that was showing up as PnP East diverging from GT East while North/Down
+    stayed fine (yaw error is ~perpendicular to a mostly-North flight path).
+    Confirmed empirically: negating yaw here cut median clean-frame 3D PnP
+    error from 1.4 m to 0.19 m on a 6-gate test log. So: extract roll/pitch/
+    yaw, flip yaw's sign, rebuild the quaternion with the same ZYX formula
+    on_attitude() uses.
+    """
     pos = np.array([np.interp(t, ekf_t, ekf_pN),
                     np.interp(t, ekf_t, ekf_pE),
                     np.interp(t, ekf_t, ekf_pD)])
@@ -204,6 +267,17 @@ def interp_pose(t):
     mag = math.sqrt(qw*qw + qx*qx + qy*qy + qz*qz)
     if mag > 1e-9:
         qw, qx, qy, qz = qw/mag, qx/mag, qy/mag, qz/mag
+    if ground_truth_mode:
+        roll  = math.atan2(2*(qw*qx+qy*qz), 1-2*(qx*qx+qy*qy))
+        pitch = math.asin(max(-1.0, min(1.0, 2*(qw*qy-qz*qx))))
+        yaw   = -math.atan2(2*(qw*qz+qx*qy), 1-2*(qy*qy+qz*qz))
+        cr, sr = math.cos(roll/2),  math.sin(roll/2)
+        cp, sp = math.cos(pitch/2), math.sin(pitch/2)
+        cy, sy = math.cos(yaw/2),   math.sin(yaw/2)
+        qw = cr*cp*cy + sr*sp*sy
+        qx = sr*cp*cy - cr*sp*sy
+        qy = cr*sp*cy + sr*cp*sy
+        qz = cr*cp*sy - sr*sp*cy
     return pos, quat_to_R(qw, qx, qy, qz)
 
 
@@ -251,9 +325,23 @@ def orange_mask(img_bgr):
 
 
 def pnp_gate(corners_px, width, height, R_b2n):
-    """IPPE PnP; picks solution where gate-Y aligns with NED-down in camera frame.
-    Uses GT attitude for disambiguation (more accurate than live EKF noise).
-    Returns (tvec [3], rvec [3]) or (None, None)."""
+    """IPPE PnP with attitude-based disambiguation.
+
+    The two IPPE solutions differ in gate orientation.  The physical constraint
+    is that the gate must be upright: gate object-Y ([0,1,0] = gate-down in the
+    corner layout [-w,-h,0] / [w,-h,0] / [w,h,0] / [-w,h,0] — the corners are
+    ordered TL,TR,BR,BL, so +Y runs from the top edge to the bottom edge) should
+    map to world-DOWN in NED ([0,0,+1], i.e. positive D). Matches vision_rx.py's
+    _pnp_gate, which scores np.dot(R_sol[:, 1], ned_down_cam) — same direction,
+    same sign.
+
+    Score each solution by how well gate-Y lands in the world-down hemisphere:
+        gate_Y_ned = R_b2n @ R_cam2body @ (R_sol @ [0,1,0])
+        score      = gate_Y_ned[2]          # D>0 = downward → positive score
+    Pick the solution with the highest score.
+
+    Returns (tvec [3], rvec [3]) or (None, None).
+    """
     hw, hh  = width / 2.0, height / 2.0
     obj_pts = np.array([[-hw, -hh, 0.],
                         [ hw, -hh, 0.],
@@ -265,18 +353,19 @@ def pnp_gate(corners_px, width, height, R_b2n):
     if n < 1:
         return None, None
 
-    # NED-down direction in camera frame (using GT attitude — better than live system)
-    ned_down_cam = R_cam2body.T @ (R_b2n.T @ np.array([0., 0., 1.]))
-
-    best_tv, best_rv, best_sc = rvecs[0].flatten(), tvecs[0].flatten(), -np.inf
+    _gate_Y = np.array([0., 1., 0.])
+    best_tv, best_rv, best_sc = None, None, -np.inf
     for rv, tv in zip(rvecs, tvecs):
         tv_f = tv.flatten()
         if tv_f[2] < 0.1:
             continue
         R_sol, _ = cv2.Rodrigues(rv)
-        score = float(np.dot(R_sol[:, 1], ned_down_cam))
+        gate_Y_ned = R_b2n @ (R_cam2body @ (R_sol @ _gate_Y))
+        score = gate_Y_ned[2]    # D>0 in NED = downward = gate right-side up
         if score > best_sc:
             best_tv, best_rv, best_sc = tv_f, rv.flatten(), score
+    if best_tv is None:
+        return None, None
 
     return (None, None) if best_tv[2] < 0.5 else (best_tv, best_rv)
 
@@ -286,7 +375,7 @@ def pnp_gate(corners_px, width, height, R_b2n):
 # ─────────────────────────────────────────────────────────────────────────────
 
 print('Loading YOLO …', end='', flush=True)
-model = _YOLO('YOLO/best.pt')
+model = _YOLO(_model_arg if _model_arg else 'YOLO/best3.pt')
 model.predict(np.zeros((640, 640, 3), dtype=np.uint8), verbose=False)
 print(' done.')
 
@@ -300,12 +389,37 @@ if save_annotated:
     os.makedirs(ann_dir, exist_ok=True)
 
 PAD      = 15      # bbox padding for orange-fraction check [px]
-CONF_THR = 0.03    # minimum YOLO confidence (matches vision_rx.py)
+CONF_THR = float(param.get('vision_conf_min', 0.6))   # minimum YOLO confidence (matches vision_rx.py)
 ORN_MIN  = 0.001   # minimum orange pixel fraction in padded bbox
 
 rows = []
 print_step = max(1, n_frames // 20)
 print(f'Processing {n_frames} frames …')
+
+# Sequential gate tracker: advance when drone passes through each gate in order.
+# Uses distance monotonicity (rebounds > _GATE_ADVANCE from minimum) rather than
+# body-frame angle, so it works even when the gate isn't squarely ahead.
+_gate_seq     = sorted(gate_neds.keys())
+_gate_seq_idx = 0        # current target gate index into _gate_seq
+_gate_min_d   = np.inf   # minimum distance to current target gate seen so far [m]
+_GATE_ADVANCE = 2.0      # advance to next gate when dist exceeds min by this [m]
+
+# Snap / outlier detection — three independent checks with different suppression rules:
+#   GT-error check (GT mode):    err_3d > _OUTLIER_THRESH — always active, never suppressed.
+#   Dist-mismatch check (GT mode): |tvec[2] - dist_fwd_gt| > _DIST_MISMATCH_THRESH
+#                                  — catches wrong IPPE depth (PnP picks near solution when
+#                                    gate is actually far, or vice versa); always active.
+#   Jump check (both modes):     |drone_est - _last_pnp_est| > _PNP_SNAP_DIST
+#                                  — suppressed during gate-transition window (_gate_trans_cnt>0)
+#                                    because the gate-NED change makes the reference stale.
+# _last_pnp_est updates only on clean frames OUTSIDE the transition window.
+_OUTLIER_THRESH       = 25.0   # m; EKF-error above this → snap (GT mode only)
+_DIST_MISMATCH_THRESH =  2.0   # m; |PnP depth - GT depth| above this → snap (GT mode only)
+_PNP_SNAP_DIST        =  2.0   # m; minimum jump distance that constitutes a snap
+_GATE_TRANS_SKIP      =  5     # frames after gate change: suppress jump check only
+_prev_gate_idx   = None
+_gate_trans_cnt  = 0
+_last_pnp_est    = None
 
 for fi, (fpath, fid, ft) in enumerate(zip(frame_files, frame_ids, frame_t)):
     if fi % print_step == 0:
@@ -316,9 +430,61 @@ for fi, (fpath, fid, ft) in enumerate(zip(frame_files, frame_ids, frame_t)):
         continue
     h_img, w_img = img_raw.shape[:2]
 
-    # GT pose at estimated frame time
-    gt_pos, R_b2n = interp_pose(ft)
-    gate_idx, gnl, dist_3d, dist_fwd = nearest_forward_gate(gt_pos, R_b2n)
+    # EKF pose at estimated frame time.
+    # In GT mode ekf.csv pN/pE/pD == true position (EKF is overridden with GT).
+    # In non-GT mode this is the EKF estimate, which may drift from truth.
+    ekf_pos, R_b2n = interp_pose(ft)
+
+    # Sequential gate tracker.
+    # Advance the moment the drone crosses the current target's gate plane
+    # (dist_fwd goes negative), with the old rebound-from-minimum check kept as a
+    # fallback for off-axis passes where the forward projection doesn't cleanly
+    # cross zero. Checking crossing FIRST matters: at the moment of passage the
+    # camera frequently already sees the NEXT gate through the current one's
+    # opening, so if we don't advance immediately, 1-2 frames get PnP'd against
+    # the stale (just-passed) gate's NED while actually looking at the next gate
+    # ~20+ m further down the corridor — producing spurious large-looking "wrong
+    # solution" position snaps that are really just a gate-index attribution lag.
+    if _gate_seq:
+        _gi  = _gate_seq[min(_gate_seq_idx, len(_gate_seq) - 1)]
+        _gnl = gate_neds[_gi]
+        _v   = _gnl - ekf_pos
+        _d   = float(np.linalg.norm(_v))
+        _vb  = R_b2n.T @ _v
+        _dist_fwd_cur = float(np.dot(_vb, R_cam2body[:, 2]))
+        if _d < _gate_min_d:
+            _gate_min_d = _d
+        if (_dist_fwd_cur < 0.0 or _d > _gate_min_d + _GATE_ADVANCE) \
+                and _gate_seq_idx < len(_gate_seq) - 1:
+            _gate_seq_idx += 1
+            _gate_min_d    = np.inf
+            _gi  = _gate_seq[_gate_seq_idx]
+            _gnl = gate_neds[_gi]
+            _v   = _gnl - ekf_pos
+            _d   = float(np.linalg.norm(_v))
+            _vb  = R_b2n.T @ _v
+        gate_idx = _gi
+        gnl      = _gnl
+        dist_3d  = _d
+        # Project gate vector onto camera-Z axis (tilted 20° above body-X) so
+        # dist_fwd matches what tvec[2] measures, not the body-X component.
+        dist_fwd = float(np.dot(_vb, R_cam2body[:, 2]))
+    else:
+        gate_idx = None
+        gnl      = None
+        dist_3d  = np.inf
+        dist_fwd = float('nan')
+
+    # Gate transition: reset jump reference and suppress jump check for _GATE_TRANS_SKIP frames.
+    # The absolute GT-error check is NOT suppressed — wrong IPPE solutions during transition
+    # still get flagged as snaps.  Only the jump check is suppressed because the gate-NED
+    # change makes the pre-transition _last_pnp_est an unreliable reference.
+    if gate_idx != _prev_gate_idx:
+        _gate_trans_cnt = _GATE_TRANS_SKIP
+        _prev_gate_idx  = gate_idx
+        _last_pnp_est   = None   # clear jump reference; post-transition frames use GT check only
+    elif _gate_trans_cnt > 0:
+        _gate_trans_cnt -= 1
 
     # Preprocessing (matches vision_rx.py)
     img  = preprocess(img_raw)
@@ -372,10 +538,35 @@ for fi, (fpath, fid, ft) in enumerate(zip(frame_files, frame_ids, frame_t)):
                     t_gate_ned = R_b2n @ (R_cam2body @ tvec)
                     drone_est  = gnl - t_gate_ned
 
-    # Position error vs GT
+    # Position error vs GT + snap / outlier detection.
+    # Three independent checks:
+    #   1. GT-error check: err_3d > _OUTLIER_THRESH — ALWAYS active in GT mode.
+    #   2. Dist-mismatch check: |tvec[2] - dist_fwd| > _DIST_MISMATCH_THRESH — ALWAYS active
+    #      in GT mode. Catches wrong IPPE depth (e.g. PnP picks 25 m when gate is 35 m away).
+    #   3. Jump check: |drone_est - _last_pnp_est| > _PNP_SNAP_DIST — SUPPRESSED during
+    #      gate transition (gate-NED change makes the reference stale).
+    # _last_pnp_est updates only on clean frames OUTSIDE the transition window so it
+    # stays anchored to the last trustworthy estimate.
+    snap = 0
     if drone_est is not None:
-        err    = drone_est - gt_pos
+        err    = drone_est - ekf_pos
         err_3d = float(np.linalg.norm(err))
+        # GT-error outlier: not suppressed during transition.
+        if ground_truth_mode and err_3d > _OUTLIER_THRESH:
+            snap = 1
+        # Distance-consistency: compare PnP depth (tvec[2]) against GT forward distance.
+        # Wrong IPPE solution picks the wrong depth branch; this catches it even when the
+        # 3-D position error happens to stay below _OUTLIER_THRESH.
+        if snap == 0 and ground_truth_mode and tvec is not None and math.isfinite(dist_fwd) and dist_fwd > 0.5:
+            if abs(float(tvec[2]) - dist_fwd) > _DIST_MISMATCH_THRESH:
+                snap = 1
+        # Jump check: only outside the transition window and only when we have a reference.
+        if snap == 0 and _gate_trans_cnt == 0 and _last_pnp_est is not None:
+            if float(np.linalg.norm(drone_est - _last_pnp_est)) > _PNP_SNAP_DIST:
+                snap = 1
+        # Reference updates only on clean frames outside the transition window.
+        if snap == 0 and _gate_trans_cnt == 0:
+            _last_pnp_est = drone_est.copy()
     else:
         err    = np.full(3, float('nan'))
         err_3d = float('nan')
@@ -395,13 +586,14 @@ for fi, (fpath, fid, ft) in enumerate(zip(frame_files, frame_ids, frame_t)):
         'pos_N':       round(float(drone_est[0]), 3) if drone_est is not None else float('nan'),
         'pos_E':       round(float(drone_est[1]), 3) if drone_est is not None else float('nan'),
         'pos_D':       round(float(drone_est[2]), 3) if drone_est is not None else float('nan'),
-        'gt_N':        round(float(gt_pos[0]), 3),
-        'gt_E':        round(float(gt_pos[1]), 3),
-        'gt_D':        round(float(gt_pos[2]), 3),
+        'ekf_N':       round(float(ekf_pos[0]), 3),
+        'ekf_E':       round(float(ekf_pos[1]), 3),
+        'ekf_D':       round(float(ekf_pos[2]), 3),
         'err_N':       round(float(err[0]), 3),
         'err_E':       round(float(err[1]), 3),
         'err_D':       round(float(err[2]), 3),
         'err_3d':      round(err_3d, 3),
+        'snap':        snap,
     })
 
     if save_annotated and detected:
@@ -426,7 +618,8 @@ print(f'  {n_frames}/{n_frames}  done.')
 # 9.  Write CSV
 # ─────────────────────────────────────────────────────────────────────────────
 
-csv_path = os.path.join(log_dir, 'yolo_check.csv')
+_out_stem = f'yolo_check_{_tag_arg}' if _tag_arg else 'yolo_check'
+csv_path = os.path.join(log_dir, f'{_out_stem}.csv')
 with open(csv_path, 'w', newline='') as f:
     w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
     w.writeheader()
@@ -440,6 +633,8 @@ print(f'\nCSV → {csv_path}')
 
 det_arr  = np.array([r['detected']    for r in rows], dtype=bool)
 pnp_arr  = np.array([r['pnp_ok']      for r in rows], dtype=bool)
+snap_arr = np.array([r['snap']         for r in rows], dtype=bool)
+clean    = pnp_arr & ~snap_arr   # PnP frames that passed both snap checks
 conf_arr = np.array([r['conf']         for r in rows], dtype=float)
 d_est    = np.array([r['dist_est']     for r in rows], dtype=float)
 d_fwd    = np.array([r['dist_fwd_gt']  for r in rows], dtype=float)
@@ -447,9 +642,9 @@ d_3d     = np.array([r['dist_3d_gt']   for r in rows], dtype=float)
 gi_arr   = np.array([r['gate_idx']     for r in rows], dtype=int)
 err_3d   = np.array([r['err_3d']       for r in rows], dtype=float)
 t_arr    = np.array([r['t_est']        for r in rows], dtype=float)
-gt_N     = np.array([r['gt_N']         for r in rows], dtype=float)
-gt_E     = np.array([r['gt_E']         for r in rows], dtype=float)
-gt_D     = np.array([r['gt_D']         for r in rows], dtype=float)
+gt_N     = np.array([r['ekf_N']        for r in rows], dtype=float)
+gt_E     = np.array([r['ekf_E']        for r in rows], dtype=float)
+gt_D     = np.array([r['ekf_D']        for r in rows], dtype=float)
 pos_N    = np.array([r['pos_N']        for r in rows], dtype=float)
 pos_E    = np.array([r['pos_E']        for r in rows], dtype=float)
 pos_D    = np.array([r['pos_D']        for r in rows], dtype=float)
@@ -494,21 +689,31 @@ if np.isfinite(err_3d[pnp_arr]).any():
           f'N={_med(err_N, pnp_arr):+.2f}m  '
           f'E={_med(np.array([r["err_E"] for r in rows], dtype=float), pnp_arr):+.2f}m  '
           f'D={_med(err_D, pnp_arr):+.2f}m  (median)')
+snap_r = 100 * snap_arr[pnp_arr].mean() if pnp_arr.any() else 0.
+_snap_criteria = (f'EKF-err>{_OUTLIER_THRESH:.0f}m or dist-mismatch>{_DIST_MISMATCH_THRESH:.0f}m (GT, always) or '
+                  f'jump>{_PNP_SNAP_DIST:.0f}m (non-trans)') if ground_truth_mode else f'jump>{_PNP_SNAP_DIST:.0f}m (non-trans)'
+print(f'  Snaps ({_snap_criteria}): {snap_arr.sum()} frames ({snap_r:.1f}% of PnP)')
+if np.isfinite(err_3d[clean]).any():
+    print(f'  Clean PnP err (3D)    : '
+          f'median={_med(err_3d, clean):.2f}m  '
+          f'std={_std(err_3d, clean):.2f}m  '
+          f'p95={_p95(err_3d, clean):.2f}m')
 
 print(f'\n── By gate ─────────────────────────────────────────')
-print(f'  {"Gate":>4}  {"Frames":>6}  {"Det%":>5}  {"PnP%":>5}  '
-      f'{"d_err med":>9}  {"pos_err med":>11}')
+print(f'  {"Gate":>4}  {"Frames":>6}  {"Det%":>5}  {"PnP%":>5}  {"Snaps":>5}  '
+      f'{"d_err med":>9}  {"clean err med":>13}')
 for gi in sorted(gate_neds):
     gm = near_mask & (gi_arr == gi)
     if not gm.any():
         continue
-    dr = 100 * det_arr[gm].mean()
-    pr = 100 * pnp_arr[gm].mean()
-    de = _med(d_err,  gm & pnp_arr)
-    pe = _med(err_3d, gm & pnp_arr)
+    dr  = 100 * det_arr[gm].mean()
+    pr  = 100 * pnp_arr[gm].mean()
+    snc = int(snap_arr[gm & pnp_arr].sum()) if (gm & pnp_arr).any() else 0
+    de  = _med(d_err,  gm & pnp_arr)
+    pe  = _med(err_3d, gm & clean)
     ned = gate_neds[gi]
-    print(f'  {gi:>4}  {gm.sum():>6}  {dr:>5.1f}  {pr:>5.1f}  '
-          f'{de:>+9.2f}m  {pe:>11.2f}m   NED=[{ned[0]:.1f},{ned[1]:.1f},{ned[2]:.1f}]')
+    print(f'  {gi:>4}  {gm.sum():>6}  {dr:>5.1f}  {pr:>5.1f}  {snc:>5}  '
+          f'{de:>+9.2f}m  {pe:>13.2f}m   NED=[{ned[0]:.1f},{ned[1]:.1f},{ned[2]:.1f}]')
 
 print(f'\n── Detection rate by distance ──────────────────────')
 for lo, hi in [(0, 10), (10, 20), (20, 30), (30, 40), (40, 50)]:
@@ -530,13 +735,18 @@ fig, axes = plt.subplots(2, 3, figsize=(16, 9))
 fig.suptitle(f'YOLO Gate-Detection Analysis — {os.path.basename(log_dir)}', fontsize=12)
 
 
-# Panel 1: YOLO confidence over time, coloured by gate
+# Panel 1: YOLO confidence over time, coloured by gate (X = snap)
 ax = axes[0, 0]
 for gi in sorted(gate_neds):
-    m = pnp_arr & (gi_arr == gi)
+    m = clean & (gi_arr == gi)
     if m.any():
         ax.scatter(t_arr[m], conf_arr[m], s=14,
                    color=GCOLS[gi % len(GCOLS)], label=f'G{gi} (PnP)', alpha=0.8, zorder=3)
+    ms = snap_arr & (gi_arr == gi)
+    if ms.any():
+        ax.scatter(t_arr[ms], conf_arr[ms], s=22,
+                   color=GCOLS[gi % len(GCOLS)], marker='x', linewidths=1.2,
+                   alpha=0.9, zorder=4, label=f'G{gi} snap')
 m_nopnp = det_arr & ~pnp_arr
 if m_nopnp.any():
     ax.scatter(t_arr[m_nopnp], conf_arr[m_nopnp],
@@ -574,38 +784,54 @@ ax.set_title('Distance error vs gate range');  ax.legend(fontsize=8);  ax.grid(T
 
 # Panel 4: Drone N position over time
 ax = axes[1, 0]
-ax.plot(t_arr, gt_N, color='steelblue', lw=1.0, label='GT North')
-if pnp_arr.any():
-    ax.scatter(t_arr[pnp_arr], pos_N[pnp_arr], s=10, c='tab:orange',
+_ref_label = 'GT North' if ground_truth_mode else 'EKF North'
+ax.plot(t_arr, gt_N, color='steelblue', lw=1.0, label=_ref_label)
+if clean.any():
+    ax.scatter(t_arr[clean], pos_N[clean], s=10, c='tab:orange',
                alpha=0.75, label='PnP North', zorder=3)
+if snap_arr.any():
+    ax.scatter(t_arr[snap_arr], pos_N[snap_arr], s=22, c='tab:red',
+               marker='x', linewidths=1.2, alpha=0.85, label='snap', zorder=4)
 for gi, ned in sorted(gate_neds.items()):
     ax.axhline(ned[0], color=GCOLS[gi % len(GCOLS)], lw=0.6, ls=':', alpha=0.7,
                label=f'G{gi} N={ned[0]:.0f}m')
 ax.set_xlabel('time [s]');  ax.set_ylabel('North [m]')
-ax.set_title('Drone N: GT vs PnP');  ax.legend(fontsize=6, ncol=2);  ax.grid(True, lw=0.3)
+_ref_str = 'GT' if ground_truth_mode else 'EKF'
+ax.set_title(f'Drone N: {_ref_str} vs PnP');  ax.legend(fontsize=6, ncol=2);  ax.grid(True, lw=0.3)
 
 
 # Panel 5: Drone E and D over time
 ax = axes[1, 1]
-ax.plot(t_arr, gt_E, color='tab:blue',  lw=1.0, label='GT East')
-ax.plot(t_arr, gt_D, color='tab:green', lw=1.0, label='GT Down')
-if pnp_arr.any():
-    ax.scatter(t_arr[pnp_arr], pos_E[pnp_arr], s=10,
+ax.plot(t_arr, gt_E, color='tab:blue',  lw=1.0,
+        label='GT East' if ground_truth_mode else 'EKF East')
+ax.plot(t_arr, gt_D, color='tab:green', lw=1.0,
+        label='GT Down' if ground_truth_mode else 'EKF Down')
+if clean.any():
+    ax.scatter(t_arr[clean], pos_E[clean], s=10,
                c='tab:cyan',  alpha=0.75, label='PnP East', zorder=3)
-    ax.scatter(t_arr[pnp_arr], pos_D[pnp_arr], s=10,
+    ax.scatter(t_arr[clean], pos_D[clean], s=10,
                c='tab:olive', alpha=0.75, label='PnP Down', zorder=3)
+if snap_arr.any():
+    ax.scatter(t_arr[snap_arr], pos_E[snap_arr], s=22, c='tab:red',
+               marker='x', linewidths=1.2, alpha=0.85, label='snap E/D', zorder=4)
+    ax.scatter(t_arr[snap_arr], pos_D[snap_arr], s=22, c='tab:red',
+               marker='+', linewidths=1.2, alpha=0.85, zorder=4)
 ax.set_xlabel('time [s]');  ax.set_ylabel('East / Down [m]')
-ax.set_title('Drone E/D: GT vs PnP');  ax.legend(fontsize=7, ncol=2);  ax.grid(True, lw=0.3)
+ax.set_title(f'Drone E/D: {_ref_str} vs PnP');  ax.legend(fontsize=7, ncol=2);  ax.grid(True, lw=0.3)
 
 
 # Panel 6: 2D overhead path (East vs North)
 ax = axes[1, 2]
-ax.plot(gt_E, gt_N, 'b-', lw=1.2, label='GT path', zorder=2)
+ax.plot(gt_E, gt_N, 'b-', lw=1.2,
+        label='GT path' if ground_truth_mode else 'EKF path', zorder=2)
 ax.plot(gt_E[0], gt_N[0], 'bs', ms=8, label='start', zorder=5)
-if pnp_arr.any():
-    sc6 = ax.scatter(pos_E[pnp_arr], pos_N[pnp_arr], s=14, c=t_arr[pnp_arr],
+if clean.any():
+    sc6 = ax.scatter(pos_E[clean], pos_N[clean], s=14, c=t_arr[clean],
                      cmap='YlOrRd', alpha=0.65, label='PnP pos', zorder=3)
     plt.colorbar(sc6, ax=ax, label='time [s]')
+if snap_arr.any():
+    ax.scatter(pos_E[snap_arr], pos_N[snap_arr], s=22, c='tab:red',
+               marker='x', linewidths=1.2, alpha=0.8, label='snap', zorder=4)
 for gi, ned in sorted(gate_neds.items()):
     ax.plot(ned[1], ned[0], 'k^', ms=9, zorder=4)
     ax.text(ned[1] + 0.5, ned[0], f'G{gi}', fontsize=7, va='center')
@@ -615,7 +841,7 @@ ax.set_aspect('equal', adjustable='datalim');  ax.grid(True, lw=0.3)
 
 
 fig.tight_layout()
-png_path = os.path.join(log_dir, 'yolo_check.png')
+png_path = os.path.join(log_dir, f'{_out_stem}.png')
 fig.savefig(png_path, dpi=120)
 plt.close(fig)
 print(f'Plot  → {png_path}')

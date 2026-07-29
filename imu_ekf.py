@@ -2,7 +2,7 @@
 imu_ekf.py
 ==========
 IMU-driven EKF: gyro/acc calibration, hover-entry zeroing, model-aided predict,
-attitude freeze, post-blip re-init, and vision corrections.
+and vision corrections.
 
 Extracted from the monolithic mavlink_rx.py so mavlink_rx stays a clean
 MAVLink transport layer with no physics knowledge.
@@ -23,12 +23,12 @@ Shared-data keys written
 ------------------------
     shared['mav_state']                 — EKF pos / vel / quat / rates
     shared['pos_offset_ned']            — world-NED position at hover-entry reset
-    shared['post_blip_att_reset_done']  — True after backup attitude re-init fires
     shared['imu_raw']                   — raw IMU sample (legacy key, read by scripts)
     shared['_imu_rates']                — FRD-corrected gyro rates (legacy key)
 """
 
 import time
+from collections import deque
 
 import numpy as np
 
@@ -60,7 +60,9 @@ class IMUEKFHandler:
         self._param  = param
         self._logger = logger
 
-        self._ekf        = QuadEKF()
+        self._ekf        = QuadEKF(
+            sigma_bias_z_proc=float(param.get('sigma_bias_z_proc', 5e-6)),
+        )
         self._last_imu_t = None
 
         # World-NED position at hover-entry reset (EKF zeroes at that point).
@@ -83,8 +85,15 @@ class IMUEKFHandler:
             print(f'[IMUEKFHandler] EKF yaw pre-set: {_init_yaw_deg:.1f}°', flush=True)
 
         self._hover_reset_t            = None
-        self._blip_frozen_q            = None
-        self._post_blip_att_reset_done = False
+
+        # Item 3: rolling RMS buffer for adaptive motor-model sigma (250 samples ≈ 1 s)
+        self._acc_model_errs = deque(maxlen=250)
+
+        # Item 4: EKF position history for PnP latency compensation [(wall_t, pos), ...]
+        self._state_buf = deque(maxlen=200)
+
+        # Item 2: last gate id whose position has already been injected as an EKF fix
+        self._last_gate_id_processed = None
 
         # Ground truth mode: sim NED position at hover-entry reset (frame origin)
         # and yaw-alignment rotation to map sim NED → EKF frame.
@@ -111,7 +120,9 @@ class IMUEKFHandler:
             self._mp_shadow_writer = csv.writer(self._mp_shadow_file)
             self._mp_shadow_writer.writerow([
                 't_wall_s', 'T_total_N', 'actuator_sum',
+                'act_fl', 'act_fr', 'act_bl', 'act_br',
                 'vb_x', 'vb_y', 'vb_z',
+                'gt_vb_x', 'gt_vb_y', 'gt_vb_z',
                 'acc_imu_x', 'acc_imu_y', 'acc_imu_z',
                 'acc_model_x', 'acc_model_y', 'acc_model_z',
                 'err_x', 'err_y', 'err_z', 'err_norm',
@@ -136,8 +147,6 @@ class IMUEKFHandler:
         if self._data.get('reset_vel_flag'):
             self._data['reset_vel_flag'] = False
             self._hover_reset_done       = True
-            self._blip_frozen_q          = None
-            self._post_blip_att_reset_done = False
 
             # Save world-frame position (vision was locked on during WAIT)
             self._pos_offset_ned = self._ekf.x[0:3].copy()
@@ -163,22 +172,29 @@ class IMUEKFHandler:
             else:
                 _gyro_bias = np.zeros(3)
 
-            # Derive attitude from static acc average (prevents ~15° pitch spike at blip).
+            # Set yaw only — NOT roll/pitch from the static acc average anymore.
+            # That average is captured only over the WAIT window (see the
+            # wait_phase_done gate above), i.e. before the controller's pre-blip
+            # levelling phase runs. self._ekf.reset() just above already zeroed
+            # the quaternion to identity (phi=theta=0), which is the right prior
+            # now: the drone has been actively levelled since WAIT ended, so the
+            # WAIT-only tilt reading is stale and re-applying it here would
+            # overwrite the just-achieved level attitude with the old ~17° slope
+            # tilt — confirmed in a flight log as an exact-looking snap-back
+            # (theta recovering to ~-4° during levelling, then jumping back to
+            # ~-18° right at this reset). set_yaw() preserves the current
+            # (post-reset-identity, i.e. level) roll/pitch and only sets yaw.
+            self._ekf.set_yaw(self._init_yaw_rad)
             if self._wait_acc_cnt > 50:
                 _acc_avg = self._wait_acc_sum / self._wait_acc_cnt
                 _g       = 9.81
                 _theta = float(np.arcsin(np.clip(_acc_avg[0] / _g, -1.0, 1.0)))
                 _phi   = float(np.arcsin(
                     np.clip(_acc_avg[1] / (_g * max(np.cos(_theta), 0.1)), -1.0, 1.0)))
-                self._ekf.set_attitude(_phi, _theta, self._init_yaw_rad)
-                self._blip_frozen_q = self._ekf.x[6:10].copy()
-                print(f'[IMUEKFHandler] attitude from static acc: '
+                print(f'[IMUEKFHandler] WAIT static tilt (diagnostic only, not applied): '
                       f'phi={np.rad2deg(_phi):.1f}°  theta={np.rad2deg(_theta):.1f}°  '
                       f'psi={np.rad2deg(self._init_yaw_rad):.1f}°  '
                       f'(n={self._wait_acc_cnt})', flush=True)
-            else:
-                self._ekf.set_yaw(self._init_yaw_rad)
-                self._blip_frozen_q = self._ekf.x[6:10].copy()
 
             # ── Ground truth frame: position offset ───────────────────────────
             _latest_gt = self._data.get('mavlink', {}).get('latest', {})
@@ -225,17 +241,25 @@ class IMUEKFHandler:
                   f'gyro_bias={_gyro_bias} (n={self._wait_gyro_cnt})', flush=True)
             self._hover_reset_t = time.time()
 
-        # ── Sim gyro sign correction (FRD convention) ─────────────────────────
-        # Sim reports all three axes sign-flipped vs FRD: negate all three.
-        gyro = np.array([-gx, -gy, -gz])
+        # ── Sim sensor → FRD conversion ───────────────────────────────────────
+        from sim_convention import sim_to_frd_gyro
+        gyro = sim_to_frd_gyro(gx, gy, gz)
         acc  = np.array([ax, ay, az])
 
         # ── WAIT-phase accumulation ───────────────────────────────────────────
-        if not self._hover_reset_done:
+        # Gated on wait_phase_done (set by controller.py the moment WAIT ends),
+        # not hover_reset_done: the controller now runs a pre-blip levelling
+        # phase between WAIT and the actual hover-entry reset, and that phase
+        # involves real, intentional rotation — averaging it in here would
+        # corrupt both the gyro-bias calibration and the static-tilt reading,
+        # which are only meaningful over the truly-static WAIT window.
+        if not self._data.get('wait_phase_done', False):
             self._wait_gyro_sum += gyro
             self._wait_gyro_cnt += 1
             self._wait_acc_sum  += acc
             self._wait_acc_cnt  += 1
+            # Expose running average so controller can display ground tilt (sysid).
+            self._data['wait_acc_avg'] = self._wait_acc_sum / max(self._wait_acc_cnt, 1)
             # Pin EKF position to zero so pos_offset_ned stays correct at reset
             if self._data.get('_vision_ekf_update') is None:
                 self._ekf.x[0:3] = 0.0
@@ -309,11 +333,31 @@ class IMUEKFHandler:
                         if self._mp_shadow_tick % 10 == 0:
                             _err = acc_model - acc
                             _act_sum = float(np.sum(_act['actuator'][:4]))
+                            _act4 = [float(v) for v in _act['actuator'][:4]]
+
+                            # Ground-truth body velocity, computed independently of
+                            # self._ekf.x directly from the raw sim mavlink messages
+                            # (ATTITUDE + LOCAL_POSITION_NED are both in the sim's
+                            # native NED frame, so no R_align/pos_offset correction
+                            # is needed — velocity and the rotation to body frame
+                            # are frame-offset-invariant).
+                            _latest_gt_row = self._data.get('mavlink', {}).get('latest', {})
+                            _att_gt_row    = _latest_gt_row.get('ATTITUDE')
+                            _lpn_gt_row    = _latest_gt_row.get('LOCAL_POSITION_NED')
+                            if _att_gt_row is not None and _lpn_gt_row is not None:
+                                _gt_vb = (_dyn_quat_to_R(_att_gt_row['quat'])
+                                          @ np.array(_lpn_gt_row['vel_ned_mps'], dtype=float))
+                                _gt_vb_str = [f'{_gt_vb[0]:.3f}', f'{_gt_vb[1]:.3f}', f'{_gt_vb[2]:.3f}']
+                            else:
+                                _gt_vb_str = ['nan', 'nan', 'nan']
+
                             self._mp_shadow_writer.writerow([
                                 f'{now:.4f}',
                                 f'{_T_total:.2f}',
                                 f'{_act_sum:.4f}',
+                                f'{_act4[0]:.4f}', f'{_act4[1]:.4f}', f'{_act4[2]:.4f}', f'{_act4[3]:.4f}',
                                 f'{_vel_b[0]:.3f}', f'{_vel_b[1]:.3f}', f'{_vel_b[2]:.3f}',
+                                *_gt_vb_str,
                                 f'{acc[0]:.4f}', f'{acc[1]:.4f}', f'{acc[2]:.4f}',
                                 f'{acc_model[0]:.4f}', f'{acc_model[1]:.4f}', f'{acc_model[2]:.4f}',
                                 f'{_err[0]:.4f}', f'{_err[1]:.4f}', f'{_err[2]:.4f}',
@@ -322,34 +366,52 @@ class IMUEKFHandler:
                                 f'{self._v_model_ned[0]:.3f}', f'{self._v_model_ned[1]:.3f}', f'{self._v_model_ned[2]:.3f}',
                             ])
 
-        acc_predict = acc_model if (_use_mp and acc_model is not None) else acc
+        if _use_mp and acc_model is not None:
+            # Sigma-weighted fusion: minimum-variance blend of IMU and physics model.
+            # w_imu = σ²_model / (σ²_imu + σ²_model); both contribute every tick.
+            # update_accel() and update_zupt() always use raw acc — unaffected by blend.
+            _s2_imu = float(self._param.get('sigma_acc_imu', 0.5)) ** 2
+            # Item 3: adaptive sigma_acc_model from rolling RMS of model-vs-IMU error
+            if len(self._acc_model_errs) >= 10:
+                _sig_mdl = float(np.clip(
+                    np.sqrt(np.mean(np.array(self._acc_model_errs) ** 2)), 0.1, 3.0))
+            else:
+                _sig_mdl = float(self._param.get('sigma_acc_model', 0.3))
+            _s2_model = _sig_mdl ** 2
+            _w_imu    = _s2_model / (_s2_imu + _s2_model)
+            acc_predict = _w_imu * acc + (1.0 - _w_imu) * acc_model
+            self._acc_model_errs.append(float(np.linalg.norm(acc_model - acc)))
+        else:
+            acc_predict = acc
         self._ekf.predict(gyro, acc_predict, dt)
+        # Item 4: record EKF position after predict for latency compensation
+        self._state_buf.append((now, self._ekf.x[0:3].copy()))
         _acc_norm_upd = float(np.linalg.norm(acc))  # raw IMU for update gate
 
-        # ── Attitude freeze (blip + motor-lag transient) ──────────────────────
-        # Pin the quaternion to the hover-reset value for blip_dur + 0.30 s so
-        # the motor-ramp acc surge cannot corrupt the EKF attitude.
-        _freeze_active = (
-            self._blip_frozen_q is not None
-            and self._hover_reset_t is not None
-            and now - self._hover_reset_t
-                < self._param.get('blip_dur_sec', 0.15) + 0.30
-        )
-        if _freeze_active:
-            self._ekf.x[6:10] = self._blip_frozen_q
-            _qn = float(np.linalg.norm(self._ekf.x[6:10]))
-            if _qn > 1e-9:
-                self._ekf.x[6:10] /= _qn
+        # No more attitude freeze or backup post-blip re-init: both existed only
+        # to protect against the liftoff blip's motor-ramp transient, which no
+        # longer exists (see controller.py PHASE 1.5 / hover-entry). Firing a
+        # one-shot accel-derived attitude reset here would actually be actively
+        # harmful now — the drone typically has real, sustained acceleration
+        # within the first ~0.5s of cascade control, and treating that as a pure
+        # tilt error is exactly the bug fixed by keeping accel_settle_sec short.
+        # update_accel() below already has the same protection via that window.
 
         # ── Accelerometer attitude update ─────────────────────────────────────
-        _blip_window = (
+        # accel_settle_sec: short post-reset window during which the gravity-
+        # alignment update is trusted. Kept short (default 0.50s) — too long and
+        # this update starts firing during genuine flight acceleration,
+        # misreading it as attitude error and (via velocity-attitude covariance)
+        # corrupting velocity too. Deliberately separate from vision_settle_sec
+        # below: roll/pitch (what this update corrects) and yaw (what that one
+        # protects) settle on different timescales post-reset.
+        _accel_settle_window = (
             not self._hover_reset_done
             or (self._hover_reset_t is not None
                 and now - self._hover_reset_t
-                    < self._param.get('blip_dur_sec', 0.15)
-                      + self._param.get('blip_acc_extra_sec', 0.50))
+                    < self._param.get('accel_settle_sec', 0.50))
         )
-        if not _freeze_active and abs(_acc_norm_upd - 9.81) < 2.0 and _blip_window:
+        if abs(_acc_norm_upd - 9.81) < 2.0 and _accel_settle_window:
             acc_applied, acc_innov = self._ekf.update_accel(acc)
         else:
             acc_applied, acc_innov = False, 0.0
@@ -359,45 +421,51 @@ class IMUEKFHandler:
         else:
             zupt_applied, zupt_innov = False, 0.0
 
-        # ── Backup post-blip attitude re-init ─────────────────────────────────
-        # One-shot re-init fires immediately after the freeze window ends.
-        # Sets attitude from acc=[0,0,-g] → ~0° — a no-op when drone is level,
-        # small correction otherwise.
-        if (self._hover_reset_done
-                and not self._post_blip_att_reset_done
-                and not _freeze_active
-                and self._hover_reset_t is not None
-                and now - self._hover_reset_t
-                    > self._param.get('blip_dur_sec', 0.15) + 0.30):
-            if abs(_acc_norm_upd - 9.81) < 1.5:
-                _g      = 9.81
-                _ax_pb  = float(acc[0])
-                _ay_pb  = float(acc[1])
-                _th_pb  = float(np.arcsin(np.clip(_ax_pb / _g, -1.0, 1.0)))
-                _ph_pb  = float(np.arcsin(
-                    np.clip(_ay_pb / (_g * max(np.cos(_th_pb), 0.1)), -1.0, 1.0)))
-                _qw, _qx, _qy, _qz = self._ekf.x[6:10]
-                _psi_pb = float(np.arctan2(
-                    2.0 * (_qw * _qz + _qx * _qy),
-                    1.0 - 2.0 * (_qy * _qy + _qz * _qz)))
-                self._ekf.set_attitude(_ph_pb, _th_pb, _psi_pb)
-                print(f'[IMUEKFHandler] post-blip att reset: '
-                      f'phi={np.rad2deg(_ph_pb):.1f}°  '
-                      f'theta={np.rad2deg(_th_pb):.1f}°  '
-                      f'acc_norm={_acc_norm_upd:.3f}  '
-                      f'dt={now - self._hover_reset_t:.3f}s', flush=True)
-                self._post_blip_att_reset_done = True
-                self._data['post_blip_att_reset_done'] = True
-
         # ── Vision position / velocity / yaw correction ───────────────────────
         # Suppress vision EKF updates in GT mode: ekf.x is overwritten by GT anyway,
         # so update_velocity/update_yaw only shrink P without improving x, leaving P
         # inconsistently small when GT is later disabled.
+        # Also suppress until yaw has actually settled: during WAIT the gyro bias
+        # hasn't been calibrated yet (confirmed: psi wandering 140-148° during WAIT
+        # vs. the correct ~180°), and yaw has no fast-converging correction post-reset
+        # (no magnetometer; gyro bias for yaw is frozen) so it settles more slowly
+        # than roll/pitch — confirmed directly: at t=0.55s post-reset (just past the
+        # old shared 0.5s window) psi was still 15° off target, producing a ~9m PnP
+        # position error that the EKF absorbed *confidently* (sig_pE shrank while
+        # trusting the bad update), a lasting bias the carrot tracker then chased
+        # with sustained wrong-direction roll. hover_reset_done alone flips True
+        # immediately at reset and doesn't cover that settling tail, so gate on
+        # elapsed time since reset instead, via its own vision_settle_sec (longer
+        # than accel_settle_sec — see that param's note for why they're separate).
+        # ekf_vision_gate is a second, adaptive backstop against whatever residual
+        # error remains after this window. Matches the velocity-heading yaw update
+        # and gate-pass position fix elsewhere in this file, which use
+        # hover_reset_done directly because they have no such settling tail.
         vis = self._data.pop('_vision_ekf_update', None)
-        if vis is not None and not self._param.get('ground_truth_mode', False):
+        _vision_settled = (
+            self._hover_reset_done
+            and self._hover_reset_t is not None
+            and now - self._hover_reset_t
+                > self._param.get('vision_settle_sec', 1.50)
+        )
+        if (vis is not None and _vision_settled
+                and not self._param.get('ground_truth_mode', False)):
             if vis.get('pos_ned') is not None:
                 # PnP is world-frame; EKF is local-frame (zeroed at hover entry).
                 local_pos = np.asarray(vis['pos_ned']) - self._pos_offset_ned
+                # Item 4: latency compensation — shift measurement forward by dead-reckoning.
+                # The image was captured vision_latency_s ago; the EKF has since moved.
+                # Adjusting local_pos by (current_pos - historical_pos) removes this offset.
+                _vis_t = vis.get('wall_t')
+                _lat   = float(self._param.get('vision_latency_s', 0.0))
+                if _vis_t is not None and _lat > 0.0 and len(self._state_buf) >= 2:
+                    _t_img = _vis_t - _lat
+                    _pos_hist = self._state_buf[0][1]   # fallback: oldest entry
+                    for _bt, _bp in self._state_buf:
+                        if _bt >= _t_img:
+                            _pos_hist = _bp
+                            break
+                    local_pos = local_pos + (self._ekf.x[0:3] - _pos_hist)
                 self._ekf.update_position(
                     local_pos, sigma_pos=vis['sigma_pos'], gate_dist=vis['gate'])
             if vis.get('vel_ned') is not None:
@@ -405,9 +473,65 @@ class IMUEKFHandler:
                     vis['vel_ned'], sigma_vel=vis['sigma_vel'],
                     gate_dist=vis['vel_gate'])
             if vis.get('yaw_ned') is not None:
+                # Confidence ramp: vision_settle_sec is a hard on/off cliff, so
+                # whatever the first trusted yaw sample happens to be (or the
+                # circular-mean of the first few, in vision_rx.py) gets applied at
+                # full nominal confidence (sigma_yaw=0.1 rad) immediately. Confirmed
+                # in a flight log: hover_reset_t=3.71s, vision_settle_sec=1.5s ->
+                # settle at 5.21s; psi jumped ~9.5deg at t=5.28s (the very next
+                # update), which the tight sigma let through and the controller
+                # then chased into a real, growing roll/E-position oscillation.
+                # This is a smaller instance of the same class of bug fixed
+                # earlier this session (LK-bridge, PnP dual-solution flips, frame
+                # duplication, single-frame yaw outliers) — smoothing/hysteresis
+                # fixes there only catch transient or single-frame errors, not
+                # ordinary PnP scatter that happens to land in the first update.
+                # Ramp sigma_yaw down from a heavily-distrusted initial value to
+                # the nominal one over vision_yaw_confidence_ramp_sec so the first
+                # updates after the cliff can only nudge the estimate, not snap it.
+                _yaw_ramp_sec  = float(self._param.get('vision_yaw_confidence_ramp_sec', 1.0))
+                _sigma_yaw_max = float(self._param.get('vision_yaw_sigma_initial', 0.5))
+                _t_since_settle = (now - self._hover_reset_t
+                                    - self._param.get('vision_settle_sec', 1.50))
+                _ramp_frac = float(np.clip(_t_since_settle / max(_yaw_ramp_sec, 1e-6),
+                                            0.0, 1.0))
+                _sigma_yaw_eff = _sigma_yaw_max + (vis['sigma_yaw'] - _sigma_yaw_max) * _ramp_frac
                 self._ekf.update_yaw(
-                    vis['yaw_ned'], sigma_yaw=vis['sigma_yaw'],
+                    vis['yaw_ned'], sigma_yaw=_sigma_yaw_eff,
                     gate_dist=vis.get('yaw_gate', 1.0))
+
+        # ── Item 1: Velocity-heading yaw update ───────────────────────────────
+        # At high horizontal speed, velocity direction ≈ nose heading.
+        # This gives a continuous weak yaw constraint between gate sightings.
+        if (self._hover_reset_done
+                and not self._param.get('ground_truth_mode', False)):
+            _v_ne  = self._ekf.x[3:5]
+            _v_mag = float(np.linalg.norm(_v_ne))
+            if _v_mag > float(self._param.get('vel_heading_min_mps', 4.0)):
+                _psi_vel = float(np.arctan2(_v_ne[1], _v_ne[0]))
+                self._ekf.update_yaw(
+                    _psi_vel,
+                    sigma_yaw=float(self._param.get('sigma_vel_heading', 0.5)),
+                    gate_dist=float(self._param.get('gate_vel_heading', 1.0)))
+
+        # ── Item 2: Gate-pass position fix ────────────────────────────────────
+        # On COLLISION the controller writes 'last_gate_id' to shared data.
+        # The gate world-NED position is a known landmark → apply as an EKF fix.
+        if (self._hover_reset_done
+                and not self._param.get('ground_truth_mode', False)):
+            _gid = self._data.get('last_gate_id')
+            if _gid is not None and _gid != self._last_gate_id_processed:
+                _gates_ned = self._data.get('track_gates_ned', {})
+                if _gid in _gates_ned:
+                    _gate_world = np.asarray(_gates_ned[_gid], dtype=float)
+                    _gate_local = (self._R_align @ (_gate_world - self._sim_ned_offset)
+                                   - self._pos_offset_ned)
+                    _sigma_gp = float(self._param.get('sigma_gate_pass_pos', 0.5))
+                    self._ekf.update_position(
+                        _gate_local, sigma_pos=_sigma_gp, gate_dist=5.0)
+                    print(f'[IMUEKFHandler] gate-pass fix gate={_gid} '
+                          f'local_pos={_gate_local}', flush=True)
+                self._last_gate_id_processed = _gid
 
         # ── EKF log ───────────────────────────────────────────────────────────
         if self._logger is not None:

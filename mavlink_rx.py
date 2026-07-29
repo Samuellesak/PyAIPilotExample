@@ -217,8 +217,15 @@ class MAVLinkRX:
         }
 
     def on_attitude(self, msg):
+        # Sim ATTITUDE sign conventions (see sim_convention.py for gyro/acc):
+        #   roll      — standard FRD/NED; no correction
+        #   pitch     — sign-inverted vs standard ZYX (msg.pitch>0 = nose DOWN); negate
+        #   yaw       — sign-inverted vs standard ZYX; NOT negated here (GT mode relies
+        #               on the inverted sign; see _send_attitude_target r_des for correction)
+        #   pitchspeed — sign-inverted; negate to match corrected pitch angle
+        #   rollspeed, yawspeed — standard; no correction
         roll, pitch, yaw = float(msg.roll), float(msg.pitch), float(msg.yaw)
-        pitch = -pitch  # sim reports pitch with opposite sign vs standard aerospace ZYX
+        pitch = -pitch
         cr, sr = np.cos(roll / 2), np.sin(roll / 2)
         cp, sp = np.cos(pitch / 2), np.sin(pitch / 2)
         cy, sy = np.cos(yaw / 2), np.sin(yaw / 2)

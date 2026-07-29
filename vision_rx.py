@@ -1,3 +1,4 @@
+import math
 import queue
 import socket
 import struct
@@ -28,11 +29,19 @@ class VisionRX:
             [0.,                   0.,                     1.                    ],
         ], dtype=np.float64)
         self._ekf_vis_sigma     = float(_p.get('ekf_vision_sigma',     0.5))
+        self._ekf_vis_sigma_k   = float(_p.get('ekf_vision_sigma_range_k', 0.08))
         self._ekf_vis_gate      = float(_p.get('ekf_vision_gate',      10.0))
+        # track_gates_ned's raw NED marks the gate's bottom beam, not the opening
+        # centre — see the correction applied where gate_info is built from it below.
+        self._gate_beam_to_center_d = float(_p.get('gate_beam_to_center_offset_m', 1.0))
         self._ekf_vis_vel_sigma = float(_p.get('ekf_vision_vel_sigma', 1.0))
         self._ekf_vis_vel_gate  = float(_p.get('ekf_vision_vel_gate',  5.0))
         self._ekf_vis_yaw_sigma = float(_p.get('ekf_vision_yaw_sigma', 0.1))
         self._ekf_vis_yaw_gate  = float(_p.get('ekf_vision_yaw_gate',  1.0))
+        # Minimum YOLO confidence to accept a detection — rejects low-confidence
+        # false positives (background clutter mistaken for a gate) from ever
+        # reaching PnP/EKF.
+        self._conf_min          = float(_p.get('vision_conf_min',      0.6))
         # Fallback gate size used for PnP when track data hasn't arrived yet.
         # Gives a distance readout and yaw estimate even during the WAIT phase.
         self._gate_w_default    = float(_p.get('gate_width_default',   2.5))
@@ -87,16 +96,70 @@ class VisionRX:
         self._sharpen_alpha = float(_p.get('preproc_sharpen_alpha', 0.8))
         self._gauss_k       = int(_p.get('preproc_gauss_k',         0))
 
-        # cam→FRD body: x_b(fwd)=cam_z, y_b(right)=cam_x, z_b(down)=cam_y
-        self._R_cam2body = np.array([[0, 0, 1],
-                                     [1, 0, 0],
-                                     [0, 1, 0]], dtype=float)
+        # cam→FRD body with upward tilt; cam_tilt_deg from params.yaml (positive = nose up)
+        _tilt = math.radians(float(_p.get('cam_tilt_deg', 20.0)))
+        _st, _ct = math.sin(_tilt), math.cos(_tilt)
+        self._R_cam2body = np.array([[0, _st, _ct],
+                                     [1,  0,   0 ],
+                                     [0, _ct, -_st]], dtype=float)
 
-        # PnP velocity estimation: sliding window of (wall_t, drone_ned) pairs.
-        # Velocity = (last_ned - first_ned) / (last_t - first_t) over the window.
-        # Averaging over N frames reduces differentiation noise by ≈ N× vs 2-frame diff.
+        # PnP velocity estimation: sliding window of (wall_t, t_gate_body, gyro_q)
+        # tuples — BODY-frame drone->gate vector (fixed R_cam2body only, no live
+        # attitude), not world-NED position. See the regression site for why body
+        # frame, and for why a gyro-integrated quaternion is buffered alongside it.
+        # Averaging over N frames reduces differentiation noise by ~N× vs 2-frame diff.
         _vel_win = int(_p.get('vision_vel_window_frames', 10))
         self._pnp_vel_buf = deque(maxlen=max(2, _vel_win))
+        # Sanity cap only — real de-rotation (below) handles ordinary flight
+        # rotation, this just bails out of the small-angle regime for genuinely
+        # extreme spins where first-order quaternion integration breaks down.
+        self._vel_max_rotation_rad = math.radians(
+            float(_p.get('vision_vel_max_rotation_deg', 90.0)))
+        # Gyro-only dead-reckoned attitude, purely for de-rotating buffered
+        # samples into the current body frame before regressing (see below) —
+        # deliberately NOT the EKF's own attitude, so this can't inherit any of
+        # the attitude-estimation-error bugs fixed elsewhere this session. Gyro
+        # bias drifts over tens of seconds, but the velocity window only spans
+        # ~1s, so bias contributes a negligible rotation error over that span.
+        self._gyro_q      = np.array([1.0, 0.0, 0.0, 0.0])   # wxyz, body->some-fixed-ref
+        self._gyro_q_last_t = None
+        # Detects a hover-reset (imu_ekf.py sets pos_offset_ned exactly once,
+        # at reset) so the velocity buffer/gyro tracker can be cleared then —
+        # see the reset-detection block in process_frame for why: the LEVEL
+        # phase snaps the drone from its resting ramp tilt to level right at
+        # reset (confirmed in a flight log: theta changed ~9.5deg in one 66ms
+        # tick, gy~3.9 rad/s), too fast for gyro_q's ~30fps-sampled first-order
+        # integration to track accurately, leaking a residual rotation error
+        # into any buffered sample that straddles the transient. Resetting
+        # the buffer here means it can only ever contain post-transient,
+        # already-settled samples.
+        self._last_pos_offset_ned = None
+
+        # Last-accepted PnP rotation, for near-tie hysteresis in _pnp_gate's
+        # dual-IPPE-solution disambiguation (see that method for why). Kept
+        # separate per target — the primary/current-gate call (fresh YOLO or
+        # LK-bridged, same physical gate) and the next-gate-candidate call
+        # each need their own continuity anchor, or the two would clobber
+        # each other's state every frame they both fire.
+        self._last_pnp_R_primary = None
+        self._last_pnp_R_next    = None
+
+        # PnP yaw smoothing: same rationale as the velocity window above, but for
+        # yaw_ned. A single bad-frame yaw reading (oblique angle / keypoint noise)
+        # used to go straight into update_yaw() with a tight sigma (0.1 rad) and a
+        # loose gate (1.0 rad ≈ 57°), so the EKF absorbed it almost at full
+        # confidence. Confirmed in a flight log: the very first post-settle-window
+        # yaw update (t=vision_settle_sec after reset, to the tick) carried a ~27°
+        # error, which the tight sigma let through, corrupting psi — and since
+        # position is computed by rotating tvec through this same (now-bad) yaw
+        # every subsequent frame, the ~9m position corruption that followed was a
+        # downstream symptom of the same single bad yaw sample, not a separate bug.
+        # Circular-mean over a short window smooths single-frame noise, and a frame
+        # that disagrees with that mean by more than the outlier threshold is
+        # dropped rather than fed to the EKF.
+        _yaw_win = int(_p.get('vision_yaw_window_frames', 5))
+        self._pnp_yaw_buf = deque(maxlen=max(2, _yaw_win))
+        self._yaw_outlier_rad = math.radians(float(_p.get('vision_yaw_outlier_deg', 12.0)))
 
         # Next-gate candidate: accumulate PnP-derived NED positions of the second-largest
         # YOLO detection across many frames.  Confirmed position = median of buffer.
@@ -108,6 +171,18 @@ class VisionRX:
         # Live debug overlay window (enabled via vision_debug_overlay: true in params.yaml).
         self._debug_overlay     = bool(_p.get('vision_debug_overlay', False))
         self._overlay_last_ctr  = None   # last known gate centre_px for hold/transition display
+
+        # Item 5: Lucas-Kanade optical flow keypoint tracker.
+        # Tracks the 4 gate keypoints between YOLO detections to bridge flicker gaps.
+        self._lk_prev_gray  = None
+        self._lk_pts        = None   # (4,1,2) float32 tracked keypoints
+        self._lk_age        = 0      # frames since last YOLO refresh
+        self._lk_max_age    = int(_p.get('lk_max_age',    5))
+        self._lk_fb_max_px  = float(_p.get('lk_fb_max_px', 2.0))
+        self._lk_params     = dict(
+            winSize=(21, 21), maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+        )
 
         # Diagnostics counters (reset every 5 s)
         self._stat_recv           = 0
@@ -122,7 +197,18 @@ class VisionRX:
         # maxsize=1: inference always gets the most recent frame; older ones are dropped.
         self._frame_q = queue.Queue(maxsize=1)
 
-        self._model = _YOLO("YOLO/best.pt")
+        # Guards against reprocessing the same camera frame twice (UDP can
+        # duplicate a packet/chunk-set, or the sim can resend one). frame_id
+        # is a monotonically increasing counter, so anything <= the last
+        # queued id is a dup or stale reorder. Confirmed in a flight log: the
+        # same frame_id (bit-identical keypoints and tvec) was processed
+        # twice ~33ms apart; drone_ned is computed from live mav_state, which
+        # had drifted between the two passes, so the identical PnP solve
+        # produced two different positions — an 8m position (and matching
+        # PnP-velocity) jump the EKF absorbed as a real, sudden motion.
+        self._last_queued_frame_id = -1
+
+        self._model = _YOLO("YOLO/best3.pt")
         self._model.predict(np.zeros((640, 640, 3), dtype=np.uint8), verbose=False)
         print("[VisionRX] YOLO model loaded and warmed up.", flush=True)
 
@@ -162,11 +248,12 @@ class VisionRX:
 
             header  = packet[:header_sz]
             payload = packet[header_sz:]
-            frame_id, chunk_id, total_chunks, jpeg_size, payload_size, _ = \
+            frame_id, chunk_id, total_chunks, jpeg_size, payload_size, sim_time_ns = \
                 struct.unpack(header_format, header)
 
             if frame_id not in frames:
-                frames[frame_id] = {"chunks": {}, "total": total_chunks}
+                frames[frame_id] = {"chunks": {}, "total": total_chunks,
+                                     "sim_time_ns": sim_time_ns}
             frames[frame_id]["chunks"][chunk_id] = payload
 
             if len(frames[frame_id]["chunks"]) == total_chunks:
@@ -180,8 +267,10 @@ class VisionRX:
                 if ok:
                     img = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8),
                                        cv2.IMREAD_COLOR)
-                    if img is not None:
+                    if img is not None and frame_id > self._last_queued_frame_id:
+                        self._last_queued_frame_id = frame_id
                         self._stat_recv += 1
+                        frame_ts = frames[frame_id]["sim_time_ns"]
                         # Drop oldest frame if inference is lagging; keep latest.
                         if self._frame_q.full():
                             try:
@@ -189,7 +278,7 @@ class VisionRX:
                             except queue.Empty:
                                 pass
                         try:
-                            self._frame_q.put_nowait((frame_id, img))
+                            self._frame_q.put_nowait((frame_id, img, frame_ts))
                         except queue.Full:
                             pass
 
@@ -210,8 +299,8 @@ class VisionRX:
                 continue
             if item is None:   # shutdown sentinel
                 break
-            frame_id, img = item
-            self.process_frame(frame_id, img)
+            frame_id, img, sim_time_ns = item
+            self.process_frame(frame_id, img, sim_time_ns)
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -417,7 +506,8 @@ class VisionRX:
 
         return vis
 
-    def _pnp_gate(self, corners_px, gate_width, gate_height):
+    def _pnp_gate(self, corners_px, gate_width, gate_height,
+                  continuity_attr='_last_pnp_R_primary'):
         """Returns (tvec, rvec) both as flat (3,) arrays, or (None, None) on failure.
 
         IPPE produces two solutions with nearly equal reprojection error for
@@ -461,20 +551,47 @@ class VisionRX:
         # Pick the solution where gate_Y (col 1 of R_gate2cam) most aligns with
         # NED-down in camera frame.  Gate Y = downward in gate frame = NED-down
         # in the world when the gate is horizontal.
-        best_rvec, best_tvec = rvecs[0].flatten(), tvecs[0].flatten()
-        best_score = -np.inf
+        candidates = []
         for rv, tv in zip(rvecs, tvecs):
             tv_f = tv.flatten()
             if tv_f[2] < 0.1:          # gate behind camera — physically impossible
                 continue
             R_sol, _ = cv2.Rodrigues(rv)
             score = float(np.dot(R_sol[:, 1], ned_down_cam))
-            if score > best_score:
-                best_score = score
-                best_rvec, best_tvec = rv.flatten(), tv_f
+            candidates.append((score, rv.flatten(), tv_f, R_sol))
+
+        if not candidates:
+            return None, None
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        best_score, best_rvec, best_tvec, best_R = candidates[0]
+
+        # Near-frontal views give two IPPE solutions with almost equal NED-down
+        # score (see docstring). ned_down_cam is derived from the EKF's current
+        # attitude, so tiny attitude noise can flip which candidate "wins" from
+        # one frame to the next even though the true pose hasn't changed —
+        # confirmed in a flight log: keypoints perfectly stable, but the picked
+        # solution flipped and stuck on the wrong one for 8+ consecutive frames,
+        # producing a sustained ~8 m position error the smoothing/outlier checks
+        # elsewhere can't catch since it isn't a single-frame glitch. When the
+        # top two scores are close, break the tie toward whichever candidate is
+        # rotationally closer to the last frame's ACCEPTED solution instead —
+        # continuity with the vision pipeline's own recent history is a much
+        # more stable signal here than instantaneous EKF attitude.
+        last_R = getattr(self, continuity_attr, None)
+        if len(candidates) >= 2 and last_R is not None:
+            second_score = candidates[1][0]
+            if best_score - second_score < 0.05:
+                def _rot_dist(Ra, Rb):
+                    _cos = (np.trace(Ra.T @ Rb) - 1.0) / 2.0
+                    return np.arccos(np.clip(_cos, -1.0, 1.0))
+                d0 = _rot_dist(candidates[0][3], last_R)
+                d1 = _rot_dist(candidates[1][3], last_R)
+                if d1 < d0:
+                    best_score, best_rvec, best_tvec, best_R = candidates[1]
 
         if best_tvec[2] < 0.5:
             return None, None
+        setattr(self, continuity_attr, best_R)
         return best_tvec, best_rvec
 
     def _yaw_from_pnp(self, rvec, gate_quat_wxyz):
@@ -498,16 +615,56 @@ class VisionRX:
         R_b2n     = R_cam2ned  @ self._R_cam2body.T
         return float(np.arctan2(R_b2n[1, 0], R_b2n[0, 0]))
 
+    # ── Gyro-only attitude tracking (velocity de-rotation helper) ───────────
+
+    @staticmethod
+    def _quat_mul(q1, q2):
+        w1, x1, y1, z1 = q1
+        w2, x2, y2, z2 = q2
+        return np.array([
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2,
+        ])
+
+    @staticmethod
+    def _quat_to_R(q):
+        qw, qx, qy, qz = q
+        return np.array([
+            [1-2*(qy*qy+qz*qz),  2*(qx*qy-qw*qz),  2*(qx*qz+qw*qy)],
+            [  2*(qx*qy+qw*qz),1-2*(qx*qx+qz*qz),  2*(qy*qz-qw*qx)],
+            [  2*(qx*qz-qw*qy),  2*(qy*qz+qw*qx),1-2*(qx*qx+qy*qy)],
+        ], dtype=float)
+
+    def _update_gyro_q(self, now):
+        """First-order-integrate the gyro-only attitude to `now` and return it.
+
+        Deliberately independent of the EKF's own attitude estimate — see the
+        buffer init comment for why. Uses mav_state['rates'] (body rates) and
+        the elapsed wall time since the last call.
+        """
+        gyro = self.data.get('mav_state', {}).get('rates')
+        if gyro is not None and self._gyro_q_last_t is not None:
+            dt = now - self._gyro_q_last_t
+            if 0.0 < dt < 0.5:   # skip absurd gaps (startup, stalls)
+                wx, wy, wz = gyro
+                _dq = np.array([1.0, 0.5*wx*dt, 0.5*wy*dt, 0.5*wz*dt])
+                self._gyro_q = self._quat_mul(self._gyro_q, _dq)
+                self._gyro_q /= np.linalg.norm(self._gyro_q)
+        self._gyro_q_last_t = now
+        return self._gyro_q.copy()
+
     # ── Main frame processing ───────────────────────────────────────────────
 
-    def process_frame(self, frame_id, img):
+    def process_frame(self, frame_id, img, sim_time_ns=None):
         if self._debug_waypoints_only:
             self.data['gate_detection'] = {
                 'detected': False, 'centre_px': None, 'conf': 0.0,
                 'tvec_cam': None, 'rvec_cam': None, 'frame_id': frame_id,
             }
             if self.logger:
-                self.logger.log_frame(frame_id, img)
+                self.logger.log_frame(frame_id, img, sim_time_ns=sim_time_ns)
             return
 
         img = self._preprocess(img)
@@ -516,10 +673,11 @@ class VisionRX:
         # buildings and the track beam, while removing the hue that would
         # contaminate the orange mask or produce cyan false-positive detections.
         img = self._apply_blue_suppression(img)
+        _gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         masked, mask_raw = self._orange_mask(img)
         orange_px = int(np.count_nonzero(mask_raw))
 
-        results = self._model.predict(img, verbose=False, conf=0.03) if self._yolo_enabled else None
+        results = self._model.predict(img, verbose=False, conf=self._conf_min) if self._yolo_enabled else None
 
         detected  = False
         centre_px = None
@@ -541,7 +699,7 @@ class VisionRX:
             kpts  = r.keypoints.xy.cpu().numpy() # (N,4,2)
 
             # Two-pass selection: filter → nearest by area.
-            # Pass 1: reject boxes with conf < 0.03, zero keypoints, or
+            # Pass 1: reject boxes with conf < vision_conf_min, zero keypoints, or
             #         orange_frac < 0.1% (removes false positives: blue beam,
             #         background structures, unlabelled distant objects).
             # Pass 2: among survivors pick LARGEST bbox area = nearest gate.
@@ -555,7 +713,7 @@ class VisionRX:
             _PAD = 15
             valid_idx = []
             for _i in range(len(boxes)):
-                if confs[_i] < 0.03:
+                if confs[_i] < self._conf_min:
                     continue
                 if kpts[_i].shape != (4, 2):
                     continue
@@ -587,7 +745,26 @@ class VisionRX:
                 # still points at waypoints[1] (first gate).
                 agi   = self.data.get('active_gate_index', 0)
                 if agi is not None and int(agi) in gates:
-                    gate_info = gates[int(agi)]
+                    # track_gates_ned's raw NED marks the gate's bottom beam, not the
+                    # opening centre the drone flies through (~1 m above the beam) —
+                    # same correction already baked into params.yaml's waypoints: list,
+                    # which is why the fallback branch below (using self._waypoints)
+                    # doesn't need it but this live-track-data branch does.
+                    #
+                    # gate_info['width']/['height'] from live track data are the gate's
+                    # OUTER frame (2.7 m) — the physical structure size, broadcast by the
+                    # sim. YOLO's keypoints measure the INNER opening (1.5 m) the drone
+                    # flies through, which is what the PnP object model must match.
+                    # Using the outer size here computed tvec_z ~1.8x too far (confirmed:
+                    # 40.4 m vs the true ~22.4 m for an identical corner set), silently
+                    # rejected by vision_max_gate_dist and blocking PnP almost entirely.
+                    # Keep the true inner size (gate_width/height_default) for the PnP
+                    # call; only 'ned' (position) comes from the live track message.
+                    gate_info = dict(gates[int(agi)])
+                    gate_info['ned'] = gate_info['ned'].copy()
+                    gate_info['ned'][2] -= self._gate_beam_to_center_d
+                    gate_info['width']  = self._gate_w_default
+                    gate_info['height'] = self._gate_h_default
                     # Cache so later frames can use it as a fallback when
                     # track_gates_ned is temporarily unavailable.
                     self._last_gate_info[int(agi)] = gate_info
@@ -598,13 +775,15 @@ class VisionRX:
                 else:
                     # No live track data for this gate.
                     # Fallback priority:
-                    #   1. Last known gate_info from track data (accurate dims + NED)
+                    #   1. Last known gate_info from track data (accurate NED; width/height
+                    #      are already the corrected inner-opening size, see above)
                     #   2. Approximate NED from params.yaml waypoints
                     #   3. Distance-only (no position update)
+                    # Gate dims are always the fixed inner-opening constant — never taken
+                    # from track data's outer-frame width/height (see note above).
                     _last = self._last_gate_info.get(int(agi)) if agi is not None else None
-                    _w = _last['width']  if _last else self._gate_w_default
-                    _h = _last['height'] if _last else self._gate_h_default
-                    tvec_cam, rvec_cam = self._pnp_gate(corners, _w, _h)
+                    tvec_cam, rvec_cam = self._pnp_gate(
+                        corners, self._gate_w_default, self._gate_h_default)
                     gate_info = None
                     if tvec_cam is not None and agi is not None:
                         if _last is not None:
@@ -638,17 +817,11 @@ class VisionRX:
                 _cur_dist = float(tvec_cam[2]) if tvec_cam is not None else 0.0
                 if _second_idx is not None:
                     _sec_corners = kpts[_second_idx]
-                    # Gate dimensions for the next gate index
-                    _agi_next = (int(agi) + 1) if agi is not None else None
-                    _ng_cache = self._last_gate_info.get(_agi_next) if _agi_next is not None else None
-                    if _agi_next is not None and _agi_next in gates:
-                        _ng_w = gates[_agi_next]['width']
-                        _ng_h = gates[_agi_next]['height']
-                    elif _ng_cache is not None:
-                        _ng_w, _ng_h = _ng_cache['width'], _ng_cache['height']
-                    else:
-                        _ng_w, _ng_h = self._gate_w_default, self._gate_h_default
-                    _tvec_ng, _ = self._pnp_gate(_sec_corners, _ng_w, _ng_h)
+                    # Gate dims for PnP are always the fixed inner-opening constant —
+                    # never track data's outer-frame width/height (see note above).
+                    _tvec_ng, _ = self._pnp_gate(
+                        _sec_corners, self._gate_w_default, self._gate_h_default,
+                        continuity_attr='_last_pnp_R_next')
                     if (_tvec_ng is not None
                             and _tvec_ng[2] > _cur_dist + 5.0   # farther than current gate
                             and _tvec_ng[2] < self._max_gate_dist):
@@ -666,6 +839,52 @@ class VisionRX:
                             if len(self._next_gate_ned_buf) >= self._next_gate_min_frames:
                                 _buf = np.array(list(self._next_gate_ned_buf))
                                 self._next_gate_ned = np.median(_buf, axis=0)
+
+        # ── Item 5: Lucas-Kanade optical flow (bridge YOLO detection gaps) ─────
+        # On YOLO hit: seed the LK tracker with detected keypoints.
+        # On YOLO miss: forward-backward track the last known keypoints and attempt PnP.
+        # lk_bridged marks frames where tvec_cam/gate_info came from optical-flow
+        # extrapolation rather than a fresh YOLO detection — see the EKF-update
+        # gate below for why these are excluded from feeding the filter.
+        lk_bridged = False
+        if corners is not None:
+            self._lk_pts = corners.astype(np.float32).reshape(-1, 1, 2)
+            self._lk_age = 0
+        elif (self._lk_pts is not None
+              and self._lk_prev_gray is not None
+              and self._lk_age < self._lk_max_age
+              and tvec_cam is None):
+            _pts_fwd, _st_fwd, _ = cv2.calcOpticalFlowPyrLK(
+                self._lk_prev_gray, _gray, self._lk_pts, None, **self._lk_params)
+            if _pts_fwd is not None and _st_fwd is not None:
+                _pts_back, _st_back, _ = cv2.calcOpticalFlowPyrLK(
+                    _gray, self._lk_prev_gray, _pts_fwd, None, **self._lk_params)
+                if _pts_back is not None:
+                    _fb_err = np.linalg.norm(
+                        (_pts_back - self._lk_pts).reshape(-1, 2), axis=1)
+                    _ok = (_st_fwd.reshape(-1) > 0) & (_fb_err < self._lk_fb_max_px)
+                    if _ok.all():
+                        _lk_corners = _pts_fwd.reshape(-1, 2)
+                        _agi_lk  = self.data.get('active_gate_index', 0)
+                        _gi_lk   = self._last_gate_info.get(
+                            int(_agi_lk) if _agi_lk is not None else -1)
+                        if _gi_lk is not None:
+                            _tvec_lk, _rvec_lk = self._pnp_gate(
+                                _lk_corners, _gi_lk['width'], _gi_lk['height'])
+                            if _tvec_lk is not None:
+                                tvec_cam    = _tvec_lk
+                                rvec_cam    = _rvec_lk
+                                gate_info   = _gi_lk
+                                corners     = _lk_corners
+                                centre_px   = _lk_corners.mean(axis=0)
+                                detected    = True
+                                lk_bridged  = True
+                                self._lk_pts = _pts_fwd
+                        self._lk_age += 1
+                    else:
+                        self._lk_pts = None
+                        self._lk_age = 0
+        self._lk_prev_gray = _gray
 
         # Publish next-gate state for controller and overlay.
         self.data['next_gate_ned']        = self._next_gate_ned
@@ -686,11 +905,33 @@ class VisionRX:
             self._locked_dist = None
             self._consec_det  = 0
             self._consec_miss = 0
-            self._pnp_vel_buf.clear()        # stale positions from old gate are invalid
+            self._pnp_vel_buf.clear()        # stale relative vectors from old gate are invalid
+            self._pnp_yaw_buf.clear()        # stale yaw readings from old gate are invalid
+            self._last_pnp_R_primary = None  # stale rotation continuity from old gate is invalid
+            self._last_pnp_R_next    = None
             self._next_gate_ned_buf.clear()  # next-gate buffer also invalid after advance
             self._next_gate_ned = None
             print(f"[VISION] gate index {self._prev_agi}→{agi}: lock reset", flush=True)
         self._prev_agi = agi
+
+        # ── Hover-reset detection ────────────────────────────────────────────
+        # pos_offset_ned is set exactly once, at hover-reset (imu_ekf.py). A
+        # change means a reset just happened — clear the velocity buffer and
+        # resync the gyro tracker so it can't straddle the LEVEL-phase snap
+        # transient (see _gyro_q's init comment).
+        _pos_off = self.data.get('pos_offset_ned')
+        if _pos_off is not None:
+            _pos_off_key = tuple(np.round(np.asarray(_pos_off, dtype=float), 6))
+            # Also fires on the very first appearance (None -> value) — that
+            # transition IS the first (and usually only) hover-reset each
+            # flight, which is exactly the one that matters here.
+            if _pos_off_key != self._last_pos_offset_ned:
+                self._pnp_vel_buf.clear()
+                self._gyro_q        = np.array([1.0, 0.0, 0.0, 0.0])
+                self._gyro_q_last_t = None
+                print("[VISION] hover-reset detected: velocity buffer/gyro tracker reset",
+                      flush=True)
+                self._last_pos_offset_ned = _pos_off_key
 
         if tvec_cam is not None:
             dist = tvec_cam[2]
@@ -740,19 +981,28 @@ class VisionRX:
             'tvec_cam':      tvec_cam,
             'centroid_only': tvec_cam is None and centroid_area > 0,
             'pnp_locked':    self._locked_dist is not None,
+            'lk_bridged':    lk_bridged,
             'frame_id':      frame_id,
         }
 
         # EKF vision update: position + velocity + yaw from PnP.
+        # Excludes lk_bridged frames: LK has no fresh corner detection to verify
+        # against, so if the gate leaves frame entirely (e.g. right after flythrough)
+        # it can keep "successfully" tracking whatever pixels are left with a clean
+        # forward-backward error and no way to tell they're no longer on the gate.
+        # Confirmed in a flight log: the frame immediately after a real detection
+        # gap opened with an LK-bridged fix (conf=0.0, pnp_ok=1) whose position
+        # jumped ~5 m from the prior real fix, which the EKF absorbed as truth.
+        # LK still updates gate_detection/centre_px above for the controller's
+        # visual-centering use — only the EKF feed is restricted to real YOLO hits.
         vel_ned     = None
         vel_ned_pnp = None
         drone_ned   = None
         yaw_ned     = None
 
-        if tvec_cam is not None:
+        if tvec_cam is not None and not lk_bridged:
             # Yaw estimate: requires gate quaternion from track data.
             # Unavailable in the pure-fallback path (gate_info=None).
-            _pnp_flipped = False   # True when rvec was from the wrong PnP branch
             if gate_info is not None and gate_info.get('quat') is not None:
                 try:
                     yaw_ned = self._yaw_from_pnp(rvec_cam, gate_info['quat'])
@@ -761,8 +1011,16 @@ class VisionRX:
                     # innovation to the nearest 90° step and subtract it to recover the
                     # correct yaw.  Safe as long as the drone's true yaw deviation from
                     # the EKF is < 45° — which holds for normal gate-approach geometry.
-                    # IMPORTANT: when a flip is detected, tvec is also from the wrong
-                    # PnP branch → position/velocity updates for this frame are skipped.
+                    # This ambiguity is a corner-labelling problem only: for a square
+                    # gate, relabelling which detected corner is "TL" by 90° rotates the
+                    # recovered orientation but leaves the object's centre — and hence
+                    # tvec/position — unchanged (confirmed empirically: testing all 4
+                    # cyclic corner relabellings against real flight corners showed the
+                    # "correct" one wins with a large, confident margin every time, i.e.
+                    # this is genuinely just a labelling ambiguity, not a translation
+                    # error). So only yaw needs the correction below; tvec stays usable
+                    # even when this fires — it used to be discarded here too, which
+                    # threw out ~58% of otherwise-good position fixes in one flight log.
                     _mav = self.data.get('mav_state')
                     if _mav is not None:
                         _qw, _qx, _qy, _qz = _mav['quat']
@@ -772,13 +1030,23 @@ class VisionRX:
                         _n = round(_innov / (np.pi / 2))
                         if _n != 0:
                             yaw_ned = (yaw_ned - _n * np.pi / 2 + np.pi) % (2*np.pi) - np.pi
-                            _pnp_flipped = True
                 except Exception:
                     yaw_ned = None
 
+                if yaw_ned is not None:
+                    # Circular-mean smoothing + outlier rejection (see buffer init comment).
+                    self._pnp_yaw_buf.append(yaw_ned)
+                    if len(self._pnp_yaw_buf) >= 3:
+                        _yaws = np.array(self._pnp_yaw_buf)
+                        _yaw_mean = float(np.arctan2(np.mean(np.sin(_yaws)),
+                                                      np.mean(np.cos(_yaws))))
+                        _dev = abs((yaw_ned - _yaw_mean + np.pi) % (2*np.pi) - np.pi)
+                        yaw_ned = None if _dev > self._yaw_outlier_rad else _yaw_mean
+                    else:
+                        yaw_ned = None   # not enough samples yet to trust a fix
+
             # Position + velocity: require known gate NED (from track data or waypoint fallback).
-            # Skip when the PnP rotation was flipped — tvec from the wrong branch is also wrong.
-            if gate_info is not None and not _pnp_flipped:
+            if gate_info is not None:
                 mav = self.data.get('mav_state')
                 if mav is not None:
                     qw, qx, qy, qz = mav['quat']
@@ -791,17 +1059,100 @@ class VisionRX:
                     t_gate_ned  = R_b2n @ t_gate_body
                     drone_ned   = gate_info['ned'] - t_gate_ned
 
-                    now = time.time()
-                    self._pnp_vel_buf.append((now, drone_ned.copy()))
-                    # Windowed velocity: endpoint difference over all buffered samples.
-                    # Using first vs last (not pairwise average) is equivalent and cheaper.
-                    # Requires ≥ 2 entries and a sane time span to guard against stale data.
-                    if len(self._pnp_vel_buf) >= 2:
-                        _t0, _p0 = self._pnp_vel_buf[0]
-                        _t1, _p1 = self._pnp_vel_buf[-1]
-                        _dt_win = _t1 - _t0
-                        if _dt_win >= 0.05:
-                            vel_ned_pnp = (_p1 - _p0) / _dt_win
+                    now      = time.time()
+                    _gyro_q  = self._update_gyro_q(now)
+                    # Velocity buffer holds t_gate_body (drone->gate, BODY frame) —
+                    # a direct PnP output via the fixed R_cam2body calibration, not
+                    # world-NED position. drone_ned above needs R_b2n (live attitude)
+                    # to rotate into world frame, and regressing across samples that
+                    # each carry a *different* historical attitude estimate bakes
+                    # every attitude error along the way into the velocity — this is
+                    # exactly the mechanism behind the position/yaw corruption bugs
+                    # found this session (LK-bridge, PnP dual-solution flips, frame
+                    # duplication), so the old vN swings (std 1.38 m/s while
+                    # stationary) were inheriting that same noise source, not just
+                    # PnP pixel jitter. Regressing the body-frame vector instead
+                    # needs attitude only once, at the very end, to rotate the
+                    # resulting body-frame velocity into NED — so historical
+                    # attitude error can no longer accumulate into the estimate.
+                    #
+                    # Body-frame differencing assumes the body axes don't rotate over
+                    # the window — if they do, the gate's direction sweeps past in
+                    # body frame purely from rotation, with zero real translation.
+                    # Confirmed in a flight log: right at hover-reset the drone
+                    # pitches hard into forward flight (a real, large rotation), and
+                    # while pos_N/pos_E/tvec_z all stayed smooth and small, the
+                    # regression produced a spurious vD ramping to -9.6 m/s over
+                    # ~0.4s purely from that pitch sweep. A first attempt gated the
+                    # whole fit on peak-rate x window-duration, but that rejected
+                    # ordinary flight maneuvering too (any sustained ~10 deg/s turn
+                    # exceeds an 8 deg budget over the ~0.8s window), killing PnP
+                    # velocity for almost the entire active-flight portion of a log —
+                    # exactly when it's needed most. Instead, de-rotate each buffered
+                    # sample into the CURRENT body frame using gyro_q (gyro-only,
+                    # integrated independently of the EKF's attitude estimate — see
+                    # _update_gyro_q) before regressing, so real rotation is
+                    # compensated rather than just detected-and-rejected.
+                    # A detection gap (YOLO miss, occlusion) leaves a stale old
+                    # cluster of samples in the buffer; appending one fresh sample
+                    # after the gap makes the fit lean almost entirely on that one
+                    # point relative to the stale cluster — functionally an
+                    # endpoint difference again, with all the noise-sensitivity
+                    # that the windowed regression exists to avoid. Confirmed in a
+                    # flight log: a ~0.3s detection gap was immediately followed by
+                    # a single-frame 9.3 m/s spurious speed reading. Drop the whole
+                    # buffer instead of letting old and new samples mix once the
+                    # gap since the last sample is large enough to matter.
+                    if self._pnp_vel_buf and (now - self._pnp_vel_buf[-1][0]) > 0.15:
+                        self._pnp_vel_buf.clear()
+                    self._pnp_vel_buf.append((now, t_gate_body.copy(), _gyro_q))
+                    # Windowed velocity: least-squares slope over all buffered samples,
+                    # not an endpoint difference. Endpoint-difference only ever uses 2 of
+                    # the N buffered positions (the oldest and newest), so raising
+                    # vision_vel_window_frames barely helped — the two endpoints are just
+                    # as individually noisy regardless of how many frames sit between
+                    # them. A regression slope uses every sample, averaging out
+                    # per-frame noise instead of inheriting it from whichever 2 frames
+                    # happen to be the endpoints.
+                    # Minimum count/span raised from 3/0.05s: those were fine when the
+                    # buffer was always full (25 samples), but clearing it on hover-reset
+                    # and now on detection gaps too means it also needs to survive the
+                    # refill period right after a clear. A 2-3 point fit spanning
+                    # ~60-90ms turns ordinary PnP position noise (a few tenths of a
+                    # metre, normal at 20m+ range) into several m/s of apparent
+                    # velocity — confirmed in the same flight log, immediately after a
+                    # hover-reset buffer clear. Better to report no PnP velocity for the
+                    # ~0.3s refill period than a noise-dominated one.
+                    if len(self._pnp_vel_buf) >= 8:
+                        _ts   = np.array([t for t, _, _ in self._pnp_vel_buf])
+                        _dt_win = float(_ts[-1] - _ts[0])
+                        if _dt_win >= 0.3:
+                            _R_now = self._quat_to_R(_gyro_q)
+                            # Sanity cap: if the total rotation implied is extreme
+                            # (near-tumbling), first-order integration and the
+                            # small-window-translation model both break down —
+                            # skip rather than trust a degenerate fit.
+                            _q_oldest = self._pnp_vel_buf[0][2]
+                            _R_oldest = self._quat_to_R(_q_oldest)
+                            _cos = (np.trace(_R_now.T @ _R_oldest) - 1.0) / 2.0
+                            _total_rot = float(np.arccos(np.clip(_cos, -1.0, 1.0)))
+                            if _total_rot <= self._vel_max_rotation_rad:
+                                # q represents body(i)->reference (same convention as
+                                # mav_state['quat'] elsewhere in this file). To express
+                                # a body(i)-frame vector in the CURRENT body frame:
+                                # body(i) -> reference -> body(now), i.e.
+                                # R(q_now).T @ R(q_i) @ p_i.
+                                _relpos = np.array([
+                                    _R_now.T @ (self._quat_to_R(_q) @ _p)
+                                    for _, _p, _q in self._pnp_vel_buf
+                                ])   # each sample de-rotated into the current body frame
+                                _ts_c   = _ts - _ts[0]
+                                _A      = np.vstack([_ts_c, np.ones_like(_ts_c)]).T
+                                _coef   = np.linalg.lstsq(_A, _relpos, rcond=None)[0]  # (2,3): [slope; intercept] per axis
+                                _v_gate_rel_body = _coef[0]   # d(t_gate_body)/dt, current-body-frame
+                                # Gate is stationary: v_drone_ned = -R_b2n @ d(t_gate_body)/dt,
+                                # rotated by the CURRENT attitude only (see comment above).
+                                vel_ned_pnp = -(R_b2n @ _v_gate_rel_body)
 
             if vel_ned_pnp is not None:
                 # Gate PnP velocity against max(current_speed, v_ref) × factor.
@@ -813,21 +1164,29 @@ class VisionRX:
                 if float(np.linalg.norm(vel_ned_pnp)) > _vel_max:
                     vel_ned_pnp = None
 
-            if yaw_ned is not None or vel_ned_pnp is not None:
-                # Position updates disabled: PnP pos noise causes EKF path jumps.
-                # Dead-reckoning (IMU velocity) is accurate enough over gate distances;
-                # the controller gate-waypoint update handles navigation from PnP.
-                # Velocity injection is enabled when consecutive PnP frames are available.
+            if drone_ned is not None or yaw_ned is not None or vel_ned_pnp is not None:
+                # Position sigma grows with range: PnP lateral accuracy is sub-metre
+                # right at the gate but degrades over distance (keypoint pixel noise
+                # and any residual attitude error both scale into lateral position
+                # error roughly linearly with range — confirmed via check_yolo.py
+                # replay analysis: ~0.1-0.6 m error at 5-30 m once the GT-mode yaw
+                # sign bug was fixed, vs. several metres of raw PnP scatter beyond
+                # ~15-20 m before that). sigma_pos = base + k*range lets the EKF
+                # trust close-range fixes tightly while discounting far ones instead
+                # of applying one fixed sigma to both regimes.
+                _sigma_pos_dyn = (self._ekf_vis_sigma
+                                   + self._ekf_vis_sigma_k * float(tvec_cam[2]))
                 self.data['_vision_ekf_update'] = {
-                    'pos_ned':   None,
+                    'pos_ned':   drone_ned,
                     'vel_ned':   vel_ned_pnp,
                     'yaw_ned':   yaw_ned,
-                    'sigma_pos': self._ekf_vis_sigma,
+                    'sigma_pos': _sigma_pos_dyn,
                     'sigma_vel': self._ekf_vis_vel_sigma,
                     'sigma_yaw': self._ekf_vis_yaw_sigma,
                     'yaw_gate':  self._ekf_vis_yaw_gate,
                     'gate':      self._ekf_vis_gate,
                     'vel_gate':  self._ekf_vis_vel_gate,
+                    'wall_t':    time.time(),   # item 4: capture timestamp for latency compensation
                 }
 
             if drone_ned is not None:
@@ -925,5 +1284,6 @@ class VisionRX:
                 annotated = self._draw_overlay(annotated, tvec_cam, centre_px, corners, vel_ned_pnp)
 
             # Always save frames with a detection; rate-limit background frames
-            self.logger.log_frame(frame_id, annotated, force=detected)
+            self.logger.log_frame(frame_id, annotated, force=detected,
+                                  sim_time_ns=sim_time_ns)
 

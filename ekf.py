@@ -35,16 +35,18 @@ class QuadEKF:
     N    = 13
 
     def __init__(self,
-                 sigma_acc_proc  = 0.3,   # m/s²  / sqrt(Hz) — accel process noise
-                 sigma_gyro_proc = 0.02,  # rad/s / sqrt(Hz) — gyro  process noise
-                 sigma_bias_proc = 5e-5,  # rad/s²/ sqrt(Hz) — bias  random walk
-                 sigma_acc_meas  = 0.5,   # m/s²               — acc measurement noise
-                 sigma_zupt      = 0.05,  # m/s                — ZUPT velocity noise
-                 g               = 9.81,
+                 sigma_acc_proc    = 0.3,    # m/s²  / sqrt(Hz) — accel process noise
+                 sigma_gyro_proc   = 0.02,   # rad/s / sqrt(Hz) — gyro  process noise
+                 sigma_bias_proc   = 5e-5,   # rad/s²/ sqrt(Hz) — bias  random walk (bgx, bgy)
+                 sigma_bias_z_proc = 5e-6,   # rad/s²/ sqrt(Hz) — bgz random walk; 0 = frozen
+                 sigma_acc_meas    = 0.5,    # m/s²               — acc measurement noise
+                 sigma_zupt        = 0.05,   # m/s                — ZUPT velocity noise
+                 g                 = 9.81,
                  ):
         self._sa   = float(sigma_acc_proc)
         self._sg   = float(sigma_gyro_proc)
         self._sb   = float(sigma_bias_proc)
+        self._sb_z = float(sigma_bias_z_proc)
         self._R_a  = float(sigma_acc_meas) ** 2 * np.eye(3)
         self._R_z  = float(sigma_zupt)     ** 2 * np.eye(3)
         self._g    = float(g)
@@ -55,9 +57,10 @@ class QuadEKF:
             [1.0**2] * 3 +               # position: large initial uncertainty
             [0.5**2] * 3 +               # velocity
             [0.1**2] * 4 +               # quaternion
-            [0.05**2] * 3                # gyro bias
+            [0.05**2] * 3                # gyro bias (bgx, bgy, bgz)
         ).astype(float)
-        self.P[12, 12] = 0.0             # bgz unobservable (no yaw sensor) — freeze at 0
+        if self._sb_z == 0.0:
+            self.P[12, 12] = 0.0         # bgz frozen (no yaw sensor)
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -89,7 +92,7 @@ class QuadEKF:
         # Propagate covariance  P ← (I + F·dt) P (I + F·dt)ᵀ + Q
         F  = _jacobian_F(q, omega, acc_raw)
         Fd = np.eye(self.N) + F * dt
-        Q  = _build_Q(q, dt, self._sa, self._sg, self._sb)
+        Q  = _build_Q(q, dt, self._sa, self._sg, self._sb, self._sb_z)
         self.P = Fd @ self.P @ Fd.T + Q
 
     def update_accel(self, acc_raw, threshold=2.0):
@@ -210,7 +213,8 @@ class QuadEKF:
         self.P[:] = 0.
         np.fill_diagonal(self.P,
             [1.0**2] * 3 + [0.5**2] * 3 + [0.1**2] * 4 + [0.05**2] * 3)
-        self.P[12, 12] = 0.0                             # bgz: frozen (unobservable)
+        if self._sb_z == 0.0:
+            self.P[12, 12] = 0.0                         # bgz: frozen
 
     def set_yaw(self, psi):
         """
@@ -384,7 +388,7 @@ def _jacobian_F(q, omega, acc):
     return F
 
 
-def _build_Q(q, dt, sa, sg, sb):
+def _build_Q(q, dt, sa, sg, sb, sb_z=0.0):
     """
     Discrete process noise covariance  Q (13×13).
     Position has no direct noise; uncertainty grows via the F[0:3,3:6] = I block.
@@ -397,7 +401,9 @@ def _build_Q(q, dt, sa, sg, sb):
     Q[6:10, 6:10]   = dt * sg**2 * 0.25 * (np.eye(4) - np.outer(q, q))
     # gyro bias bgx, bgy observable via roll/pitch gravity alignment
     Q[10:12, 10:12] = dt * sb**2 * np.eye(2)
-    # bgz (index 12) NOT observable: frozen, no random walk added
+    # bgz: small random walk lets filter slowly estimate yaw bias when yaw is
+    # observed via PnP or velocity-heading updates; sb_z=0 keeps it fully frozen
+    Q[12, 12] = dt * sb_z**2
     return Q
 
 

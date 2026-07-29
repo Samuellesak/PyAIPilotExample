@@ -1,3 +1,4 @@
+import math
 import time
 import numpy as np
 from pymavlink import mavutil
@@ -100,6 +101,13 @@ class Controller:
             print("[Controller] hover_only=true — carrot tracker disabled, "
                   "drone will hold altitude indefinitely", flush=True)
 
+        # Camera tilt matrix (cam→body FRD) — mirrors vision_rx.py, reads cam_tilt_deg from params.
+        _tilt = math.radians(float(param.get('cam_tilt_deg', 20.0)))
+        _st, _ct = math.sin(_tilt), math.cos(_tilt)
+        self._R_cam2body = np.array([[0, _st, _ct],
+                                     [1,  0,   0 ],
+                                     [0, _ct, -_st]], dtype=float)
+
         # Cascade integrators
         self.xi_vel      = np.zeros(3)              # NED velocity integrals [m]
         self.xi_psi      = 0.0                      # yaw integral [rad·s]
@@ -125,6 +133,13 @@ class Controller:
         self._gate_pass_dist    = float(param.get('gate_pass_dist_m', 0.0))
         self._gate_pass_timeout = float(param.get('gate_pass_timeout_sec', 2.0))
         self._wp_pending        = None   # (new_wp, gate_wp_ned, ea, t_fired) or None
+        # RACE_STATUS's active_gate_index as a second, independent gate-pass
+        # trigger alongside COLLISION's gate_passed flag. Confirmed in a flight
+        # log: the sim never sent a single COLLISION message for the whole
+        # flight, but RACE_STATUS's active_gate_index correctly advanced 0->1
+        # right as the drone converged on gate 0 — COLLISION support appears to
+        # be absent/disabled in this sim build, so it can't be the sole trigger.
+        self._last_seen_agi     = -1
 
         # Rate-limited yaw command — initialised at measured yaw on first update
         self._psi_cmd = None
@@ -147,6 +162,7 @@ class Controller:
         self._carrot_active  = False  # True after first frame in carrot mode
         self._hover_entered  = False  # True after first HOVER tick (triggers one-shot reset)
         self._hover_entry_t  = None   # wall-clock time of hover entry (for integrate delay)
+        self._level_done_t   = None   # wall-clock time levelling finished (blip clock starts here)
 
         # Timing diagnostics
         self._last_loop_t = None   # wall time of previous update() call
@@ -242,6 +258,7 @@ class Controller:
         t_elapsed = time.time() - self._t_start
 
         # ── PHASE 1: WAIT ──────────────────────────────────────────────
+        # Motors idle; EKF accumulates static acc/gyro for attitude sysid.
         if t_elapsed < WAIT_PHASE_SEC:
             if _now - getattr(self, '_last_wait_diag_t', 0.0) >= 0.5:
                 self._last_wait_diag_t = _now
@@ -250,13 +267,66 @@ class Controller:
                 theta_deg = np.degrees(_theta_w)
                 _, _qx_w, _qy_w, _ = quat
                 R22_w = max(0.3, 1.0 - 2*(_qx_w*_qx_w + _qy_w*_qy_w))
+                # Sysid: display ground tilt from static acc average (FRD: θ<0 = nose-down).
+                _acc_avg = self.data.get('wait_acc_avg')
+                _sysid_str = ''
+                if _acc_avg is not None:
+                    _g = 9.81
+                    _th_s = float(np.degrees(np.arcsin(np.clip(_acc_avg[0] / _g, -1.0, 1.0))))
+                    _ph_s = float(np.degrees(np.arcsin(
+                        np.clip(_acc_avg[1] / (_g * max(np.cos(np.radians(_th_s)), 0.1)),
+                                -1.0, 1.0))))
+                    _sysid_str = f'  [SYSID tilt θ={_th_s:.1f}° φ={_ph_s:.1f}°]'
                 print(f"[WAIT t={t_elapsed:.2f}s]  "
                       f"roll={phi_deg:.1f}°  pitch={theta_deg:.1f}°  R22={R22_w:.3f}  "
                       f"rates=({rates[0]:.2f},{rates[1]:.2f},{rates[2]:.2f})  "
-                      f"dt={_actual_dt*1000:.1f}ms", flush=True)
+                      f"dt={_actual_dt*1000:.1f}ms{_sysid_str}", flush=True)
             self._send_attitude_target(0.0, 0.0, 0.0, 4.0 * 0.05 * self.T_max)
             time.sleep(DT)
             return
+
+        # ── PHASE 1.5: LEVEL ──────────────────────────────────────────────
+        # Null roll/pitch before the liftoff blip fires. The blip below assumes
+        # "pure vertical" thrust from four equal motors — true only if level. On
+        # the sloped spawn platform the drone is tilted (~17° pitch, measured
+        # during WAIT), so firing the blip as-is injects real horizontal velocity
+        # (sin(tilt) fraction of the impulse). The outer loop then chases that
+        # velocity error by saturating theta_des to its clamp — confirmed root
+        # cause of post-liftoff attitude divergence (theta/phi diverging into the
+        # 100s of degrees within a few seconds of hover entry). Level first, at
+        # hover-neutral thrust (grounded, no climb yet), then blip once level —
+        # this keeps hover_entry_t (and everything timed off it: the blip itself,
+        # imu_ekf's attitude-freeze window, its backup post-blip attitude reset,
+        # and the vision-update settling window) anchored to when the blip
+        # actually fires, so none of that downstream timing needs to change.
+        #
+        # Tell imu_ekf WAIT has truly ended, every tick from here on (idempotent).
+        # imu_ekf's static acc/gyro accumulation (gyro-bias calibration + the
+        # ground-tilt reading used at hover-reset) must stop here, not at
+        # hover_reset_done — that now fires *after* this whole levelling phase,
+        # and letting accumulation run through it would average in real,
+        # intentional rotation, corrupting both the bias estimate and the tilt
+        # reading with motion that isn't the static "resting on the slope" state
+        # they're meant to capture.
+        self.data['wait_phase_done'] = True
+        if self._level_done_t is None:
+            _phi_lv, _theta_lv, _ = quat_to_euler(quat)
+            _level_tol      = np.deg2rad(float(self.param.get('level_tol_deg', 2.0)))
+            _level_elapsed  = t_elapsed - WAIT_PHASE_SEC
+            _level_timeout  = float(self.param.get('level_timeout_sec', 1.5))
+            _levelled = abs(_phi_lv) < _level_tol and abs(_theta_lv) < _level_tol
+            if _levelled or _level_elapsed > _level_timeout:
+                self._level_done_t = time.time()
+                print(f"[CONTROLLER] Pre-blip level "
+                      f"{'done' if _levelled else 'TIMED OUT'} — "
+                      f"phi={np.degrees(_phi_lv):.1f}°  theta={np.degrees(_theta_lv):.1f}°  "
+                      f"t={_level_elapsed:.2f}s", flush=True)
+            else:
+                _p_lv = np.clip(self._K_att * (0.0 - _phi_lv),   -4.0, 4.0)
+                _q_lv = np.clip(self._K_att * (0.0 - _theta_lv), -4.0, 4.0)
+                self._send_attitude_target(_p_lv, _q_lv, 0.0, 4.0 * self.T_hover)
+                time.sleep(DT)
+                return
 
         # ── PHASE 2: HOVER (attitude hold, outer velocity loop disabled) ──
         # Carrot tracker and velocity reference are inactive.
@@ -270,7 +340,12 @@ class Controller:
         if not self._hover_entered:
             self._hover_entered          = True
             self._hover_entry_t          = time.time()
-            self._psi_cmd = np.deg2rad(float(self.param.get('initial_yaw_deg', 0.0)))
+            # hover_target_yaw_deg sets the heading the drone turns to at hover entry
+            # (separate from initial_yaw_deg which is the EKF frame alignment at spawn).
+            _hover_yaw_deg = float(self.param.get(
+                'hover_target_yaw_deg',
+                self.param.get('initial_yaw_deg', 0.0)))
+            self._psi_cmd = np.deg2rad(_hover_yaw_deg)
             self.xi_vel                  = np.zeros(3)
             self.xi_psi                  = 0.0
             if self._controller_type == 2:
@@ -298,33 +373,28 @@ class Controller:
         hover_elapsed = (time.time() - self._hover_entry_t) if self._hover_entry_t else 0.0
         in_hover = self._hover_only
 
-        # ── Liftoff blip: high-thrust burst right at WAIT→HOVER transition ──
-        # All four motors commanded equally (no rate setpoints) for pure vertical force.
-        _blip_dur  = float(self.param.get('blip_dur_sec',     0.1))
-        _blip_frac = float(self.param.get('blip_thrust_frac', 0.8))
-        if hover_elapsed < _blip_dur:
-            self._send_motors_norm(np.full(4, _blip_frac))
-            time.sleep(DT)
-            return
-
+        # No more liftoff blip or post-blip attitude freeze. The drone is already
+        # level (PHASE 1.5) and cascade control now ramps in its own authority
+        # (see _outer_loop's _att_ramp, which scales K_att/Kp_vN/Kp_vE and the
+        # horizontal reference itself over 2 s) — that ramp does the same job the
+        # blip+freeze used to (avoid a violent initial command) without an
+        # open-loop thrust burst or a window where the cascade flies blind on a
+        # stale attitude estimate. Kp_vD (altitude) was never ramped, so vertical
+        # control — and therefore actual liftoff authority — is already at full
+        # strength from the very first cascade tick.
         v_ref_for_gains = np.zeros(3)
         if in_hover:
-            # During hover hold, pre-rotate _psi_cmd toward the first waypoint so the
-            # drone is already facing the right direction when carrot activates.
-            r1 = self.tracker.waypoints[min(1, self.tracker.n_waypoints - 1)]
-            to_wp = r1[:2] - pos_ned[:2]   # NE only
-            if np.linalg.norm(to_wp) > 0.5:
-                psi_to_wp = np.arctan2(to_wp[1], to_wp[0])
-                dpsi = _wrap_pi(psi_to_wp - self._psi_cmd)
-                self._psi_cmd = _wrap_pi(
-                    self._psi_cmd + np.clip(dpsi,
-                                            -PSI_RATE_MAX * _actual_dt,
-                                             PSI_RATE_MAX * _actual_dt))
+            # hover_only=True: hold psi_cmd at initial_yaw_deg for a stable hover.
+            pass
         else:
             # Carrot tracking: use EKF position to follow the waypoint path.
             if not self._carrot_active:
                 self._carrot_active  = True
                 self._v_ref_smooth   = None   # reset LP so it init from first carrot reference
+                # Sync to whatever active_gate_index already is (e.g. 0, before any
+                # gate has been passed) so the RACE_STATUS-advance check below only
+                # fires on a real *increase* from here, not on this baseline value.
+                self._last_seen_agi = int(self.data.get('active_gate_index', -1))
                 # params.yaml waypoints are in WORLD NED (WP0 = launch point).
                 # The EKF has been zeroed to LOCAL NED at hover entry.  Convert
                 # all waypoints to local once so the tracker stays frame-consistent.
@@ -357,11 +427,21 @@ class Controller:
             # Refine target waypoint to PnP-measured gate position in local NED.
             # gate_local = pos_ned (EKF local) + R_b2n @ R_cam2body @ tvec_cam
             # This uses only what the camera sees — no track data dependency.
+            # Excludes lk_bridged frames: this path has none of the EKF vision
+            # feed's protections (LK-bridge exclusion, PnP dual-solution
+            # hysteresis, yaw smoothing, frame dedup) since it reads tvec_cam
+            # directly rather than going through _vision_ekf_update. An LK-bridged
+            # frame — tracked corners with no fresh YOLO backing, possibly no
+            # longer actually on the gate — would otherwise snap the live carrot
+            # target straight to a bad position with zero smoothing. Confirmed in
+            # a flight log: right after passing gate 0, the carrot's committed
+            # target (waypoints[wp]) ended up far closer to the start than the
+            # true next gate, sending the drone essentially back the way it came.
             if not self._debug_waypoints_only:
-                if det.get('detected') and det.get('tvec_cam') is not None:
+                if (det.get('detected') and det.get('tvec_cam') is not None
+                        and not det.get('lk_bridged', False)):
                     _tvec = np.asarray(det['tvec_cam'], dtype=float)
-                    # cam→body: body_x=cam_z(fwd), body_y=cam_x(right), body_z=cam_y(down)
-                    _t_body = np.array([_tvec[2], _tvec[0], _tvec[1]])
+                    _t_body = self._R_cam2body @ _tvec
                     R_bn = _rot_from_quat(quat)
                     R_nb = R_bn.T
                     self.tracker.waypoints[self.tracker.wp] = pos_ned + R_nb @ _t_body
@@ -385,9 +465,13 @@ class Controller:
                            if (det.get('pnp_locked') and not self._debug_waypoints_only)
                            else None)
 
-            # Publish current mode for the vision debug overlay.
+            # Publish current mode for the vision debug overlay. TRANSITION
+            # (the carrot's commit phase — pinned to the gate centre for final
+            # approach, see carrot_tracker.py) takes priority over PNP/HOLD/CARROT
+            # since it's the more specific, more relevant state near the gate.
             self.data['vis_ctrl_mode'] = (
-                'PNP'    if _fresh_tvec is not None
+                'TRANSITION' if self.tracker.committed
+                else 'PNP'    if _fresh_tvec is not None
                 else 'HOLD'   if self._vis_tvec_hold is not None
                 else 'CARROT'
             )
@@ -408,11 +492,11 @@ class Controller:
 
             if self._vis_tvec_hold is not None:
                 _tvec_v  = self._vis_tvec_hold
-                # cam→body: x_b(fwd)=cam_z, y_b(right)=cam_x
-                _horiz_v = float(np.sqrt(_tvec_v[2]**2 + _tvec_v[0]**2))
+                _t_body_v = self._R_cam2body @ _tvec_v
+                _horiz_v = float(np.sqrt(_t_body_v[0]**2 + _t_body_v[1]**2))
                 if _horiz_v > 1.0:   # gate at least 1 m away horizontally
-                    _dir_xb = _tvec_v[2] / _horiz_v   # body-forward component
-                    _dir_yb = _tvec_v[0] / _horiz_v   # body-right  component
+                    _dir_xb = _t_body_v[0] / _horiz_v   # body-forward component
+                    _dir_yb = _t_body_v[1] / _horiz_v   # body-right  component
                     _psi_v  = quat_to_euler(quat)[2]
                     _cp, _sp = np.cos(_psi_v), np.sin(_psi_v)
                     _dir_n  =  _cp * _dir_xb - _sp * _dir_yb
@@ -458,11 +542,23 @@ class Controller:
                 v_cmd      = v_ref_for_gains,
                 carrot_pos = self.tracker.carrot_pos,
                 drone_pos  = pos_ned,
+                mode       = self.data.get('vis_ctrl_mode', ''),
             )
 
-        # Advance carrot waypoint when sim signals gate passage.
-        if self.data.pop('gate_passed', False):
-            agi    = self.data.get('active_gate_index', -1)
+        # Advance carrot waypoint when sim signals gate passage — via either
+        # COLLISION (gate_passed) or a RACE_STATUS active_gate_index increase.
+        # See _last_seen_agi's init comment for why both are needed.
+        _agi_now      = int(self.data.get('active_gate_index', -1))
+        _agi_advanced = _agi_now > self._last_seen_agi
+        self._last_seen_agi = _agi_now
+        _via_collision = self.data.pop('gate_passed', False)
+        if _via_collision or _agi_advanced:
+            # Label which signal actually fired — id=None from COLLISION is
+            # normal on sim builds that don't send it; RACE_STATUS (agi=N) is
+            # the primary trigger there. See _last_seen_agi's init comment.
+            _trigger = (f"COLLISION id={self.data.get('last_gate_id')}"
+                        if _via_collision else f"RACE_STATUS agi={_agi_now}")
+            agi    = _agi_now
             new_wp = self.tracker.wp + 1
             if agi >= 0:
                 new_wp = max(new_wp, int(agi) + 1)
@@ -476,13 +572,13 @@ class Controller:
                     _len = float(np.linalg.norm(_d))
                     _ea  = _d / _len if _len > 1e-6 else _d
                     self._wp_pending = (new_wp, _r1.copy(), _ea, time.time())
-                    print(f"[GATE PASSED id={self.data.get('last_gate_id')}] "
+                    print(f"[GATE PASSED {_trigger}] "
                           f"wp advance to {new_wp} pending ({self._gate_pass_dist:.1f} m clearance)",
                           flush=True)
                 else:
                     self.tracker.wp = new_wp
                     self._wp_pending = None
-                    print(f"[GATE PASSED id={self.data.get('last_gate_id')}] "
+                    print(f"[GATE PASSED {_trigger}] "
                           f"tracker.wp → {self.tracker.wp}", flush=True)
 
         # Resolve pending wp advance: fire when drone clears gate by gate_pass_dist_m
@@ -498,27 +594,11 @@ class Controller:
                 print(f"[WP ADVANCE] tracker.wp → {_new_wp}  "
                       f"(along={_along:.1f} m  elapsed={_elapsed:.2f} s)", flush=True)
 
-        # Path-progress fallback: advance wp when drone clears the target waypoint by
-        # gate_pass_dist_m along the segment.  Fires when the sim does not send COLLISION
-        # (e.g. before race_started=True) or when COLLISION never arrives.
-        # Suppressed while a collision-triggered pending advance is active — in that
-        # case the pending check above already manages the transition.
-        if (self._carrot_active and not in_hover
-                and self.tracker.wp < self.tracker.n_waypoints - 1
-                and self._wp_pending is None):
-            _r0  = np.asarray(self.tracker.waypoints[self.tracker.wp - 1], dtype=float)
-            _r1  = np.asarray(self.tracker.waypoints[self.tracker.wp],     dtype=float)
-            _seg = _r1 - _r0
-            _seg_len = float(np.linalg.norm(_seg))
-            if _seg_len > 0.1:
-                _lam = float(np.dot(pos_ned - _r0, _seg / _seg_len))
-                if _lam >= _seg_len + self._gate_pass_dist:
-                    _nwp = self.tracker.wp + 1
-                    if _nwp > self.tracker.wp:
-                        self.tracker.wp = _nwp
-                        self._wp_transition_reset()
-                        print(f"[PATH ADVANCE wp→{self.tracker.wp}]  "
-                              f"lambda={_lam:.1f}/{_seg_len:.1f}m", flush=True)
+        # No position-based fallback advance anymore — waypoint advance is driven
+        # solely by the gate_passed (COLLISION) message above. A geometry-only
+        # fallback can fire on noisy/biased position even when the drone hasn't
+        # actually passed the gate, which is exactly the kind of spurious
+        # advance we don't want feeding into the commit-phase logic below.
 
         _, _, psi_meas = quat_to_euler(quat)
 
@@ -548,7 +628,9 @@ class Controller:
                 _vis_log = self.data.get('vis_ctrl_mode', '') if not in_hover else ''
                 self._logger.log_cascade(
                     time_ms       = _now * 1e3,
-                    v_ned_ref     = v_ref_for_gains,
+                    # Post-tau_ref_smooth value (what the loop actually tracks),
+                    # not the raw carrot reference — see _dbg's init comment.
+                    v_ned_ref     = dbg.get('v_ned_ref_smoothed', v_ref_for_gains),
                     v_ned_meas    = v_ned,
                     phi_des_deg   = dbg.get('phi_des_deg',   0.0),
                     theta_des_deg = dbg.get('theta_des_deg', 0.0),
@@ -622,16 +704,35 @@ class Controller:
     def _wp_transition_reset(self):
         """Called the instant tracker.wp advances to a new segment.
 
-        1. Flush xi_vel: the integrator was compensating old-segment drag and now
-           fights the new reference direction.  P-term alone starts the turn.
-        2. Zero the lag-FF derivative for one tick: set _v_ref_prev = _v_ref_smooth
-           so dv_ref/dt = 0 on the first post-transition call, preventing a spike
-           from any small residual step in the smoothed reference.
-        Do NOT reseed _v_ref_smooth — the LP filter carries over naturally and the
-        carrot extrapolation (past-gate fix in carrot_tracker.py) keeps the
-        reference moving forward during the delay window.
+        Project horizontal integrators (N, E) onto the new segment tangent:
+          - Along-track component is preserved  (drag compensation still valid).
+          - Cross-track component is discarded  (would fight the turn).
+          cos(θ) scaling means: small direction change → near-full preservation;
+          90° turn → full zero.  Hard-zero was the prior behaviour (θ treated as 90°
+          always), which created a step in controller output at every transition.
+
+        Vertical integrator xi_vel[2] is kept unchanged: it compensates gravity
+        imbalance and is independent of horizontal heading.
+
+        Also zero the lag-FF derivative for one tick so dv_ref/dt = 0 on the first
+        post-transition call (prevents spike from any residual step in smoothed ref).
         """
-        self.xi_vel[:] = 0.0
+        wp  = self.tracker.wp
+        r0  = np.asarray(self.tracker.waypoints[wp - 1], dtype=float)
+        r1  = np.asarray(self.tracker.waypoints[wp],     dtype=float)
+        seg = r1 - r0
+        seg_len = float(np.linalg.norm(seg))
+        if seg_len > 1e-6:
+            ea_h   = seg[:2] / seg_len             # horizontal tangent (N, E)
+            ea_h  /= max(float(np.linalg.norm(ea_h)), 1e-9)
+            xi_proj = float(np.dot(self.xi_vel[:2], ea_h))
+            self.xi_vel[0] = xi_proj * ea_h[0]
+            self.xi_vel[1] = xi_proj * ea_h[1]
+        else:
+            self.xi_vel[0] = 0.0
+            self.xi_vel[1] = 0.0
+        # xi_vel[2] (vertical) is direction-independent — preserve it
+
         if self._v_ref_smooth is not None:
             self._v_ref_prev = self._v_ref_smooth.copy()
 
@@ -640,6 +741,13 @@ class Controller:
     # ------------------------------------------------------------------
 
     def _outer_loop(self, v_ned_ref, psi_ref, v_ned_meas, quat, psi_meas, R22, dt, hover_t):
+        # Coordinate convention (body FRD, world NED):
+        #   φ>0 right-wing-down   θ<0 nose-down   ψ: 0=N CW+
+        #   θ_des = −a_xb/g  →  nose-UP (θ>0) brakes northward drift  ✓
+        #   q_des>0 → nose-UP rate to sim (confirmed empirically from cascade logs)
+        #   r_des sign: GT sends −r_des (psi_meas = −psi_NED from ATTITUDE);
+        #               non-GT sends +r_des (psi_meas standard NED from EKF gyros)
+
         # ── Gain scheduling ───────────────────────────────────────────────────
         # Interpolate K_att and Kp_v* linearly with |v_ned_ref| so gains ramp up
         # as commanded speed increases, improving attitude bandwidth at high speed.
@@ -653,6 +761,36 @@ class Controller:
         _Kp_vN_eff = self._Kp_vN + _gs_alpha * (self._Kp_vN_hi - self._Kp_vN)
         _Kp_vE_eff = self._Kp_vE + _gs_alpha * (self._Kp_vE_hi - self._Kp_vE)
         _Kp_vD_eff = self._Kp_vD + _gs_alpha * (self._Kp_vD_hi - self._Kp_vD)
+
+        # ── Post-hover-entry ramp ────────────────────────────────────────────────
+        # No blip/freeze anymore (see PHASE 1.5 / hover-entry in update()) — the
+        # drone is level and cascade control starts on the very next tick. Ramp
+        # both the attitude gain and the horizontal velocity P gains from 0 to
+        # full over 2 s anyway, so theta_des stays near 0 at the start and builds
+        # up gradually, preventing the 60°-clip and the resulting hard pitch
+        # command that a full-strength response to a stepped-in reference would
+        # otherwise produce. Kp_vD (altitude) is NOT ramped — altitude hold must
+        # stay active for liftoff.
+        _att_ramp = float(np.clip(hover_t / 2.0, 0.0, 1.0))
+        _K_att_eff  *= _att_ramp
+        _Kp_vN_eff  *= _att_ramp
+        _Kp_vE_eff  *= _att_ramp
+
+        # Ramp the horizontal reference itself alongside the gains above, not just
+        # the gains. Ramping gain alone leaves e_vel at its full magnitude (carrot
+        # hands over a full-value reference, e.g. -5 m/s, from the first tick) —
+        # so even a partially-ramped Kp_vN still multiplies a ~full-size error,
+        # producing a steadily growing theta_des that reaches MAX_TILT within
+        # ~1-1.5s regardless of the gain ramp (confirmed in flight logs: growth
+        # tracked _att_ramp almost exactly, with model_predict, the derivative
+        # feedforward, and the one-tick kick all independently ruled out first).
+        # Scaling v_ned_ref down here means e_vel starts small and grows together
+        # with the gain, keeping their product — the commanded tilt — bounded
+        # through the same transition instead of just delaying when it saturates.
+        # D (altitude) is excluded, matching Kp_vD staying unramped below.
+        v_ned_ref = v_ned_ref.copy()
+        v_ned_ref[0] *= _att_ramp
+        v_ned_ref[1] *= _att_ramp
 
         # Low-pass filter all three EKF velocity channels before computing errors.
         # Horizontal (vN, vE): longer τ because the cold-start spurious velocity
@@ -756,7 +894,13 @@ class Controller:
         self._T_coll_filt = alpha_T * self._T_coll_filt + (1.0 - alpha_T) * T_raw
         T_collective = self._T_coll_filt
 
-        # Cache for logger
+        # Cache for logger. v_ned_ref_smoothed is the POST-tau_ref_smooth value
+        # actually used below for e_vel/feedforward — distinct from the caller's
+        # raw v_ref_for_gains (what log_cascade used to log). Confirmed in a
+        # flight log: at a waypoint transition, logged vD_ref jumped -0.20 -> 1.26
+        # in one tick with vD_meas responding smoothly and gradually right through
+        # it — the "discontinuity" was the log showing the pre-filter carrot
+        # target, not an actual step in what the controller commanded.
         self._dbg = {
             'phi_des_deg':   float(np.degrees(phi_des)),
             'theta_des_deg': float(np.degrees(theta_des)),
@@ -764,6 +908,7 @@ class Controller:
             'theta_meas_deg':float(np.degrees(theta_meas)),
             'psi_meas_deg':  float(np.degrees(psi_meas)),
             'psi_ref_deg':   float(np.degrees(psi_ref)),
+            'v_ned_ref_smoothed': v_ned_ref.copy(),
         }
 
         return p_des, q_des, r_des, T_collective
@@ -779,10 +924,13 @@ class Controller:
         thrust_norm = T_collective [N, total over 4 motors] / (4 * T_max_motor).
         """
         thrust_norm = float(np.clip(T_collective / (4.0 * self.T_max), 0.0, 1.0))
-        # Sign map (mavlink_rx negates sim pitch → sign_q now +1, sign_r still -1):
-        #   p: FRD-compatible → send as-is
-        #   q: FRD-compatible after pitch sign fix in mavlink_rx → send as-is
-        #   r: reversed in sim → negate
+        # Body rates p/q/r sent as-is to the sim's inner rate controller.
+        # r_des is mode-dependent because psi_meas convention differs:
+        #   GT   — ATTITUDE yaw is NOT negated in mavlink_rx → psi_meas = −psi_NED
+        #          → r_des is sign-inverted → negate before send
+        #   non-GT — EKF gyro integration → psi_meas = standard NED → send as-is
+        _gt_mode = bool(self.param.get('ground_truth_mode', False))
+        _r_cmd   = float(-r_des if _gt_mode else r_des)
         self.sim_conn.mav.set_attitude_target_send(
             int(time.time() * 1e3) & 0xFFFFFFFF,
             self.sim_conn.target_system,
@@ -791,7 +939,7 @@ class Controller:
             [1.0, 0.0, 0.0, 0.0],      # attitude quaternion (ignored)
             float(p_des),
             float(q_des),
-            float(-r_des),
+            _r_cmd,
             thrust_norm,
         )
         if self._logger is not None:

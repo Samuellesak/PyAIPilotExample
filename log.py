@@ -54,6 +54,7 @@ class Logger:
             "vcx": [], "vcy": [], "vcz": [],
             "cx":  [], "cy":  [], "cz":  [],   # carrot NED position
             "dx":  [], "dy":  [], "dz":  [],   # drone NED position
+            "mode": [],   # vis_ctrl_mode: PNP/HOLD/CARROT/TRANSITION
         }
 
         # Cascade controller signal log — one row per control tick (~250 Hz)
@@ -136,6 +137,9 @@ class Logger:
             "vel_N": [], "vel_E": [], "vel_D": [], "speed_ms": [],
         }
 
+        # Per-saved-frame sim timestamps — written to frame_timestamps.csv
+        self._frame_ts = []   # list of {'frame_id': int, 'sim_time_ns': int}
+
         print(f"Logger: session directory -> {self.session_dir}")
 
     # ------------------------------------------------------------------
@@ -197,7 +201,7 @@ class Logger:
             d["u0"].append(float(u[0])); d["u1"].append(float(u[1]))
             d["u2"].append(float(u[2])); d["u3"].append(float(u[3]))
 
-    def log_carrot(self, time_ms, wp, v_cmd, carrot_pos=None, drone_pos=None):
+    def log_carrot(self, time_ms, wp, v_cmd, carrot_pos=None, drone_pos=None, mode=''):
         """Accumulate one carrot-tracker sample."""
         with self._lock:
             d = self._carrot
@@ -214,6 +218,7 @@ class Logger:
             d["dx"].append(float(dp[0]))
             d["dy"].append(float(dp[1]))
             d["dz"].append(float(dp[2]))
+            d["mode"].append(str(mode))
 
     def log_ekf(self, t_us, wall_t, x, P_diag,
                 acc_applied, acc_innov,
@@ -293,11 +298,12 @@ class Logger:
             d["FL"].append(float(FL)); d["FR"].append(float(FR))
             d["BL"].append(float(BL)); d["BR"].append(float(BR))
 
-    def log_frame(self, frame_id, img, force=False, suffix=""):
+    def log_frame(self, frame_id, img, force=False, suffix="", sim_time_ns=None):
         """
         Save a camera frame as JPEG.
         force=True  : always save (used for detected gates).
         suffix      : optional filename suffix, e.g. "_mask" for orange-mask images.
+        sim_time_ns : simulation epoch timestamp [ns] from UDP header (used for label alignment).
         Otherwise saves every 30th frame.
         """
         with self._lock:
@@ -306,6 +312,10 @@ class Logger:
         if save_this:
             path = os.path.join(self.frames_dir, f"frame_{frame_id:06d}{suffix}.jpg")
             cv2.imwrite(path, img)
+            if sim_time_ns is not None:
+                with self._lock:
+                    self._frame_ts.append({'frame_id': frame_id,
+                                           'sim_time_ns': int(sim_time_ns)})
 
     def log_vision(self, wall_t, frame_id, detected,
                    conf=0.0, bb=None, corners=None,
@@ -400,6 +410,7 @@ class Logger:
         self._write_cascade_csv()
         self._write_vision_csv()
         self._plot_vision()
+        self._write_frame_timestamps_csv()
         print(f"Logger: all data saved to {self.session_dir}")
 
     # ------------------------------------------------------------------
@@ -606,6 +617,26 @@ class Logger:
         ax_wp.step(t, d["wp"], label="waypoint index", where="post", linewidth=1.2)
         ax_wp.set_ylabel("Waypoint index")
         ax_wp.set_title("Carrot Tracker — Active Waypoint")
+
+        # Shade TRANSITION (commit-phase) spans so it's visible against the
+        # waypoint timeline when reviewing a flight after the fact.
+        _modes = d.get("mode", [])
+        if _modes:
+            _in_span = False
+            _span_start = None
+            _labelled = False
+            for i, _m in enumerate(_modes):
+                if _m == 'TRANSITION' and not _in_span:
+                    _in_span, _span_start = True, t[i]
+                elif _m != 'TRANSITION' and _in_span:
+                    ax_wp.axvspan(_span_start, t[i], color='orange', alpha=0.15,
+                                  label=None if _labelled else 'TRANSITION')
+                    _labelled = True
+                    _in_span = False
+            if _in_span:
+                ax_wp.axvspan(_span_start, t[-1], color='orange', alpha=0.15,
+                              label=None if _labelled else 'TRANSITION')
+
         ax_wp.legend(loc="upper left")
         ax_wp.grid(True, alpha=0.4)
 
@@ -682,7 +713,7 @@ class Logger:
             f.write("time_s,wp,"
                     "vc_N_ms,vc_E_ms,vc_D_ms,v_cmd_ms,"
                     "carrot_N_m,carrot_E_m,carrot_D_m,"
-                    "drone_N_m,drone_E_m,drone_D_m\n")
+                    "drone_N_m,drone_E_m,drone_D_m,mode\n")
             for i in range(len(d["t"])):
                 t_s   = (d["t"][i] - t0) / 1e3
                 v_mag = (d["vcx"][i]**2 + d["vcy"][i]**2 + d["vcz"][i]**2) ** 0.5
@@ -692,7 +723,8 @@ class Logger:
                     f"{d['vcx'][i]:.4f},{d['vcy'][i]:.4f},{d['vcz'][i]:.4f},"
                     f"{v_mag:.4f},"
                     f"{d['cx'][i]:.4f},{d['cy'][i]:.4f},{d['cz'][i]:.4f},"
-                    f"{d['dx'][i]:.4f},{d['dy'][i]:.4f},{d['dz'][i]:.4f}\n"
+                    f"{d['dx'][i]:.4f},{d['dy'][i]:.4f},{d['dz'][i]:.4f},"
+                    f"{d['mode'][i]}\n"
                 )
         print(f"Logger: carrot CSV -> {out}")
 
@@ -849,6 +881,18 @@ class Logger:
         plt.close(fig2)
         print(f"Logger: EKF covariance plot -> {out2}")
 
+    def _write_frame_timestamps_csv(self):
+        with self._lock:
+            rows = list(self._frame_ts)
+        if not rows:
+            return
+        out = os.path.join(self.session_dir, "frame_timestamps.csv")
+        with open(out, "w") as f:
+            f.write("frame_id,sim_time_ns\n")
+            for r in rows:
+                f.write(f"{r['frame_id']},{r['sim_time_ns']}\n")
+        print(f"Logger: frame timestamps CSV -> {out}")
+
     def _write_ekf_csv(self):
         with self._lock:
             d = {k: list(v) for k, v in self._ekf.items()}
@@ -858,7 +902,7 @@ class Logger:
         out = os.path.join(self.session_dir, "ekf.csv")
         with open(out, "w") as f:
             f.write(
-                "time_s,t_us,"
+                "time_s,t_us,wall_t,"
                 "pN,pE,pD,"
                 "vN,vE,vD,"
                 "qw,qx,qy,qz,"
@@ -877,7 +921,7 @@ class Logger:
                 phi, theta, psi = self._euler_from_quat(
                     d["qw"][i], d["qx"][i], d["qy"][i], d["qz"][i])
                 f.write(
-                    f"{t_s:.6f},{d['t_us'][i]},"
+                    f"{t_s:.6f},{d['t_us'][i]},{d['wall_t'][i]:.6f},"
                     f"{d['pN'][i]:.4f},{d['pE'][i]:.4f},{d['pD'][i]:.4f},"
                     f"{d['vN'][i]:.5f},{d['vE'][i]:.5f},{d['vD'][i]:.5f},"
                     f"{d['qw'][i]:.6f},{d['qx'][i]:.6f},{d['qy'][i]:.6f},{d['qz'][i]:.6f},"
