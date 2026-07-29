@@ -62,6 +62,32 @@ class QuadEKF:
         if self._sb_z == 0.0:
             self.P[12, 12] = 0.0         # bgz frozen (no yaw sensor)
 
+        # Adaptive gate state (position/velocity/yaw updates only — see
+        # _effective_gate). A gate rejection is meant as an outlier safety
+        # net, but if the FILTER (not the measurement) has drifted past
+        # gate_dist, every subsequent — even perfectly correct — measurement
+        # also looks like an outlier, and a fixed gate becomes a one-way door
+        # with no way back. Tracking a per-channel consecutive-rejection
+        # streak and widening the effective gate once it runs long enough
+        # lets a persistently-diverged filter accept a large correction and
+        # snap back, rather than staying locked out for the rest of the flight.
+        self._pos_reject_streak = 0
+        self._vel_reject_streak = 0
+        self._yaw_reject_streak = 0
+
+    _GATE_WIDEN_AFTER = 10    # consecutive rejections before the gate starts widening
+    _GATE_WIDEN_STEP  = 0.5  # gate-multiples added per rejection beyond that
+    _GATE_WIDEN_MAX   = 15.0 # cap on the widening multiplier
+
+    def _effective_gate(self, gate_dist, streak):
+        """Widen gate_dist after a long run of consecutive rejections (see
+        __init__'s note on the adaptive-gate state)."""
+        extra = streak - self._GATE_WIDEN_AFTER
+        if extra <= 0:
+            return gate_dist
+        mult = min(1.0 + self._GATE_WIDEN_STEP * extra, self._GATE_WIDEN_MAX)
+        return gate_dist * mult
+
     # ── Public API ────────────────────────────────────────────────────────
 
     def predict(self, gyro_raw, acc_raw, dt):
@@ -102,6 +128,8 @@ class QuadEKF:
         Skipped when |acc_norm − g| > threshold to avoid contaminating
         the estimate with large linear accelerations.
         """
+        if not np.all(np.isfinite(acc_raw)):
+            return False, 0.0
         acc_norm = float(np.linalg.norm(acc_raw))
         if abs(acc_norm - self._g) > threshold:
             return False, 0.0
@@ -127,6 +155,8 @@ class QuadEKF:
         Fires only when the drone appears stationary (low gyro + gravity-aligned acc
         AND the EKF's own velocity estimate is near zero).
         """
+        if not np.all(np.isfinite(gyro_raw)) or not np.all(np.isfinite(acc_raw)):
+            return False, 0.0
         gyro_mag = float(np.linalg.norm(gyro_raw))
         acc_norm = float(np.linalg.norm(acc_raw))
         vel_mag  = float(np.linalg.norm(self.x[self._IV]))
@@ -143,13 +173,27 @@ class QuadEKF:
     def update_position(self, pos_ned_meas, sigma_pos=0.5, gate_dist=10.0):
         """
         NED position measurement from visual PnP against a known gate landmark.
-        Rejects innovations larger than gate_dist metres (outlier/bad PnP).
+        Rejects innovations larger than gate_dist metres (outlier/bad PnP), but
+        the effective gate widens after a long run of consecutive rejections
+        (see __init__'s note) so a diverged filter can eventually recover.
         Returns (applied: bool, innov_norm: float).
         """
-        innov = np.asarray(pos_ned_meas, dtype=float) - self.x[self._IP]
+        pos_ned_meas = np.asarray(pos_ned_meas, dtype=float)
+        if not np.all(np.isfinite(pos_ned_meas)):
+            # A non-finite measurement (e.g. a degenerate PnP solve) must never
+            # reach the gate check below: `nan > gate_dist` is False in numpy,
+            # so a NaN innovation would silently pass the gate and inject NaN
+            # straight into self.x via _apply_update, corrupting the filter
+            # permanently. Reject outright and don't count it toward the
+            # reject streak — it's not a "far away" measurement, just garbage.
+            return False, float('nan')
+        innov = pos_ned_meas - self.x[self._IP]
         innov_norm = float(np.linalg.norm(innov))
-        if innov_norm > gate_dist:
+        eff_gate = self._effective_gate(gate_dist, self._pos_reject_streak)
+        if innov_norm > eff_gate:
+            self._pos_reject_streak += 1
             return False, innov_norm
+        self._pos_reject_streak = 0
 
         H       = np.zeros((3, self.N))
         H[0, 0] = H[1, 1] = H[2, 2] = 1.0   # measures position states 0:3
@@ -162,13 +206,21 @@ class QuadEKF:
     def update_velocity(self, vel_ned_meas, sigma_vel=1.0, gate_dist=5.0):
         """
         NED velocity measurement derived from finite-differencing consecutive PnP positions.
-        Rejects innovations larger than gate_dist m/s (outlier/dropped frame).
+        Rejects innovations larger than gate_dist m/s (outlier/dropped frame), but
+        the effective gate widens after a long run of consecutive rejections
+        (see __init__'s note) so a diverged filter can eventually recover.
         Returns (applied: bool, innov_norm: float).
         """
-        innov = np.asarray(vel_ned_meas, dtype=float) - self.x[self._IV]
+        vel_ned_meas = np.asarray(vel_ned_meas, dtype=float)
+        if not np.all(np.isfinite(vel_ned_meas)):
+            return False, float('nan')   # see update_position's note on why this guard exists
+        innov = vel_ned_meas - self.x[self._IV]
         innov_norm = float(np.linalg.norm(innov))
-        if innov_norm > gate_dist:
+        eff_gate = self._effective_gate(gate_dist, self._vel_reject_streak)
+        if innov_norm > eff_gate:
+            self._vel_reject_streak += 1
             return False, innov_norm
+        self._vel_reject_streak = 0
 
         H       = np.zeros((3, self.N))
         H[0, 3] = H[1, 4] = H[2, 5] = 1.0   # measures velocity states 3:6
@@ -181,9 +233,12 @@ class QuadEKF:
         """
         NED yaw measurement [rad] from PnP + known gate orientation.
         Uses the linearised Jacobian of yaw(q) w.r.t. the quaternion state.
-        Wraps innovation to [-π, π].  Rejects |innov| > gate_dist.
+        Wraps innovation to [-π, π].  Rejects |innov| > gate_dist, widening
+        after a long run of consecutive rejections (see __init__'s note).
         Returns (applied: bool, innov_abs: float).
         """
+        if not np.isfinite(yaw_meas):
+            return False, float('nan')   # see update_position's note on why this guard exists
         qw, qx, qy, qz = self.x[self._IQ]
         f = 2.0 * (qw * qz + qx * qy)
         g = 1.0 - 2.0 * (qy * qy + qz * qz)
@@ -191,8 +246,11 @@ class QuadEKF:
 
         innov = float(yaw_meas) - yaw_est
         innov = (innov + np.pi) % (2.0 * np.pi) - np.pi   # wrap to [-π, π]
-        if abs(innov) > gate_dist:
+        eff_gate = self._effective_gate(gate_dist, self._yaw_reject_streak)
+        if abs(innov) > eff_gate:
+            self._yaw_reject_streak += 1
             return False, abs(innov)
+        self._yaw_reject_streak = 0
 
         denom = f * f + g * g + 1e-12
         H = np.zeros((1, self.N))
@@ -215,6 +273,9 @@ class QuadEKF:
             [1.0**2] * 3 + [0.5**2] * 3 + [0.1**2] * 4 + [0.05**2] * 3)
         if self._sb_z == 0.0:
             self.P[12, 12] = 0.0                         # bgz: frozen
+        self._pos_reject_streak = 0
+        self._vel_reject_streak = 0
+        self._yaw_reject_streak = 0
 
     def set_yaw(self, psi):
         """

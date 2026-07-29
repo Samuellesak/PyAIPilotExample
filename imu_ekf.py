@@ -109,6 +109,15 @@ class IMUEKFHandler:
         self._mp_shadow_file    = None
         self._mp_shadow_path    = None
         self._v_model_ned       = None   # integrated model velocity [m/s] in NED
+
+        # Motor first-order lag + accelerometer bias — both identified offline
+        # by fit_shadow.py. tau_motor is a real physical param (already in
+        # params.yaml); accel_bias is diagnostic/session-specific (fit_shadow.py
+        # never auto-writes it — only via its --write-bias flag) so it defaults
+        # to zero unless the user explicitly opts a trusted fit into params.yaml.
+        self._tau_motor  = float(param.get('tau_motor', 0.05))
+        self._accel_bias = np.array(param.get('accel_bias', [0.0, 0.0, 0.0]), dtype=float)
+        self._T_actual   = None   # lag-filtered thrust state [N], None until first tick
         if self._mp_shadow_enabled:
             import csv, os
             _dir = (logger.session_dir
@@ -304,11 +313,22 @@ class IMUEKFHandler:
                 _T_max   = float(self._param.get('T_max_motor', 49.9))
                 _T_total = float(np.sum(_act['actuator'][:4])) * _T_max
                 if _T_total > 1.0:
+                    # First-order motor lag: commanded thrust != actual thrust
+                    # (dyn.dyn_lag's ODE, applied here to the live model_predict
+                    # path — previously only the offline fit_shadow.py model
+                    # accounted for this, leaving this path assuming instant
+                    # thrust response).
+                    if self._T_actual is None:
+                        self._T_actual = _T_total
+                    else:
+                        _alpha = float(np.clip(dt / max(self._tau_motor, 1e-6), 0.0, 1.0))
+                        self._T_actual += (_T_total - self._T_actual) * _alpha
+
                     _R_nb      = _dyn_quat_to_R(self._ekf.x[6:10])
                     _vel_b     = _R_nb @ self._ekf.x[3:6]
                     _F_drag    = -self._param['Dv'] @ (np.abs(_vel_b) * _vel_b)
-                    acc_model  = ((np.array([0.0, 0.0, -_T_total]) + _F_drag)
-                                  / float(self._param['m']))
+                    acc_model  = ((np.array([0.0, 0.0, -self._T_actual]) + _F_drag)
+                                  / float(self._param['m'])) + self._accel_bias
                     # Shadow log: compare model vs raw IMU (every 10th tick ≈ 25 Hz)
                     if _use_shd and self._hover_reset_done and self._mp_shadow_writer is not None:
                         # Integrate model velocity in NED at every IMU tick for accuracy.
@@ -535,6 +555,33 @@ class IMUEKFHandler:
 
         # ── EKF log ───────────────────────────────────────────────────────────
         if self._logger is not None:
+            # Diagnostic snapshot for ekf_shadow.py's offline replay: raw
+            # (unrotated) GT and thrust, logged every tick regardless of
+            # ground_truth_mode/use_model_predict/model_predict_shadow so a
+            # normal flight always has enough data for an offline EKF replay.
+            # Deliberately duplicates a few lines from the use_model_predict/
+            # model_predict_shadow block above rather than reusing it, so this
+            # addition can't affect that block's gating or the live shadow log.
+            _latest_diag = self._data.get('mavlink', {}).get('latest', {})
+            _att_diag = _latest_diag.get('ATTITUDE')
+            _lpn_diag = _latest_diag.get('LOCAL_POSITION_NED')
+            if _att_diag is not None and _lpn_diag is not None:
+                _gt_pos_diag  = np.array(_lpn_diag['pos_ned_m'], dtype=float)
+                _gt_vel_diag  = np.array(_lpn_diag['vel_ned_mps'], dtype=float)
+                _gt_quat_diag = np.array(_att_diag['quat'], dtype=float)
+            else:
+                _gt_pos_diag  = np.full(3, np.nan)
+                _gt_vel_diag  = np.full(3, np.nan)
+                _gt_quat_diag = np.full(4, np.nan)
+
+            _act_diag = _latest_diag.get('ACTUATOR_OUTPUT_STATUS')
+            if _act_diag is not None:
+                _act_sum_diag = float(np.sum(_act_diag['actuator'][:4]))
+                _T_total_diag = _act_sum_diag * float(self._param.get('T_max_motor', 49.9))
+            else:
+                _act_sum_diag = float('nan')
+                _T_total_diag = float('nan')
+
             try:
                 self._logger.log_ekf(
                     t_us, now,
@@ -542,6 +589,10 @@ class IMUEKFHandler:
                     acc_applied, acc_innov,
                     zupt_applied, zupt_innov,
                     gyro, acc,
+                    gt_pos=_gt_pos_diag, gt_vel=_gt_vel_diag, gt_quat=_gt_quat_diag,
+                    T_total_N=_T_total_diag, actuator_sum=_act_sum_diag,
+                    hover_reset_done=self._hover_reset_done,
+                    wait_phase_done=bool(self._data.get('wait_phase_done', False)),
                 )
             except Exception:
                 pass

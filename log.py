@@ -106,6 +106,13 @@ class Logger:
             # Innovation diagnostics
             "acc_applied":  [], "acc_innov":  [],   # gravity-alignment update
             "zupt_applied": [], "zupt_innov": [],   # zero-velocity update
+            # ekf_shadow.py offline-replay inputs: raw (unrotated) GT, thrust,
+            # and phase flags, logged every tick independent of ground_truth_mode.
+            "gt_pN": [], "gt_pE": [], "gt_pD": [],
+            "gt_vN": [], "gt_vE": [], "gt_vD": [],
+            "gt_qw": [], "gt_qx": [], "gt_qy": [], "gt_qz": [],
+            "T_total_N": [], "actuator_sum": [],
+            "hover_reset_done": [], "wait_phase_done": [],
         }
 
         self._waypoints = None   # set via set_waypoints(); used for path comparison plot
@@ -135,6 +142,21 @@ class Logger:
             # Velocity derived from consecutive PnP positions
             "vel_ok": [],
             "vel_N": [], "vel_E": [], "vel_D": [], "speed_ms": [],
+        }
+
+        # Raw vision-EKF-update fixes (pos/vel/yaw + sigma/gate), one row per
+        # produced fix, independent of ground_truth_mode — vision_rx.py builds
+        # shared['_vision_ekf_update'] regardless of the flag, imu_ekf.py just
+        # doesn't consume it while GT mode overrides the EKF state. Feeds
+        # ekf_shadow.py's offline replay; distinct from self._vision above
+        # (per-frame YOLO/PnP diagnostic, not what the EKF would fuse).
+        self._vision_fix = {
+            "wall_t": [],
+            "has_pos": [], "pos_N": [], "pos_E": [], "pos_D": [],
+            "has_vel": [], "vel_N": [], "vel_E": [], "vel_D": [],
+            "has_yaw": [], "yaw_ned": [],
+            "sigma_pos": [], "sigma_vel": [], "sigma_yaw": [],
+            "gate": [], "vel_gate": [], "yaw_gate": [],
         }
 
         # Per-saved-frame sim timestamps — written to frame_timestamps.csv
@@ -169,6 +191,8 @@ class Logger:
                 self._motors[key].clear()
             for key in self._vision:
                 self._vision[key].clear()
+            for key in self._vision_fix:
+                self._vision_fix[key].clear()
 
     def log_mavlink(self, msg):
         """Append one MAVLink message to the text log."""
@@ -223,7 +247,10 @@ class Logger:
     def log_ekf(self, t_us, wall_t, x, P_diag,
                 acc_applied, acc_innov,
                 zupt_applied, zupt_innov,
-                gyro_raw, acc_raw):
+                gyro_raw, acc_raw,
+                gt_pos=None, gt_vel=None, gt_quat=None,
+                T_total_N=float('nan'), actuator_sum=float('nan'),
+                hover_reset_done=False, wait_phase_done=False):
         """
         Accumulate one EKF sample (called at IMU rate, ~250 Hz).
 
@@ -232,6 +259,12 @@ class Logger:
         acc_applied / acc_innov   : gravity-alignment update was applied, |innovation|
         zupt_applied / zupt_innov : ZUPT update was applied, |innovation|
         gyro_raw, acc_raw         : raw IMU [rad/s], [m/s²]
+        gt_pos/gt_vel/gt_quat     : raw (unrotated) ground truth, independent of
+                                    ground_truth_mode — for ekf_shadow.py's offline
+                                    replay. None (-> NaN) when GT isn't available yet.
+        T_total_N, actuator_sum   : collective thrust / raw actuator sum this tick.
+        hover_reset_done, wait_phase_done : phase flags, for replay initial-condition
+                                    reconstruction.
         """
         with self._lock:
             d = self._ekf
@@ -259,6 +292,17 @@ class Logger:
             # innovations
             d["acc_applied"].append(int(acc_applied));   d["acc_innov"].append(float(acc_innov))
             d["zupt_applied"].append(int(zupt_applied)); d["zupt_innov"].append(float(zupt_innov))
+            # ekf_shadow.py offline-replay inputs
+            _gp = gt_pos  if gt_pos  is not None else (float('nan'),)*3
+            _gv = gt_vel  if gt_vel  is not None else (float('nan'),)*3
+            _gq = gt_quat if gt_quat is not None else (float('nan'),)*4
+            d["gt_pN"].append(float(_gp[0])); d["gt_pE"].append(float(_gp[1])); d["gt_pD"].append(float(_gp[2]))
+            d["gt_vN"].append(float(_gv[0])); d["gt_vE"].append(float(_gv[1])); d["gt_vD"].append(float(_gv[2]))
+            d["gt_qw"].append(float(_gq[0])); d["gt_qx"].append(float(_gq[1]))
+            d["gt_qy"].append(float(_gq[2])); d["gt_qz"].append(float(_gq[3]))
+            d["T_total_N"].append(float(T_total_N)); d["actuator_sum"].append(float(actuator_sum))
+            d["hover_reset_done"].append(int(bool(hover_reset_done)))
+            d["wait_phase_done"].append(int(bool(wait_phase_done)))
 
     def log_cascade(self, time_ms,
                     v_ned_ref, v_ned_meas,
@@ -382,6 +426,52 @@ class Logger:
                 d["vel_N"].append(_nan); d["vel_E"].append(_nan)
                 d["vel_D"].append(_nan); d["speed_ms"].append(_nan)
 
+    def log_vision_fix(self, wall_t, pos_ned=None, vel_ned=None, yaw_ned=None,
+                        sigma_pos=None, sigma_vel=None, sigma_yaw=None,
+                        gate=None, vel_gate=None, yaw_gate=None):
+        """
+        Accumulate one raw vision-EKF-update fix (shared['_vision_ekf_update']),
+        called whenever vision_rx.py produces one — independent of
+        ground_truth_mode, since that flag only affects whether imu_ekf.py
+        consumes the fix, not whether vision_rx.py produces it. Feeds
+        ekf_shadow.py's offline replay; distinct from log_vision's per-frame
+        YOLO/PnP diagnostic (vision.csv).
+        """
+        # has_pos/vel/yaw must only ever be 1 when the value is genuinely
+        # usable — a non-None but non-finite value (e.g. from a degenerate
+        # PnP solve) previously slipped through as has_pos=1 with pos_N/E/D=nan,
+        # which downstream (ekf.py's update_position) bypassed the gate check
+        # entirely (`nan > gate_dist` is False in numpy) and corrupted the
+        # whole filter. Treat non-finite the same as None here.
+        _nan = float("nan")
+        with self._lock:
+            d = self._vision_fix
+            d["wall_t"].append(float(wall_t))
+            if pos_ned is not None and np.all(np.isfinite(pos_ned)):
+                d["has_pos"].append(1)
+                d["pos_N"].append(float(pos_ned[0])); d["pos_E"].append(float(pos_ned[1]))
+                d["pos_D"].append(float(pos_ned[2]))
+            else:
+                d["has_pos"].append(0)
+                d["pos_N"].append(_nan); d["pos_E"].append(_nan); d["pos_D"].append(_nan)
+            if vel_ned is not None and np.all(np.isfinite(vel_ned)):
+                d["has_vel"].append(1)
+                d["vel_N"].append(float(vel_ned[0])); d["vel_E"].append(float(vel_ned[1]))
+                d["vel_D"].append(float(vel_ned[2]))
+            else:
+                d["has_vel"].append(0)
+                d["vel_N"].append(_nan); d["vel_E"].append(_nan); d["vel_D"].append(_nan)
+            if yaw_ned is not None and np.isfinite(yaw_ned):
+                d["has_yaw"].append(1); d["yaw_ned"].append(float(yaw_ned))
+            else:
+                d["has_yaw"].append(0); d["yaw_ned"].append(_nan)
+            d["sigma_pos"].append(float(sigma_pos) if sigma_pos is not None else _nan)
+            d["sigma_vel"].append(float(sigma_vel) if sigma_vel is not None else _nan)
+            d["sigma_yaw"].append(float(sigma_yaw) if sigma_yaw is not None else _nan)
+            d["gate"].append(float(gate) if gate is not None else _nan)
+            d["vel_gate"].append(float(vel_gate) if vel_gate is not None else _nan)
+            d["yaw_gate"].append(float(yaw_gate) if yaw_gate is not None else _nan)
+
     # ------------------------------------------------------------------
     # Call once at the end of the flight
     # ------------------------------------------------------------------
@@ -410,6 +500,7 @@ class Logger:
         self._write_cascade_csv()
         self._write_vision_csv()
         self._plot_vision()
+        self._write_vision_fix_csv()
         self._write_frame_timestamps_csv()
         print(f"Logger: all data saved to {self.session_dir}")
 
@@ -914,7 +1005,9 @@ class Logger:
                 "sig_bgx,sig_bgy,sig_bgz,"
                 "ax,ay,az,gx,gy,gz,"
                 "acc_applied,acc_innov,"
-                "zupt_applied,zupt_innov\n"
+                "zupt_applied,zupt_innov,"
+                "gt_pN,gt_pE,gt_pD,gt_vN,gt_vE,gt_vD,gt_qw,gt_qx,gt_qy,gt_qz,"
+                "T_total_N,actuator_sum,hover_reset_done,wait_phase_done\n"
             )
             for i in range(len(d["t_us"])):
                 t_s = (d["t_us"][i] - t0_us) / 1e6
@@ -936,7 +1029,12 @@ class Logger:
                     f"{d['ax'][i]:.5f},{d['ay'][i]:.5f},{d['az'][i]:.5f},"
                     f"{d['gx'][i]:.5f},{d['gy'][i]:.5f},{d['gz'][i]:.5f},"
                     f"{d['acc_applied'][i]},{d['acc_innov'][i]:.5f},"
-                    f"{d['zupt_applied'][i]},{d['zupt_innov'][i]:.5f}\n"
+                    f"{d['zupt_applied'][i]},{d['zupt_innov'][i]:.5f},"
+                    f"{d['gt_pN'][i]:.4f},{d['gt_pE'][i]:.4f},{d['gt_pD'][i]:.4f},"
+                    f"{d['gt_vN'][i]:.5f},{d['gt_vE'][i]:.5f},{d['gt_vD'][i]:.5f},"
+                    f"{d['gt_qw'][i]:.6f},{d['gt_qx'][i]:.6f},{d['gt_qy'][i]:.6f},{d['gt_qz'][i]:.6f},"
+                    f"{d['T_total_N'][i]:.4f},{d['actuator_sum'][i]:.5f},"
+                    f"{d['hover_reset_done'][i]},{d['wait_phase_done'][i]}\n"
                 )
         print(f"Logger: EKF CSV -> {out}")
 
@@ -1273,6 +1371,35 @@ class Logger:
                     f"{d['vel_ok'][i]},{_f(d['vel_N'][i])},{_f(d['vel_E'][i])},{_f(d['vel_D'][i])},{_f(d['speed_ms'][i])}\n"
                 )
         print(f"Logger: vision CSV -> {out}")
+
+    def _write_vision_fix_csv(self):
+        with self._lock:
+            d = {k: list(v) for k, v in self._vision_fix.items()}
+        if not d["wall_t"]:
+            print("Logger: no vision-fix data collected, skipping CSV.")
+            return
+        t0 = d["wall_t"][0]
+        out = os.path.join(self.session_dir, "vision_fix.csv")
+        with open(out, "w") as f:
+            f.write(
+                "time_s,wall_t,has_pos,pos_N,pos_E,pos_D,"
+                "has_vel,vel_N,vel_E,vel_D,has_yaw,yaw_ned,"
+                "sigma_pos,sigma_vel,sigma_yaw,gate,vel_gate,yaw_gate\n"
+            )
+
+            def _f(v):
+                return f"{v:.5f}" if v == v else "nan"   # nan-safe formatter
+
+            for i in range(len(d["wall_t"])):
+                f.write(
+                    f"{d['wall_t'][i]-t0:.4f},{d['wall_t'][i]:.6f},"
+                    f"{d['has_pos'][i]},{_f(d['pos_N'][i])},{_f(d['pos_E'][i])},{_f(d['pos_D'][i])},"
+                    f"{d['has_vel'][i]},{_f(d['vel_N'][i])},{_f(d['vel_E'][i])},{_f(d['vel_D'][i])},"
+                    f"{d['has_yaw'][i]},{_f(d['yaw_ned'][i])},"
+                    f"{_f(d['sigma_pos'][i])},{_f(d['sigma_vel'][i])},{_f(d['sigma_yaw'][i])},"
+                    f"{_f(d['gate'][i])},{_f(d['vel_gate'][i])},{_f(d['yaw_gate'][i])}\n"
+                )
+        print(f"Logger: vision-fix CSV -> {out}")
 
     def _plot_vision(self):
         with self._lock:

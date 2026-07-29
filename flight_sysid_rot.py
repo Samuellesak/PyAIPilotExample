@@ -16,9 +16,15 @@ instead and fixes m_motor.
     Ixx = Iyy = 2*m_motor*L^2 + m_frame*L^2/6      m_frame = m - 4*m_motor
     Izz       = 4*m_motor*L^2 + m_frame*L^2/3
 
-    tau_x = d*(FL+BL-FR-BR)     d = L/sqrt(2)   (dyn.py mixer convention;
-    tau_y = d*(FL+FR-BL-BR)      ACTUATOR_OUTPUT_STATUS is already in the
-    tau_z = kappa*(FL+BR-FR-BL)  sim-native [FL,FR,BL,BR] order — no reorder)
+    tau_x = -d*(FL+BL-FR-BR)    d = L/sqrt(2)   (dyn.py mixer convention;
+    tau_y =  d*(FL+FR-BL-BR)     ACTUATOR_OUTPUT_STATUS is in the sim-native
+    tau_z =  kappa*(FL+BR-FR-BL) [FL,FR,BL,BR] order — no reorder needed.
+                                  tau_x is negated relative to dyn.py's plain
+                                  formula — empirically required for this sim;
+                                  confirmed NOT a motor-array-order issue,
+                                  since that would flip tau_z the same way
+                                  (also splits by left/right pairing) and it
+                                  doesn't need flipping. See _mixer_torque().)
 
     omega_dot = I_inv @ (tau - Dw*|omega|*omega - omega x (I @ omega))
 
@@ -26,7 +32,9 @@ Uses the same setup_components() init as main.py / flight_sysid_gt.py and
 requires ground_truth_mode: true in params.yaml. Body-rate sign convention
 (rollspeed/pitchspeed/yawspeed from ATTITUDE, commanded via SET_ATTITUDE_TARGET
 through _send_raw) follows the FRD convention already validated empirically by
-flight_sysid_gt.py — no extra negation applied here.
+flight_sysid_gt.py — no extra negation applied here (confirmed: commanding
++p/+q/+r produces real "roll right"/"pitch back (nose up)"/"yaw right", the
+expected FRD response, so the GT rate measurements themselves are trustworthy).
 
 Phase sequence:
   WAIT -> TAKEOFF -> HOVER ->
@@ -240,11 +248,19 @@ def _inertia(m_fixed, m_motor, L):
 
 
 def _mixer_torque(u_motors_n, kappa, L):
-    """u_motors_n: (N,4) per-motor thrust [N] in sim order [FL,FR,BL,BR]."""
+    """u_motors_n: (N,4) per-motor thrust [N] in sim order [FL,FR,BL,BR].
+
+    tau_x is negated relative to dyn.py's own formula — empirically required
+    for this sim (confirmed via a roll-vs-yaw excitation test: with dyn.py's
+    plain formula, the model's roll prediction came out mirrored against GT
+    while yaw and pitch tracked correctly, so only roll's sign convention
+    differs here; not a motor-array-order issue, which would have flipped
+    yaw the same way since tau_z also splits by left/right motor pairing).
+    """
     d = L / np.sqrt(2.0)
     FL, FR, BL, BR = u_motors_n[:, 0], u_motors_n[:, 1], u_motors_n[:, 2], u_motors_n[:, 3]
     return np.stack([
-        d * (FL + BL - FR - BR),        # tau_x
+        -d * (FL + BL - FR - BR),       # tau_x (negated — see docstring)
         d * (FL + FR - BL - BR),        # tau_y
         kappa * (FL + BR - FR - BL),    # tau_z
     ], axis=1)

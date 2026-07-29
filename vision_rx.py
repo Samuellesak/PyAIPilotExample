@@ -54,8 +54,19 @@ class VisionRX:
         # The 41×41 dilation lets blue bleed into the YOLO input through the mask
         # boundary — suppressing it at source prevents keypoint confusion.
         self._debug_waypoints_only = bool(_p.get('debug_waypoints_only', False))
-        if self._debug_waypoints_only:
+        # Separate opt-in from debug_waypoints_only: controller.py gates all of
+        # its OWN vision-influenced control paths (gate-NED override, bearing
+        # override, visual yaw blend) behind its own debug_waypoints_only check
+        # independent of whether real detection data exists — so running YOLO/
+        # PnP here for logging (ekf_shadow.py's vision_fix.csv) doesn't change
+        # flight behavior at all as long as controller.py's flag stays true.
+        self._vision_detect_for_logging = bool(_p.get('vision_detect_for_logging', False))
+        if self._debug_waypoints_only and not self._vision_detect_for_logging:
             print("[VisionRX] debug_waypoints_only=true — YOLO disabled", flush=True)
+        elif self._debug_waypoints_only:
+            print("[VisionRX] debug_waypoints_only=true but vision_detect_for_logging=true "
+                  "— YOLO/PnP still runs for logging; controller.py ignores it as before",
+                  flush=True)
 
         self._yolo_enabled = bool(_p.get('yolo_enabled', True))
         if not self._yolo_enabled:
@@ -137,10 +148,9 @@ class VisionRX:
 
         # Last-accepted PnP rotation, for near-tie hysteresis in _pnp_gate's
         # dual-IPPE-solution disambiguation (see that method for why). Kept
-        # separate per target — the primary/current-gate call (fresh YOLO or
-        # LK-bridged, same physical gate) and the next-gate-candidate call
-        # each need their own continuity anchor, or the two would clobber
-        # each other's state every frame they both fire.
+        # separate per target — the primary/current-gate call and the
+        # next-gate-candidate call each need their own continuity anchor, or
+        # the two would clobber each other's state every frame they both fire.
         self._last_pnp_R_primary = None
         self._last_pnp_R_next    = None
 
@@ -171,18 +181,6 @@ class VisionRX:
         # Live debug overlay window (enabled via vision_debug_overlay: true in params.yaml).
         self._debug_overlay     = bool(_p.get('vision_debug_overlay', False))
         self._overlay_last_ctr  = None   # last known gate centre_px for hold/transition display
-
-        # Item 5: Lucas-Kanade optical flow keypoint tracker.
-        # Tracks the 4 gate keypoints between YOLO detections to bridge flicker gaps.
-        self._lk_prev_gray  = None
-        self._lk_pts        = None   # (4,1,2) float32 tracked keypoints
-        self._lk_age        = 0      # frames since last YOLO refresh
-        self._lk_max_age    = int(_p.get('lk_max_age',    5))
-        self._lk_fb_max_px  = float(_p.get('lk_fb_max_px', 2.0))
-        self._lk_params     = dict(
-            winSize=(21, 21), maxLevel=3,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
-        )
 
         # Diagnostics counters (reset every 5 s)
         self._stat_recv           = 0
@@ -271,6 +269,18 @@ class VisionRX:
                         self._last_queued_frame_id = frame_id
                         self._stat_recv += 1
                         frame_ts = frames[frame_id]["sim_time_ns"]
+                        # Stamp vis_ctrl_mode at capture time, not at whatever
+                        # time _infer_loop eventually gets around to processing
+                        # this frame. Inference lags capture by up to ~170ms
+                        # under queueing backlog (confirmed in flight logs), and
+                        # controller.py flips vis_ctrl_mode asynchronously on its
+                        # own control-loop thread. Reading it live inside
+                        # process_frame let a frame captured mid-TRANSITION be
+                        # evaluated after the mode had already flipped back to
+                        # CARROT, defeating the TRANSITION suppression below and
+                        # letting a bad detection (small gate seen inside the
+                        # near gate's beams) through as a real PnP fix.
+                        ctrl_mode_at_capture = self.data.get('vis_ctrl_mode')
                         # Drop oldest frame if inference is lagging; keep latest.
                         if self._frame_q.full():
                             try:
@@ -278,7 +288,7 @@ class VisionRX:
                             except queue.Empty:
                                 pass
                         try:
-                            self._frame_q.put_nowait((frame_id, img, frame_ts))
+                            self._frame_q.put_nowait((frame_id, img, frame_ts, ctrl_mode_at_capture))
                         except queue.Full:
                             pass
 
@@ -299,8 +309,8 @@ class VisionRX:
                 continue
             if item is None:   # shutdown sentinel
                 break
-            frame_id, img, sim_time_ns = item
-            self.process_frame(frame_id, img, sim_time_ns)
+            frame_id, img, sim_time_ns, ctrl_mode_at_capture = item
+            self.process_frame(frame_id, img, sim_time_ns, ctrl_mode_at_capture)
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -554,6 +564,15 @@ class VisionRX:
         candidates = []
         for rv, tv in zip(rvecs, tvecs):
             tv_f = tv.flatten()
+            rv_f = rv.flatten()
+            # A degenerate corner configuration can make solvePnPGeneric return
+            # NaN/Inf instead of failing outright. Must reject explicitly here:
+            # `nan < 0.1` is also False in numpy, so the "behind camera" filter
+            # below would NOT catch it either, and a NaN tvec/rvec would flow
+            # all the way through to the logged vision fix and (previously)
+            # crash/corrupt the EKF via update_position's gate check.
+            if not (np.all(np.isfinite(tv_f)) and np.all(np.isfinite(rv_f))):
+                continue
             if tv_f[2] < 0.1:          # gate behind camera — physically impossible
                 continue
             R_sol, _ = cv2.Rodrigues(rv)
@@ -657,8 +676,8 @@ class VisionRX:
 
     # ── Main frame processing ───────────────────────────────────────────────
 
-    def process_frame(self, frame_id, img, sim_time_ns=None):
-        if self._debug_waypoints_only:
+    def process_frame(self, frame_id, img, sim_time_ns=None, ctrl_mode_at_capture=None):
+        if self._debug_waypoints_only and not self._vision_detect_for_logging:
             self.data['gate_detection'] = {
                 'detected': False, 'centre_px': None, 'conf': 0.0,
                 'tvec_cam': None, 'rvec_cam': None, 'frame_id': frame_id,
@@ -673,7 +692,6 @@ class VisionRX:
         # buildings and the track beam, while removing the hue that would
         # contaminate the orange mask or produce cyan false-positive detections.
         img = self._apply_blue_suppression(img)
-        _gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         masked, mask_raw = self._orange_mask(img)
         orange_px = int(np.count_nonzero(mask_raw))
 
@@ -689,6 +707,11 @@ class VisionRX:
         gate_info = None
         drone_ned = None
         _pnp_skip_reason = None   # diagnostic: why PnP was skipped this frame
+        # Use the mode stamped at frame *capture* time (see _recv_loop), not a
+        # live read here — process_frame can run up to ~170ms after capture
+        # under queueing backlog, by which point controller.py's async control
+        # loop may have already flipped vis_ctrl_mode back out of TRANSITION.
+        _in_transit = ctrl_mode_at_capture == 'TRANSITION'
 
         h_img, w_img = mask_raw.shape
         if results is not None and results[0].boxes is not None \
@@ -728,7 +751,20 @@ class VisionRX:
                     continue
                 valid_idx.append(_i)
 
-            if valid_idx:
+            # Suppress detection during TRANSITION (the carrot tracker's final-
+            # approach/commit phase, pinned to the gate centre while passing
+            # through it): at close range and steep viewing angles the camera
+            # can see smaller structures inside/beyond the gate's own beams
+            # (e.g. a further gate framed by the near one), and YOLO's largest-
+            # bbox-wins selection can mistake one of those for the target,
+            # producing a discontinuous tvec_cam that corrupts _pnp_vel_buf's
+            # regression (the reported PnP velocity spikes at gate transitions)
+            # as well as gate_info/gate-NED overrides. The real target gate is
+            # already being flown through open-loop by the carrot at this
+            # point, so nothing is lost by ignoring vision here.
+            if valid_idx and _in_transit:
+                _pnp_skip_reason = "transit phase (suppressed)"
+            if valid_idx and not _in_transit:
                 areas       = boxes[:, 2] * boxes[:, 3]
                 _sorted_v   = sorted(valid_idx, key=lambda i: areas[i], reverse=True)
                 best        = _sorted_v[0]
@@ -840,52 +876,6 @@ class VisionRX:
                                 _buf = np.array(list(self._next_gate_ned_buf))
                                 self._next_gate_ned = np.median(_buf, axis=0)
 
-        # ── Item 5: Lucas-Kanade optical flow (bridge YOLO detection gaps) ─────
-        # On YOLO hit: seed the LK tracker with detected keypoints.
-        # On YOLO miss: forward-backward track the last known keypoints and attempt PnP.
-        # lk_bridged marks frames where tvec_cam/gate_info came from optical-flow
-        # extrapolation rather than a fresh YOLO detection — see the EKF-update
-        # gate below for why these are excluded from feeding the filter.
-        lk_bridged = False
-        if corners is not None:
-            self._lk_pts = corners.astype(np.float32).reshape(-1, 1, 2)
-            self._lk_age = 0
-        elif (self._lk_pts is not None
-              and self._lk_prev_gray is not None
-              and self._lk_age < self._lk_max_age
-              and tvec_cam is None):
-            _pts_fwd, _st_fwd, _ = cv2.calcOpticalFlowPyrLK(
-                self._lk_prev_gray, _gray, self._lk_pts, None, **self._lk_params)
-            if _pts_fwd is not None and _st_fwd is not None:
-                _pts_back, _st_back, _ = cv2.calcOpticalFlowPyrLK(
-                    _gray, self._lk_prev_gray, _pts_fwd, None, **self._lk_params)
-                if _pts_back is not None:
-                    _fb_err = np.linalg.norm(
-                        (_pts_back - self._lk_pts).reshape(-1, 2), axis=1)
-                    _ok = (_st_fwd.reshape(-1) > 0) & (_fb_err < self._lk_fb_max_px)
-                    if _ok.all():
-                        _lk_corners = _pts_fwd.reshape(-1, 2)
-                        _agi_lk  = self.data.get('active_gate_index', 0)
-                        _gi_lk   = self._last_gate_info.get(
-                            int(_agi_lk) if _agi_lk is not None else -1)
-                        if _gi_lk is not None:
-                            _tvec_lk, _rvec_lk = self._pnp_gate(
-                                _lk_corners, _gi_lk['width'], _gi_lk['height'])
-                            if _tvec_lk is not None:
-                                tvec_cam    = _tvec_lk
-                                rvec_cam    = _rvec_lk
-                                gate_info   = _gi_lk
-                                corners     = _lk_corners
-                                centre_px   = _lk_corners.mean(axis=0)
-                                detected    = True
-                                lk_bridged  = True
-                                self._lk_pts = _pts_fwd
-                        self._lk_age += 1
-                    else:
-                        self._lk_pts = None
-                        self._lk_age = 0
-        self._lk_prev_gray = _gray
-
         # Publish next-gate state for controller and overlay.
         self.data['next_gate_ned']        = self._next_gate_ned
         self.data['next_gate_buf_frames'] = len(self._next_gate_ned_buf)
@@ -981,26 +971,22 @@ class VisionRX:
             'tvec_cam':      tvec_cam,
             'centroid_only': tvec_cam is None and centroid_area > 0,
             'pnp_locked':    self._locked_dist is not None,
-            'lk_bridged':    lk_bridged,
             'frame_id':      frame_id,
         }
 
-        # EKF vision update: position + velocity + yaw from PnP.
-        # Excludes lk_bridged frames: LK has no fresh corner detection to verify
-        # against, so if the gate leaves frame entirely (e.g. right after flythrough)
-        # it can keep "successfully" tracking whatever pixels are left with a clean
-        # forward-backward error and no way to tell they're no longer on the gate.
-        # Confirmed in a flight log: the frame immediately after a real detection
-        # gap opened with an LK-bridged fix (conf=0.0, pnp_ok=1) whose position
-        # jumped ~5 m from the prior real fix, which the EKF absorbed as truth.
-        # LK still updates gate_detection/centre_px above for the controller's
-        # visual-centering use — only the EKF feed is restricted to real YOLO hits.
+        # EKF vision update: position + velocity + yaw from PnP, from a fresh
+        # YOLO detection only (no optical-flow bridging — removed after being
+        # a repeat source of position/velocity corruption: a tracked-but-stale
+        # keypoint set has no way to tell it's no longer on the gate once the
+        # gate leaves frame, e.g. right after flythrough. model_predict plus
+        # the current detection robustness make bridging brief YOLO misses
+        # unnecessary).
         vel_ned     = None
         vel_ned_pnp = None
         drone_ned   = None
         yaw_ned     = None
 
-        if tvec_cam is not None and not lk_bridged:
+        if tvec_cam is not None:
             # Yaw estimate: requires gate quaternion from track data.
             # Unavailable in the pure-fallback path (gate_info=None).
             if gate_info is not None and gate_info.get('quat') is not None:
@@ -1188,6 +1174,16 @@ class VisionRX:
                     'vel_gate':  self._ekf_vis_vel_gate,
                     'wall_t':    time.time(),   # item 4: capture timestamp for latency compensation
                 }
+                # Log the raw fix regardless of ground_truth_mode (which only
+                # affects whether imu_ekf.py consumes it) — feeds ekf_shadow.py's
+                # offline replay.
+                if self.logger:
+                    _vu = self.data['_vision_ekf_update']
+                    self.logger.log_vision_fix(
+                        wall_t=_vu['wall_t'], pos_ned=_vu['pos_ned'], vel_ned=_vu['vel_ned'],
+                        yaw_ned=_vu['yaw_ned'], sigma_pos=_vu['sigma_pos'], sigma_vel=_vu['sigma_vel'],
+                        sigma_yaw=_vu['sigma_yaw'], gate=_vu['gate'], vel_gate=_vu['vel_gate'],
+                        yaw_gate=_vu['yaw_gate'])
 
             if drone_ned is not None:
                 _dist_m = float(tvec_cam[2])

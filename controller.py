@@ -427,19 +427,13 @@ class Controller:
             # Refine target waypoint to PnP-measured gate position in local NED.
             # gate_local = pos_ned (EKF local) + R_b2n @ R_cam2body @ tvec_cam
             # This uses only what the camera sees — no track data dependency.
-            # Excludes lk_bridged frames: this path has none of the EKF vision
-            # feed's protections (LK-bridge exclusion, PnP dual-solution
-            # hysteresis, yaw smoothing, frame dedup) since it reads tvec_cam
-            # directly rather than going through _vision_ekf_update. An LK-bridged
-            # frame — tracked corners with no fresh YOLO backing, possibly no
-            # longer actually on the gate — would otherwise snap the live carrot
-            # target straight to a bad position with zero smoothing. Confirmed in
-            # a flight log: right after passing gate 0, the carrot's committed
-            # target (waypoints[wp]) ended up far closer to the start than the
-            # true next gate, sending the drone essentially back the way it came.
+            # This path has none of the EKF vision feed's protections (PnP
+            # dual-solution hysteresis, yaw smoothing, frame dedup) since it
+            # reads tvec_cam directly rather than going through
+            # _vision_ekf_update, so a bad frame here would snap the live
+            # carrot target straight to a bad position with zero smoothing.
             if not self._debug_waypoints_only:
-                if (det.get('detected') and det.get('tvec_cam') is not None
-                        and not det.get('lk_bridged', False)):
+                if det.get('detected') and det.get('tvec_cam') is not None:
                     _tvec = np.asarray(det['tvec_cam'], dtype=float)
                     _t_body = self._R_cam2body @ _tvec
                     R_bn = _rot_from_quat(quat)
@@ -448,11 +442,19 @@ class Controller:
 
             # Update next waypoint from vision-confirmed second-gate NED position.
             # Only applied once position is stable (median over next_gate_min_frames).
-            _ng_ned = self.data.get('next_gate_ned')
-            if _ng_ned is not None:
-                _wp_next = self.tracker.wp + 1
-                if _wp_next < self.tracker.n_waypoints:
-                    self.tracker.waypoints[_wp_next] = np.asarray(_ng_ned, dtype=float)
+            # Gated on debug_waypoints_only like the other vision overrides above —
+            # previously this was unreachable (vision_rx.py never ran detection, so
+            # next_gate_ned was never set), but vision_detect_for_logging now lets
+            # detection run for logging while debug_waypoints_only stays true, and
+            # this block had no gate of its own, so it started actually overwriting
+            # the next waypoint with a real (and apparently offset) vision-derived
+            # position — causing a beam strike at the second gate.
+            if not self._debug_waypoints_only:
+                _ng_ned = self.data.get('next_gate_ned')
+                if _ng_ned is not None:
+                    _wp_next = self.tracker.wp + 1
+                    if _wp_next < self.tracker.n_waypoints:
+                        self.tracker.waypoints[_wp_next] = np.asarray(_ng_ned, dtype=float)
 
             v_ned_ref_carrot, psi_ref_carrot = self.tracker.update(pos_ned)
             v_ref_for_gains = v_ned_ref_carrot

@@ -5,10 +5,10 @@
 m:     5.405   # total mass [kg]  — identified by sysid.py (ground angular-rate fit)
 g:     9.81    # gravitational acceleration [m/s^2]
 L:     0.14    # arm length (rotor to CoM) [m]
-kappa: 0.016   # rotor torque-to-thrust ratio [m]
+kappa: 0.084735   # rotor torque-to-thrust ratio [m]
 
-T_max_motor:    49.9  # maximum thrust per motor [N]  (used for normalization) 49.9
-tau_motor:      0.05  # first-order motor lag time constant [s]  (typ. 20–100 ms for brushless)
+T_max_motor:    50.800057  # maximum thrust per motor [N]  (used for normalization) 49.9
+tau_motor:      0.162400  # first-order motor lag time constant [s]  (typ. 20–100 ms for brushless)
 
 # ── Inertia (computed from geometry, not specified directly) ──────────
 # Motors: 4 point masses at arm tips.  d = L/sqrt(2) = projected offset.
@@ -20,17 +20,17 @@ tau_motor:      0.05  # first-order motor lag time constant [s]  (typ. 20–100 
 # where m_frame = m - 4 * m_motor
 #   Ixx = Iyy = 2 * m_motor * L² + m_frame * L² / 6
 #   Izz       = 4 * m_motor * L² + m_frame * L² / 3
-m_motor: 0.050  # mass of one motor [kg]  (4 * m_motor must be < m)
+m_motor: 0.150  # mass of one motor [kg]  (4 * m_motor must be < m)
 
 # ── Aerodynamic drag ──────────────────────────────────────────────────
 # Force drag:  F = -Dv * |v| .* v   [N / (m/s)^2]  — diagonal elements
 # (Dv unidentified from ground sysid — needs in-flight velocity data)
-Dv: [0.25, 0.25, 0.6] 
+Dv: [0.243852, 0.243852, 0.790401] 
 
 # Torque drag: M = -Dw * |w| .* w   [N·m / (rad/s)^2] — diagonal elements
 # Dw_xy identified from ground roll/pitch excitation (sysid.py).
 # Dw_z unidentified (kappa degenerate on ground) — kept at nominal.
-Dw: [0.0377, 0.0377, 0.002]
+Dw: [0.276910, 0.276910, 0.340295]
 
 # ── Aerodynamic moment coefficients ───────────────────────────────────
 # Pitch moment from forward  body velocity  [N·m / (m/s)]
@@ -270,10 +270,6 @@ sigma_gate_pass_pos: 0.5   # 1-sigma position noise for gate-pass fix [m]
 # Item 4: PnP latency compensation — shift pos measurement forward by dead-reckoning
 vision_latency_s: 0.08     # image-to-EKF-update pipeline delay [s]; 0 = disabled
 
-# Item 5: Lucas-Kanade optical flow keypoint tracking
-lk_max_age:    5    # max frames to track LK keypoints without YOLO refresh
-lk_fb_max_px:  2.0  # max forward-backward consistency error [px] to accept tracked point
-
 
 
 model_predict_shadow:    true   # log acc_model vs acc_imu to logs/model_predict_shadow_*.csv
@@ -282,11 +278,13 @@ model_predict_shadow:    true   # log acc_model vs acc_imu to logs/model_predict
 
 v_ref:          5.0   # reference cruise speed [m/s]
 lookahead_gain: 1.3   # lookahead distance = lookahead_gain * v_ref [m]; larger = smoother carrot direction 1.6
+
+
 # Distance to the gate at which the carrot stops advancing past it and pins to
 # the gate centre instead — commits to flying through that specific point for
 # the final approach rather than a lookahead point that keeps sliding forward.
 # Defaults to the lookahead distance itself (lookahead_gain * v_ref) if unset.
-commit_dist_m: 6.5
+commit_dist_m: 3.5
 
 # ── Controller selection ─────────────────────────────────────────────────────
 # 1 = Cascade PI  (analytical gains, no offline solve required)
@@ -304,12 +302,23 @@ hover_only: false
 # Gate-NED overrides and visual yaw blending are disabled; waypoint advance still
 # happens via the sim COLLISION signal.  Use this to isolate path-following bugs.
 debug_waypoints_only: true
+# Opt-in, independent of debug_waypoints_only: lets vision_rx.py still run
+# YOLO/PnP and log vision_fix.csv (for ekf_shadow.py's offline replay) while
+# debug_waypoints_only stays true — controller.py's own debug_waypoints_only
+# check already ignores vision data regardless of whether real detections
+# exist, so this does not change flight behavior, only adds YOLO's CPU cost.
+vision_detect_for_logging: true
 ground_truth_mode:  true
 
 
 use_model_predict:  false
-sigma_acc_imu:   0.5   # raw IMU specific force 1-sigma [m/s²]  — weight in blend
-sigma_acc_model: 0.3   # motor model specific force 1-sigma [m/s²] — lower = trust model more; adaptive at runtime
+sigma_acc_imu:   5.0   # raw IMU specific force 1-sigma [m/s²]  — weight in blend
+sigma_acc_model: 0.05  # motor model specific force 1-sigma [m/s²] — lower = trust model more; adaptive at runtime
+# Fitted via ekf_shadow.py --fit-config +model against logs/20260729_154249
+# (vision-free, whole-flight replay): RMS saturates for sigma_imu/sigma_model
+# ratio >~20-50 (88.16 at ratio=1 -> 65.85 at ratio=100 -> 65.847 asymptote),
+# i.e. the model_predict physics (already identified via fit_shadow.py this
+# session) predicts specific force more reliably than the raw IMU here.
 sigma_bias_z_proc: 5.0e-6  # bgz (yaw gyro bias) random-walk std [rad/s/√s]; 0 = frozen
 
 # Set to false to skip YOLO inference entirely (model.predict is never called).
@@ -399,7 +408,7 @@ gain_sched_v_hi: 20.0   # speed where hi-speed gains apply [m/s]
 
 
 
-
+   
 
 
 
