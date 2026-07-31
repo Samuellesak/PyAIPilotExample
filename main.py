@@ -8,7 +8,7 @@ import msvcrt
 from setup import setup_components
 
 # Modify these properties if you want to run the server remotely for example
-SIM_SERVER_UDP_IP = "127.0.0.1"
+SIM_SERVER_UDP_IP = "127.0.0.1" 
 SIM_SERVER_UDP_PORT = 14550
 
 # time since sim started ms

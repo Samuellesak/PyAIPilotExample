@@ -6,6 +6,8 @@ from datetime import datetime
 import cv2
 import numpy as np
 import matplotlib
+
+import rotations
 matplotlib.use("Agg")  # write to file without a display
 import matplotlib.pyplot as plt
 
@@ -55,6 +57,12 @@ class Logger:
             "cx":  [], "cy":  [], "cz":  [],   # carrot NED position
             "dx":  [], "dy":  [], "dz":  [],   # drone NED position
             "mode": [],   # vis_ctrl_mode: PNP/HOLD/CARROT/TRANSITION
+            # Transition/reacquisition-stage diagnostics (controller.py):
+            "agi_match":     [],   # active_gate_index == tracker.wp-1 (identity guard)
+            "reacq_blend_w": [],   # 0=carrot-only, 1=full pursuit (post-reacquisition ramp)
+            "search_active": [],   # blind-search descend nudge currently engaged
+            "search_offset": [],   # current bounded search-descend offset [m]
+            "vnudge_bias":   [],   # vertical visual-centering nudge's velocity bias [m/s]
         }
 
         # Cascade controller signal log — one row per control tick (~250 Hz)
@@ -142,6 +150,9 @@ class Logger:
             # Velocity derived from consecutive PnP positions
             "vel_ok": [],
             "vel_N": [], "vel_E": [], "vel_D": [], "speed_ms": [],
+            # Gate-tracking pipeline diagnostics (vision_rx.py):
+            "skip_reason":     [],   # why PnP was skipped this frame, '' if not skipped
+            "gate_id_rejected": [],  # 1 if this frame failed the gate-identity plausibility check
         }
 
         # Raw vision-EKF-update fixes (pos/vel/yaw + sigma/gate), one row per
@@ -155,8 +166,9 @@ class Logger:
             "has_pos": [], "pos_N": [], "pos_E": [], "pos_D": [],
             "has_vel": [], "vel_N": [], "vel_E": [], "vel_D": [],
             "has_yaw": [], "yaw_ned": [],
-            "sigma_pos": [], "sigma_vel": [], "sigma_yaw": [],
-            "gate": [], "vel_gate": [], "yaw_gate": [],
+            "has_att": [], "roll_ned": [], "pitch_ned": [],
+            "sigma_pos": [], "sigma_vel": [], "sigma_yaw": [], "sigma_att": [],
+            "gate": [], "vel_gate": [], "yaw_gate": [], "att_gate": [],
         }
 
         # Per-saved-frame sim timestamps — written to frame_timestamps.csv
@@ -225,7 +237,9 @@ class Logger:
             d["u0"].append(float(u[0])); d["u1"].append(float(u[1]))
             d["u2"].append(float(u[2])); d["u3"].append(float(u[3]))
 
-    def log_carrot(self, time_ms, wp, v_cmd, carrot_pos=None, drone_pos=None, mode=''):
+    def log_carrot(self, time_ms, wp, v_cmd, carrot_pos=None, drone_pos=None, mode='',
+                   agi_match=True, reacq_blend_w=1.0, search_active=False,
+                   search_offset=0.0, vnudge_bias=0.0):
         """Accumulate one carrot-tracker sample."""
         with self._lock:
             d = self._carrot
@@ -243,6 +257,11 @@ class Logger:
             d["dy"].append(float(dp[1]))
             d["dz"].append(float(dp[2]))
             d["mode"].append(str(mode))
+            d["agi_match"].append(int(bool(agi_match)))
+            d["reacq_blend_w"].append(float(reacq_blend_w))
+            d["search_active"].append(int(bool(search_active)))
+            d["search_offset"].append(float(search_offset))
+            d["vnudge_bias"].append(float(vnudge_bias))
 
     def log_ekf(self, t_us, wall_t, x, P_diag,
                 acc_applied, acc_innov,
@@ -363,7 +382,8 @@ class Logger:
 
     def log_vision(self, wall_t, frame_id, detected,
                    conf=0.0, bb=None, corners=None,
-                   tvec=None, drone_ned=None, vel_ned=None, gate_ned=None):
+                   tvec=None, drone_ned=None, vel_ned=None, gate_ned=None,
+                   skip_reason=None, gate_id_rejected=False):
         """
         Accumulate one vision/YOLO/PnP sample (called at camera frame rate).
 
@@ -372,6 +392,9 @@ class Logger:
         tvec     : (3,) gate position in OpenCV camera frame [m] or None
         drone_ned: (3,) drone NED position estimate from PnP or None
         vel_ned  : (3,) drone NED velocity estimate from PnP differencing or None
+        skip_reason      : diagnostic string for why PnP was skipped this frame, or None
+        gate_id_rejected  : True if this frame's detection failed the gate-identity
+                             plausibility check (see vision_rx.py's _gate_id_tol)
         """
         _nan = float("nan")
         with self._lock:
@@ -425,10 +448,13 @@ class Logger:
             else:
                 d["vel_N"].append(_nan); d["vel_E"].append(_nan)
                 d["vel_D"].append(_nan); d["speed_ms"].append(_nan)
+            d["skip_reason"].append(str(skip_reason) if skip_reason else "")
+            d["gate_id_rejected"].append(int(bool(gate_id_rejected)))
 
     def log_vision_fix(self, wall_t, pos_ned=None, vel_ned=None, yaw_ned=None,
                         sigma_pos=None, sigma_vel=None, sigma_yaw=None,
-                        gate=None, vel_gate=None, yaw_gate=None):
+                        gate=None, vel_gate=None, yaw_gate=None,
+                        roll_ned=None, pitch_ned=None, sigma_att=None, att_gate=None):
         """
         Accumulate one raw vision-EKF-update fix (shared['_vision_ekf_update']),
         called whenever vision_rx.py produces one — independent of
@@ -465,12 +491,21 @@ class Logger:
                 d["has_yaw"].append(1); d["yaw_ned"].append(float(yaw_ned))
             else:
                 d["has_yaw"].append(0); d["yaw_ned"].append(_nan)
+            if (roll_ned is not None and pitch_ned is not None
+                    and np.isfinite(roll_ned) and np.isfinite(pitch_ned)):
+                d["has_att"].append(1)
+                d["roll_ned"].append(float(roll_ned)); d["pitch_ned"].append(float(pitch_ned))
+            else:
+                d["has_att"].append(0)
+                d["roll_ned"].append(_nan); d["pitch_ned"].append(_nan)
             d["sigma_pos"].append(float(sigma_pos) if sigma_pos is not None else _nan)
             d["sigma_vel"].append(float(sigma_vel) if sigma_vel is not None else _nan)
             d["sigma_yaw"].append(float(sigma_yaw) if sigma_yaw is not None else _nan)
+            d["sigma_att"].append(float(sigma_att) if sigma_att is not None else _nan)
             d["gate"].append(float(gate) if gate is not None else _nan)
             d["vel_gate"].append(float(vel_gate) if vel_gate is not None else _nan)
             d["yaw_gate"].append(float(yaw_gate) if yaw_gate is not None else _nan)
+            d["att_gate"].append(float(att_gate) if att_gate is not None else _nan)
 
     # ------------------------------------------------------------------
     # Call once at the end of the flight
@@ -804,7 +839,8 @@ class Logger:
             f.write("time_s,wp,"
                     "vc_N_ms,vc_E_ms,vc_D_ms,v_cmd_ms,"
                     "carrot_N_m,carrot_E_m,carrot_D_m,"
-                    "drone_N_m,drone_E_m,drone_D_m,mode\n")
+                    "drone_N_m,drone_E_m,drone_D_m,mode,"
+                    "agi_match,reacq_blend_w,search_active,search_offset_m,vnudge_bias_ms\n")
             for i in range(len(d["t"])):
                 t_s   = (d["t"][i] - t0) / 1e3
                 v_mag = (d["vcx"][i]**2 + d["vcy"][i]**2 + d["vcz"][i]**2) ** 0.5
@@ -815,18 +851,20 @@ class Logger:
                     f"{v_mag:.4f},"
                     f"{d['cx'][i]:.4f},{d['cy'][i]:.4f},{d['cz'][i]:.4f},"
                     f"{d['dx'][i]:.4f},{d['dy'][i]:.4f},{d['dz'][i]:.4f},"
-                    f"{d['mode'][i]}\n"
+                    f"{d['mode'][i]},"
+                    f"{d['agi_match'][i]},{d['reacq_blend_w'][i]:.4f},"
+                    f"{d['search_active'][i]},{d['search_offset'][i]:.4f},"
+                    f"{d['vnudge_bias'][i]:.4f}\n"
                 )
         print(f"Logger: carrot CSV -> {out}")
 
     # ── EKF ───────────────────────────────────────────────────────────────
 
     def _euler_from_quat(self, qw, qx, qy, qz):
-        """Return (phi, theta, psi) in degrees from quaternion [qw qx qy qz]."""
-        phi   = np.degrees(np.arctan2(2*(qw*qx + qy*qz), 1 - 2*(qx*qx + qy*qy)))
-        theta = np.degrees(np.arcsin(np.clip(2*(qw*qy - qz*qx), -1, 1)))
-        psi   = np.degrees(np.arctan2(2*(qw*qz + qx*qy), 1 - 2*(qy*qy + qz*qz)))
-        return phi, theta, psi
+        """Return (phi, theta, psi) in degrees from quaternion [qw qx qy qz].
+        See rotations.py (quat_to_euler) for the shared radians formula."""
+        phi, theta, psi = rotations.quat_to_euler([qw, qx, qy, qz])
+        return np.degrees(phi), np.degrees(theta), np.degrees(psi)
 
     def _plot_ekf(self):
         with self._lock:
@@ -1350,7 +1388,8 @@ class Logger:
                 "kp0x,kp0y,kp1x,kp1y,kp2x,kp2y,kp3x,kp3y,"
                 "pnp_ok,tvec_x,tvec_y,tvec_z,"
                 "pos_N,pos_E,pos_D,"
-                "vel_ok,vel_N,vel_E,vel_D,speed_ms\n"
+                "vel_ok,vel_N,vel_E,vel_D,speed_ms,"
+                "skip_reason,gate_id_rejected\n"
             )
             for i in range(len(d["wall_t"])):
                 t_s = d["wall_t"][i] - t0
@@ -1358,6 +1397,10 @@ class Logger:
                 def _f(v):
                     return f"{v:.4f}" if v == v else "nan"   # nan-safe formatter
 
+                # skip_reason is free text and may itself contain commas (e.g.
+                # "no track_gates_ned, no cache, no agi") — this writer doesn't
+                # quote fields, so commas are replaced to keep columns aligned.
+                _skip = str(d["skip_reason"][i]).replace(",", ";")
                 f.write(
                     f"{t_s:.4f},{d['frame_id'][i]},{d['detected'][i]},{_f(d['conf'][i])},"
                     f"{_f(d['bb_cx'][i])},{_f(d['bb_cy'][i])},"
@@ -1368,7 +1411,8 @@ class Logger:
                     f"{_f(d['kp3x'][i])},{_f(d['kp3y'][i])},"
                     f"{d['pnp_ok'][i]},{_f(d['tvec_x'][i])},{_f(d['tvec_y'][i])},{_f(d['tvec_z'][i])},"
                     f"{_f(d['pos_N'][i])},{_f(d['pos_E'][i])},{_f(d['pos_D'][i])},"
-                    f"{d['vel_ok'][i]},{_f(d['vel_N'][i])},{_f(d['vel_E'][i])},{_f(d['vel_D'][i])},{_f(d['speed_ms'][i])}\n"
+                    f"{d['vel_ok'][i]},{_f(d['vel_N'][i])},{_f(d['vel_E'][i])},{_f(d['vel_D'][i])},{_f(d['speed_ms'][i])},"
+                    f"{_skip},{d['gate_id_rejected'][i]}\n"
                 )
         print(f"Logger: vision CSV -> {out}")
 
@@ -1384,7 +1428,9 @@ class Logger:
             f.write(
                 "time_s,wall_t,has_pos,pos_N,pos_E,pos_D,"
                 "has_vel,vel_N,vel_E,vel_D,has_yaw,yaw_ned,"
-                "sigma_pos,sigma_vel,sigma_yaw,gate,vel_gate,yaw_gate\n"
+                "has_att,roll_ned,pitch_ned,"
+                "sigma_pos,sigma_vel,sigma_yaw,sigma_att,"
+                "gate,vel_gate,yaw_gate,att_gate\n"
             )
 
             def _f(v):
@@ -1396,8 +1442,9 @@ class Logger:
                     f"{d['has_pos'][i]},{_f(d['pos_N'][i])},{_f(d['pos_E'][i])},{_f(d['pos_D'][i])},"
                     f"{d['has_vel'][i]},{_f(d['vel_N'][i])},{_f(d['vel_E'][i])},{_f(d['vel_D'][i])},"
                     f"{d['has_yaw'][i]},{_f(d['yaw_ned'][i])},"
-                    f"{_f(d['sigma_pos'][i])},{_f(d['sigma_vel'][i])},{_f(d['sigma_yaw'][i])},"
-                    f"{_f(d['gate'][i])},{_f(d['vel_gate'][i])},{_f(d['yaw_gate'][i])}\n"
+                    f"{d['has_att'][i]},{_f(d['roll_ned'][i])},{_f(d['pitch_ned'][i])},"
+                    f"{_f(d['sigma_pos'][i])},{_f(d['sigma_vel'][i])},{_f(d['sigma_yaw'][i])},{_f(d['sigma_att'][i])},"
+                    f"{_f(d['gate'][i])},{_f(d['vel_gate'][i])},{_f(d['yaw_gate'][i])},{_f(d['att_gate'][i])}\n"
                 )
         print(f"Logger: vision-fix CSV -> {out}")
 

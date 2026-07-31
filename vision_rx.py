@@ -11,6 +11,7 @@ import numpy as np
 from ultralytics import YOLO as _YOLO
 
 from dyn import load_params
+import rotations
 
 SIM_SERVER_UDP_IP   = "0.0.0.0"
 SIM_SERVER_UDP_PORT = 5600
@@ -23,6 +24,12 @@ class VisionRX:
         self.logger = logger
 
         _p = load_params("params.yaml")
+        # GT mode's mav_state['quat'] carries the sim's raw ATTITUDE yaw
+        # convention (psi_gt = -psi_NED, not standard NED — see
+        # rotations.gt_yaw_flip/gt_correct_quat's module docstring). Cached
+        # once so every rotation built from that quaternion in this file can
+        # be corrected consistently.
+        self._gt_mode = bool(_p.get('ground_truth_mode', False))
         self._cam_K = np.array([
             [_p.get('cam_fx', 320.), 0.,                   _p.get('cam_cx', 320.)],
             [0.,                   _p.get('cam_fy', 320.), _p.get('cam_cy', 240.)],
@@ -38,6 +45,18 @@ class VisionRX:
         self._ekf_vis_vel_gate  = float(_p.get('ekf_vision_vel_gate',  5.0))
         self._ekf_vis_yaw_sigma = float(_p.get('ekf_vision_yaw_sigma', 0.1))
         self._ekf_vis_yaw_gate  = float(_p.get('ekf_vision_yaw_gate',  1.0))
+        self._ekf_vis_att_sigma = float(_p.get('ekf_vision_att_sigma', 0.15))
+        self._ekf_vis_att_gate  = float(_p.get('ekf_vision_att_gate',  5.0))
+        # Range-scaled, mirroring ekf_vision_sigma_range_k's exact pattern for
+        # position. Confirmed in a flight log: attitude/yaw error consistently
+        # grows during the long-range, mid-approach portion of a segment and
+        # self-corrects once the gate is close (short range) — the same
+        # low-SNR-at-range effect already motivating position's range-scaled
+        # sigma, just not yet applied to the rotation solve extracted from the
+        # same corner detections. 0 = disabled (flat sigma at all ranges,
+        # today's behaviour) until a fitted value is available.
+        self._ekf_vis_yaw_sigma_k = float(_p.get('ekf_vision_yaw_sigma_range_k', 0.0))
+        self._ekf_vis_att_sigma_k = float(_p.get('ekf_vision_att_sigma_range_k', 0.0))
         # Minimum YOLO confidence to accept a detection — rejects low-confidence
         # false positives (background clutter mistaken for a gate) from ever
         # reaching PnP/EKF.
@@ -92,6 +111,41 @@ class VisionRX:
         self._lock_frames   = int(_p.get('vision_lock_frames', 5))
         self._lock_miss_max = int(_p.get('vision_lock_miss',   30))
         self._spike_tol     = float(_p.get('vision_spike_tol', 5.0))
+        # "Largest visible box wins" (below) assumes the closest visible gate
+        # IS the current target. That breaks the instant the current gate goes
+        # out of view while the NEXT gate (farther down-track) is still
+        # visible: with no valid current-gate box, the next gate's box becomes
+        # "largest" by default and gets misattributed as the current gate.
+        # gate_info['ned'] (known from track data, independent of vision) plus
+        # mav_state's own position estimate already give an expected range to
+        # the ACTUAL current gate at zero extra cost — reject a detection
+        # whose measured range disagrees with that by more than ordinary
+        # EKF/PnP noise would explain, rather than feeding a misidentified
+        # detection into lock/EKF/bearing override. Default is well under
+        # typical gate-to-gate spacing (~20m+ on this track) so it can't
+        # confuse adjacent gates for each other, but generous enough to
+        # tolerate EKF position error during a blind spell. Applied at lock
+        # acquisition on every frame, and periodically (every
+        # vision_gate_id_recheck_interval_s) while already locked — see the
+        # check's own site for why the acquisition-only version wasn't
+        # enough: a wrong-gate lock that happens to pass the one-time
+        # acquisition check (e.g. right at a gate handoff, before the
+        # drone has moved far past the previous gate) was then tracked
+        # indefinitely, since vision_spike_tol only checks self-consistency
+        # against the lock's own history, not correctness against the real
+        # target. Confirmed in a flight log: ground-truth position (not just
+        # the EKF estimate) diverged in the wrong lateral direction for an
+        # entire approach following a gate handoff. The periodic recheck
+        # uses the same trusting-mav_state['pos_ned'] logic as acquisition,
+        # so it carries the same self-reinforcing-lockout risk from EKF
+        # drift in principle — but a genuine wrong-gate lock is off by tens
+        # of metres (gate-to-gate spacing), while EKF drift measured this
+        # session tops out around a few metres, so the existing tolerance
+        # discriminates the two cleanly without needing to be tightened.
+        self._gate_id_tol   = float(_p.get('vision_gate_id_tol_m', 10.0))
+        self._gate_id_recheck_interval = float(
+            _p.get('vision_gate_id_recheck_interval_s', 1.5))
+        self._last_id_recheck_t = None   # wall time of the last periodic recheck
         self._locked_dist   = None   # None = lock not yet acquired
         self._consec_det    = 0      # consecutive frames with valid PnP
         self._consec_miss   = 0      # consecutive frames without valid PnP
@@ -108,11 +162,7 @@ class VisionRX:
         self._gauss_k       = int(_p.get('preproc_gauss_k',         0))
 
         # cam→FRD body with upward tilt; cam_tilt_deg from params.yaml (positive = nose up)
-        _tilt = math.radians(float(_p.get('cam_tilt_deg', 20.0)))
-        _st, _ct = math.sin(_tilt), math.cos(_tilt)
-        self._R_cam2body = np.array([[0, _st, _ct],
-                                     [1,  0,   0 ],
-                                     [0, _ct, -_st]], dtype=float)
+        self._R_cam2body = rotations.cam_to_body_matrix(_p.get('cam_tilt_deg', 20.0))
 
         # PnP velocity estimation: sliding window of (wall_t, t_gate_body, gyro_q)
         # tuples — BODY-frame drone->gate vector (fixed R_cam2body only, no live
@@ -121,6 +171,36 @@ class VisionRX:
         # Averaging over N frames reduces differentiation noise by ~N× vs 2-frame diff.
         _vel_win = int(_p.get('vision_vel_window_frames', 10))
         self._pnp_vel_buf = deque(maxlen=max(2, _vel_win))
+        # Parallel buffer of (wall_t, drone_ned) — the already-computed absolute
+        # NED position, one attitude-rotation per SAMPLE rather than one per
+        # regression. See the combination site below for why this is run
+        # alongside (not instead of) the body-frame buffer above.
+        self._pnp_vel_ned_buf = deque(maxlen=max(2, _vel_win))
+        self._vel_cross_check_tol = float(_p.get('vision_vel_cross_check_tol', 2.0))
+        # Minimum sample count / time span before a regression is trusted at
+        # all. Briefly lowered to 5/0.15s to reduce latency, on the theory that
+        # the per-tick dynamic sigma below (_ols_slope_sigma) would tell the
+        # EKF how much to trust a shorter, noisier fit instead of vision_rx
+        # pre-smoothing to a single fixed noise level via window size alone.
+        # Reverted after a real crash traced this exact combination: replaying
+        # the raw per-frame drone_ned samples from that flight (ordinary PnP
+        # scatter, ~0.3-0.4m, no bad samples) through a 5-9 sample/~0.15-0.27s
+        # window reproduced a spurious -3 to -4 m/s slope from what was
+        # actually a small, smooth wiggle in position — a short window's OLS
+        # slope is highly sensitive to exactly this kind of ordinary noise
+        # shape, and the fit's own residuals stayed small throughout (a
+        # straight line still fits a short wiggle "well"), so the dynamic
+        # sigma never flagged it. That spurious velocity got fed to the EKF
+        # near the floor sigma, and directly correlates with the onset of a
+        # real, GT-confirmed roll divergence that crashed the drone into a
+        # gate's inner beam. The dynamic sigma still helps characterize
+        # residual scatter on an adequately-sized window; it does not, on its
+        # own, substitute for the window being long enough that ordinary
+        # position noise averages out rather than dominating the fit — see
+        # this file's vision_vel_window_frames param for the Monte-Carlo data
+        # this reversion restores the margin from.
+        self._vel_min_frames = int(_p.get('vision_vel_min_frames', 8))
+        self._vel_min_span_s = float(_p.get('vision_vel_min_span_s', 0.3))
         # Sanity cap only — real de-rotation (below) handles ordinary flight
         # rotation, this just bails out of the small-angle regime for genuinely
         # extreme spins where first-order quaternion integration breaks down.
@@ -373,7 +453,8 @@ class VisionRX:
             img = cv2.GaussianBlur(img, (gk, gk), 0)
         return img
 
-    def _draw_overlay(self, img, tvec_cam, centre_px, corners, vel_ned_pnp):
+    def _draw_overlay(self, img, tvec_cam, centre_px, corners, vel_ned_pnp,
+                       pnp_skip_reason=None, gate_id_rejected=False):
         """Draw live debug overlay onto a copy of img and return it."""
         vis = img.copy()
         h, w = vis.shape[:2]
@@ -439,6 +520,59 @@ class VisionRX:
         cv2.putText(vis, ng_lbl, (5, 140),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, ng_col, 2, cv2.LINE_AA)
 
+        # ── Transition/reacquisition pipeline diagnostics ───────────────────
+        # Surfaces every stage added this session (locked -> transition ->
+        # search/fallback -> reacquisition) in one place, live, so a failure
+        # mode doesn't need post-flight log archaeology to spot. Controller-
+        # side fields (agi_matches_wp, reacq_blend_w, search/vnudge state) are
+        # published to self.data each control tick; skip_reason/
+        # gate_id_rejected are this vision frame's own local diagnostics,
+        # passed in directly.
+        _y = 166
+        _agi_ok = self.data.get('agi_matches_wp', True)
+        agi_lbl = 'AGI/WP: OK' if _agi_ok else 'AGI/WP: MISMATCH'
+        agi_col = (0, 220, 0) if _agi_ok else (0, 0, 220)
+        cv2.putText(vis, agi_lbl, (5, _y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, agi_col, 2, cv2.LINE_AA)
+        _y += 24
+
+        _reacq = float(self.data.get('reacq_blend_w', 1.0))
+        reacq_lbl = f'REACQ BLEND: {_reacq:.2f}'
+        reacq_col = (0, 220, 0) if _reacq > 0.99 else (30, 140, 255)
+        cv2.putText(vis, reacq_lbl, (5, _y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, reacq_col, 2, cv2.LINE_AA)
+        _y += 24
+
+        if self.data.get('search_active', False):
+            search_lbl = f'SEARCH: {self.data.get("search_descend_offset", 0.0):+.2f}m'
+            search_col = (0, 200, 220)
+        else:
+            search_lbl = 'SEARCH: off'
+            search_col = (120, 120, 120)
+        cv2.putText(vis, search_lbl, (5, _y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, search_col, 2, cv2.LINE_AA)
+        _y += 24
+
+        _vnudge = float(self.data.get('vnudge_bias', 0.0))
+        if abs(_vnudge) > 1e-3:
+            vnudge_lbl = f'VNUDGE: {_vnudge:+.2f}m/s'
+            vnudge_col = (0, 200, 220)
+        else:
+            vnudge_lbl = 'VNUDGE: off'
+            vnudge_col = (120, 120, 120)
+        cv2.putText(vis, vnudge_lbl, (5, _y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, vnudge_col, 2, cv2.LINE_AA)
+        _y += 24
+
+        if gate_id_rejected:
+            cv2.putText(vis, 'ID REJECT: wrong gate?', (5, _y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 220), 2, cv2.LINE_AA)
+            _y += 24
+        elif pnp_skip_reason:
+            cv2.putText(vis, f'SKIP: {pnp_skip_reason}', (5, _y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 165, 255), 1, cv2.LINE_AA)
+            _y += 22
+
         # ── Gate keypoints + quad outline ─────────────────────────────────────
         if corners is not None:
             pts = corners.astype(int)
@@ -495,12 +629,7 @@ class VisionRX:
             _vel_n = np.asarray(_mav_ov['vel_ned'], dtype=float)
             _spd_ov = float(np.linalg.norm(_vel_n))
             if _spd_ov > 0.3:
-                _qw, _qx, _qy, _qz = _mav_ov['quat']
-                _Rb2n = np.array([
-                    [1-2*(_qy*_qy+_qz*_qz),  2*(_qx*_qy-_qw*_qz),  2*(_qx*_qz+_qw*_qy)],
-                    [  2*(_qx*_qy+_qw*_qz),1-2*(_qx*_qx+_qz*_qz),  2*(_qy*_qz-_qw*_qx)],
-                    [  2*(_qx*_qz-_qw*_qy),  2*(_qy*_qz+_qw*_qx),1-2*(_qx*_qx+_qy*_qy)],
-                ], dtype=float)
+                _Rb2n = rotations.quat_to_R_body2ned(_mav_ov['quat'])
                 _vb = _Rb2n.T @ _vel_n          # body frame: x=fwd, y=right, z=down
                 _VLEN = 80                       # fixed arrow length in pixels
                 _vtx = ic_x + int(_VLEN * _vb[1] / _spd_ov)   # body-right → cam-x
@@ -562,12 +691,14 @@ class VisionRX:
         ned_down_cam = np.array([0.0, 1.0, 0.0])    # cam_Y fallback (level drone)
         mav = self.data.get('mav_state')
         if mav is not None:
-            qw, qx, qy, qz = mav['quat']
-            R_b2n = np.array([
-                [1-2*(qy*qy+qz*qz),   2*(qx*qy-qw*qz), 2*(qx*qz+qw*qy)],
-                [  2*(qx*qy+qw*qz), 1-2*(qx*qx+qz*qz), 2*(qy*qz-qw*qx)],
-                [  2*(qx*qz-qw*qy),   2*(qy*qz+qw*qx), 1-2*(qx*qx+qy*qy)],
-            ], dtype=float)
+            # No gt_correct_quat needed here specifically: extracting "which
+            # body direction is NED-down" is yaw-invariant (rotating the
+            # world Z-axis about itself is a no-op), so GT mode's raw yaw
+            # convention in mav['quat'] doesn't affect this one. Every other
+            # mav['quat'] use in this file rotates a horizontal body-frame
+            # vector (a bearing/position), where yaw direction does matter —
+            # those all go through gt_correct_quat.
+            R_b2n = rotations.quat_to_R_body2ned(mav['quat'])
             ned_down_body = R_b2n.T @ np.array([0.0, 0.0, 1.0])
             ned_down_cam  = self._R_cam2body.T @ ned_down_body
 
@@ -610,12 +741,11 @@ class VisionRX:
                 # independent anchor a single bad vision frame can't have
                 # already poisoned (see docstring for why the rotational-
                 # continuity fallback below can self-reinforce a wrong lock).
-                qw, qx, qy, qz = mav['quat']
-                R_b2n = np.array([
-                    [1-2*(qy*qy+qz*qz),  2*(qx*qy-qw*qz),  2*(qx*qz+qw*qy)],
-                    [  2*(qx*qy+qw*qz),1-2*(qx*qx+qz*qz),  2*(qy*qz-qw*qx)],
-                    [  2*(qx*qz-qw*qy),  2*(qy*qz+qw*qx),1-2*(qx*qx+qy*qy)],
-                ])
+                # gt_correct_quat: this rotates a body-frame bearing into NED,
+                # so GT mode's raw yaw convention would rotate it the wrong
+                # way (see rotations.py's module note) if left uncorrected.
+                R_b2n = rotations.quat_to_R_body2ned(
+                    rotations.gt_correct_quat(mav['quat'], self._gt_mode))
                 mav_pos = np.asarray(mav['pos_ned'])
 
                 def _implied_pos(tv_cand):
@@ -639,11 +769,8 @@ class VisionRX:
                 # position check above exists to avoid.
                 last_R = getattr(self, continuity_attr, None)
                 if last_R is not None:
-                    def _rot_dist(Ra, Rb):
-                        _cos = (np.trace(Ra.T @ Rb) - 1.0) / 2.0
-                        return np.arccos(np.clip(_cos, -1.0, 1.0))
-                    d0 = _rot_dist(candidates[0][3], last_R)
-                    d1 = _rot_dist(candidates[1][3], last_R)
+                    d0 = rotations.rotation_angle_distance(candidates[0][3], last_R)
+                    d1 = rotations.rotation_angle_distance(candidates[1][3], last_R)
                     if d1 < d0:
                         best_score, best_rvec, best_tvec, best_R = candidates[1]
 
@@ -652,26 +779,62 @@ class VisionRX:
         setattr(self, continuity_attr, best_R)
         return best_tvec, best_rvec
 
-    def _yaw_from_pnp(self, rvec, gate_quat_wxyz):
+    def _attitude_from_pnp(self, rvec, gate_quat_wxyz):
         """
-        Derive drone yaw (NED, radians) from PnP rvec + known gate orientation.
-
-        The gate y-axis is world-Down (gate is perfectly horizontal), and with
-        roll=0 the drone body-z is also world-Down, so the only free attitude
-        degree of freedom is yaw.  The gate quaternion from track data gives the
-        gate frame orientation in NED, completing the chain:
+        Derive drone (roll, pitch, yaw) NED, radians, from PnP rvec + known
+        gate orientation. The gate quaternion from track data gives the gate
+        frame orientation in NED, completing the chain:
             R_b2n = R_gate2ned @ R_gate2cam.T @ R_cam2body.T
+        R_b2n is a full attitude, so roll/pitch fall out of the same matrix
+        at no extra PnP cost — used by ekf.py's update_attitude as vision's
+        only *ongoing* roll/pitch correction that doesn't have to go silent
+        during real linear acceleration the way the accelerometer-based
+        update does.
+
+        Square gates have a 4-fold corner-labelling ambiguity: solvePnP can
+        return a pose rotated by any multiple of 90 degrees about the gate's
+        own normal axis (relabelling which detected corner is "top-left").
+        This used to be handled by rounding the resulting YAW's deviation
+        from the EKF's current yaw to the nearest 90 degrees and subtracting
+        it from yaw alone (see git history) — but for how these gates are
+        actually mounted (normal roughly horizontal, pointing back down the
+        track, not aligned with the world yaw/vertical axis), a 90-degree
+        mislabelling shifts YAW by only a few degrees — well under that
+        heuristic's 45-degree detection threshold, so it never actually
+        fired — while shifting ROLL by ~90-180 degrees. Confirmed via a
+        synthetic forward-model test and matched exactly against real
+        flight logs: roll_ned spanned the full +-180 degrees essentially at
+        random while yaw_ned tracked GT with only ~13 degree mean error.
+        Fixed here by resolving the ambiguity against the EKF's FULL current
+        attitude (not just yaw) and correcting the whole rotation before
+        extracting any of the three angles, so roll/pitch/yaw stay
+        self-consistent regardless of which world axis the mislabelling
+        happens to project onto.
         """
         R_gate2cam, _ = cv2.Rodrigues(rvec.reshape(3, 1))
-        qw, qx, qy, qz = gate_quat_wxyz
-        R_gate2ned = np.array([
-            [1 - 2*(qy*qy + qz*qz),  2*(qx*qy - qw*qz),  2*(qx*qz + qw*qy)],
-            [    2*(qx*qy + qw*qz),  1 - 2*(qx*qx + qz*qz),  2*(qy*qz - qw*qx)],
-            [    2*(qx*qz - qw*qy),  2*(qy*qz + qw*qx),  1 - 2*(qx*qx + qy*qy)],
-        ], dtype=float)
-        R_cam2ned = R_gate2ned @ R_gate2cam.T
-        R_b2n     = R_cam2ned  @ self._R_cam2body.T
-        return float(np.arctan2(R_b2n[1, 0], R_b2n[0, 0]))
+        R_gate2ned = rotations.quat_to_R_body2ned(gate_quat_wxyz)
+
+        mav = self.data.get('mav_state')
+        # gt_correct_quat: this disambiguation compares candidate attitudes
+        # against the drone's current attitude — in GT mode mav['quat']'s raw
+        # yaw would make that reference itself wrong along exactly the axis
+        # this search is trying to resolve (see rotations.py's module note).
+        R_ekf = (rotations.quat_to_R_body2ned(
+                     rotations.gt_correct_quat(mav['quat'], self._gt_mode))
+                 if mav is not None else np.eye(3))
+
+        best_R_b2n, best_dist = None, np.inf
+        for n in range(4):
+            c, s = np.cos(n * np.pi / 2.0), np.sin(n * np.pi / 2.0)
+            Rz_n = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+            R_cam2ned_cand = R_gate2ned @ (R_gate2cam @ Rz_n).T
+            R_b2n_cand = R_cam2ned_cand @ self._R_cam2body.T
+            dist = rotations.rotation_angle_distance(R_b2n_cand, R_ekf)
+            if dist < best_dist:
+                best_dist, best_R_b2n = dist, R_b2n_cand
+
+        roll, pitch, yaw = rotations.euler_from_R_body2ned(best_R_b2n)
+        return roll, pitch, yaw
 
     # ── Gyro-only attitude tracking (velocity de-rotation helper) ───────────
 
@@ -686,14 +849,30 @@ class VisionRX:
             w1*z2 + x1*y2 - y1*x2 + z1*w2,
         ])
 
+    # v_ned = R @ v_body — see rotations.py.
+    _quat_to_R = staticmethod(rotations.quat_to_R_body2ned)
+
     @staticmethod
-    def _quat_to_R(q):
-        qw, qx, qy, qz = q
-        return np.array([
-            [1-2*(qy*qy+qz*qz),  2*(qx*qy-qw*qz),  2*(qx*qz+qw*qy)],
-            [  2*(qx*qy+qw*qz),1-2*(qx*qx+qz*qz),  2*(qy*qz-qw*qx)],
-            [  2*(qx*qz-qw*qy),  2*(qy*qz+qw*qx),1-2*(qx*qx+qy*qy)],
-        ], dtype=float)
+    def _ols_slope_sigma(A, y, coef):
+        """Standard error of an OLS slope (column 0 of `coef`), as a single
+        scalar summarizing all columns of `y`. Used to give the EKF a per-tick
+        velocity sigma that reflects how good THIS window's fit actually was
+        (short/noisy vs. long/settled), instead of one fixed sigma for every
+        fit regardless of quality.
+
+        sigma_slope^2 = residual_variance * (AtA)^-1[0,0] per column (standard
+        OLS slope-covariance result); averaging that variance across columns
+        before rotation gives the same trace/3 as after rotation by any
+        orthogonal R (v_ned = R @ v_body), since trace(R Cov R^T) = trace(Cov)
+        — so this can be computed once in whichever frame is convenient.
+        """
+        n, p = A.shape
+        dof = max(n - p, 1)
+        resid = y - A @ coef
+        rss = np.sum(resid**2, axis=0)              # (ncols,)
+        AtA_inv_00 = np.linalg.inv(A.T @ A)[0, 0]
+        slope_var = (rss / dof) * AtA_inv_00         # (ncols,)
+        return float(np.sqrt(np.mean(slope_var)))
 
     def _update_gyro_q(self, now):
         """First-order-integrate the gyro-only attitude to `now` and return it.
@@ -746,11 +925,38 @@ class VisionRX:
         gate_info = None
         drone_ned = None
         _pnp_skip_reason = None   # diagnostic: why PnP was skipped this frame
+        _gate_id_rejected = False   # this frame's detection failed the gate-identity check
         # Use the mode stamped at frame *capture* time (see _recv_loop), not a
         # live read here — process_frame can run up to ~170ms after capture
         # under queueing backlog, by which point controller.py's async control
         # loop may have already flipped vis_ctrl_mode back out of TRANSITION.
         _in_transit = ctrl_mode_at_capture == 'TRANSITION'
+
+        # ── Gate distance lock reset ──────────────────────────────────────────
+        # Reset lock when the sim advances to the next gate (active_gate_index
+        # changes). Moved here (before detection/gate-identity processing
+        # below) from its previous position after the next-gate-candidate
+        # block: that ordering left self._locked_dist holding the OLD gate's
+        # value for the entire frame where agi actually changes, so the
+        # gate-identity plausibility check below (gated on `_locked_dist is
+        # None`) silently skipped its very first, most-needed frame — the
+        # one right at the transition. Resetting first means the identity
+        # check sees the correct (None) lock state from the transition frame
+        # onward, with no one-frame gap.
+        agi = self.data.get('active_gate_index')
+        if agi != self._prev_agi and self._prev_agi is not None:
+            self._locked_dist = None
+            self._consec_det  = 0
+            self._consec_miss = 0
+            self._pnp_vel_buf.clear()        # stale relative vectors from old gate are invalid
+            self._pnp_vel_ned_buf.clear()    # same for the parallel NED-position buffer
+            self._pnp_yaw_buf.clear()        # stale yaw readings from old gate are invalid
+            self._last_pnp_R_primary = None  # stale rotation continuity from old gate is invalid
+            self._last_pnp_R_next    = None
+            self._next_gate_ned_buf.clear()  # next-gate buffer also invalid after advance
+            self._next_gate_ned = None
+            print(f"[VISION] gate index {self._prev_agi}→{agi}: lock reset", flush=True)
+        self._prev_agi = agi
 
         h_img, w_img = mask_raw.shape
         if results is not None and results[0].boxes is not None \
@@ -893,6 +1099,59 @@ class VisionRX:
                     else:
                         _pnp_skip_reason = "no track_gates_ned (waypoint NED fallback)"
 
+                # ── Gate-identity plausibility check ──────────────────────
+                # See _gate_id_tol's definition for why this exists and why
+                # it's safe to run periodically, not just at acquisition.
+                # _locked_dist is None => acquisition, check every frame.
+                # Otherwise, only re-check every _gate_id_recheck_interval_s —
+                # running it every single locked frame would carry the full
+                # self-reinforcing-lockout risk from ordinary EKF drift that
+                # acquisition-only scoping was originally meant to avoid;
+                # a period on the order of a second is frequent enough to
+                # catch a wrong-gate lock well within one approach while
+                # keeping the EKF-drift false-trigger risk low.
+                _id_check_due = (
+                    self._locked_dist is None
+                    or self._last_id_recheck_t is None
+                    or (time.time() - self._last_id_recheck_t) >= self._gate_id_recheck_interval
+                )
+                if tvec_cam is not None and gate_info is not None and _id_check_due:
+                    _mav_id = self.data.get('mav_state')
+                    if _mav_id is not None:
+                        _was_locked = self._locked_dist is not None
+                        self._last_id_recheck_t = time.time()
+                        _expected_range  = float(np.linalg.norm(
+                            np.asarray(gate_info['ned']) - np.asarray(_mav_id['pos_ned'])))
+                        _measured_range  = float(tvec_cam[2])
+                        if abs(_measured_range - _expected_range) > self._gate_id_tol:
+                            tvec_cam   = None
+                            rvec_cam   = None
+                            gate_info  = None
+                            detected   = False
+                            centre_px  = None
+                            conf       = 0.0
+                            best_box   = None
+                            _gate_id_rejected = True
+                            _pnp_skip_reason = "range mismatch vs expected gate range (likely next gate)"
+                            if _was_locked:
+                                # A lock this far off its expected target is
+                                # wrong, not just noisy — drop it entirely
+                                # (rather than only rejecting this one frame)
+                                # so the next successful detection goes
+                                # through full acquisition instead of being
+                                # folded into the same bad lock's history.
+                                self._locked_dist = None
+                                self._consec_det  = 0
+                                self._consec_miss = 0
+                                self._pnp_vel_buf.clear()
+                                self._pnp_vel_ned_buf.clear()
+                                self._pnp_yaw_buf.clear()
+                                self._last_pnp_R_primary = None
+                                self._last_pnp_R_next    = None
+                                print(f"[VISION] gate-identity recheck failed while locked "
+                                      f"(range {_measured_range:.1f}m "
+                                      f"vs expected {_expected_range:.1f}m) — lock dropped", flush=True)
+
                 # ── Next-gate candidate (second-largest valid box) ────────────
                 # Accumulates PnP-derived NED positions across many frames and
                 # publishes a confirmed median position once the buffer is full.
@@ -911,12 +1170,7 @@ class VisionRX:
                             and _tvec_ng[2] < self._max_gate_dist):
                         _mav_ng = self.data.get('mav_state')
                         if _mav_ng is not None:
-                            _qw, _qx, _qy, _qz = _mav_ng['quat']
-                            _R_b2n_ng = np.array([
-                                [1-2*(_qy*_qy+_qz*_qz),  2*(_qx*_qy-_qw*_qz),  2*(_qx*_qz+_qw*_qy)],
-                                [  2*(_qx*_qy+_qw*_qz),1-2*(_qx*_qx+_qz*_qz),  2*(_qy*_qz-_qw*_qx)],
-                                [  2*(_qx*_qz-_qw*_qy),  2*(_qy*_qz+_qw*_qx),1-2*(_qx*_qx+_qy*_qy)],
-                            ], dtype=float)
+                            _R_b2n_ng = rotations.quat_to_R_body2ned(_mav_ng['quat'])
                             _t_ng_ned = _R_b2n_ng @ (self._R_cam2body @ _tvec_ng)
                             _gate2_ned = np.asarray(_mav_ng['pos_ned']) + _t_ng_ned
                             self._next_gate_ned_buf.append(_gate2_ned)
@@ -936,22 +1190,6 @@ class VisionRX:
             rvec_cam = None
             gate_info = None
 
-        # ── Gate distance lock ────────────────────────────────────────────────
-        # Reset lock when the sim advances to the next gate (active_gate_index changes).
-        agi = self.data.get('active_gate_index')
-        if agi != self._prev_agi and self._prev_agi is not None:
-            self._locked_dist = None
-            self._consec_det  = 0
-            self._consec_miss = 0
-            self._pnp_vel_buf.clear()        # stale relative vectors from old gate are invalid
-            self._pnp_yaw_buf.clear()        # stale yaw readings from old gate are invalid
-            self._last_pnp_R_primary = None  # stale rotation continuity from old gate is invalid
-            self._last_pnp_R_next    = None
-            self._next_gate_ned_buf.clear()  # next-gate buffer also invalid after advance
-            self._next_gate_ned = None
-            print(f"[VISION] gate index {self._prev_agi}→{agi}: lock reset", flush=True)
-        self._prev_agi = agi
-
         # ── Hover-reset detection ────────────────────────────────────────────
         # pos_offset_ned is set exactly once, at hover-reset (imu_ekf.py). A
         # change means a reset just happened — clear the velocity buffer and
@@ -965,6 +1203,7 @@ class VisionRX:
             # flight, which is exactly the one that matters here.
             if _pos_off_key != self._last_pos_offset_ned:
                 self._pnp_vel_buf.clear()
+                self._pnp_vel_ned_buf.clear()
                 self._gyro_q        = np.array([1.0, 0.0, 0.0, 0.0])
                 self._gyro_q_last_t = None
                 print("[VISION] hover-reset detected: velocity buffer/gyro tracker reset",
@@ -1005,8 +1244,14 @@ class VisionRX:
         # This gives a bearing to the gate center even without keypoints or PnP.
         # The centroid is published as centre_px so the controller can use it for
         # visual yaw correction (keep gate centered).
+        # Skipped when this frame's YOLO detection was itself rejected by the
+        # gate-identity check above: the same wrong (next) gate's blob is still
+        # the dominant orange region in the mask, so this fallback would just
+        # rediscover it via a cruder path and steer at it anyway. Treat this
+        # frame as genuinely blind instead — the reacquisition/search-nudge
+        # logic in controller.py is built to handle that gracefully.
         centroid_area = 0
-        if not detected:
+        if not detected and not _gate_id_rejected:
             ccx, ccy, centroid_area = self._orange_centroid(mask_raw)
             if ccx is not None:
                 centre_px = np.array([ccx, ccy])
@@ -1031,41 +1276,36 @@ class VisionRX:
         # unnecessary).
         vel_ned     = None
         vel_ned_pnp = None
+        _vel_body   = None   # body-frame-regression PnP velocity estimate (see below)
+        _vel_pos    = None   # NED-position-regression PnP velocity estimate (see below)
+        _sigma_body = None   # per-tick fit-quality sigma for _vel_body [m/s]
+        _sigma_pos_vel = None   # per-tick fit-quality sigma for _vel_pos [m/s]
+        _sigma_vel_dyn = None   # combined dynamic sigma for vel_ned_pnp [m/s]
         drone_ned   = None
         yaw_ned     = None
+        roll_ned    = None
+        pitch_ned   = None
 
         if tvec_cam is not None:
-            # Yaw estimate: requires gate quaternion from track data.
+            # Attitude estimate: requires gate quaternion from track data.
             # Unavailable in the pure-fallback path (gate_info=None).
             if gate_info is not None and gate_info.get('quat') is not None:
                 try:
-                    yaw_ned = self._yaw_from_pnp(rvec_cam, gate_info['quat'])
-                    # Resolve PnP rotational ambiguity for square gates (4-fold symmetry).
-                    # solvePnP can return a pose off by any multiple of 90°. Round the
-                    # innovation to the nearest 90° step and subtract it to recover the
-                    # correct yaw.  Safe as long as the drone's true yaw deviation from
-                    # the EKF is < 45° — which holds for normal gate-approach geometry.
-                    # This ambiguity is a corner-labelling problem only: for a square
-                    # gate, relabelling which detected corner is "TL" by 90° rotates the
-                    # recovered orientation but leaves the object's centre — and hence
-                    # tvec/position — unchanged (confirmed empirically: testing all 4
-                    # cyclic corner relabellings against real flight corners showed the
-                    # "correct" one wins with a large, confident margin every time, i.e.
-                    # this is genuinely just a labelling ambiguity, not a translation
-                    # error). So only yaw needs the correction below; tvec stays usable
-                    # even when this fires — it used to be discarded here too, which
-                    # threw out ~58% of otherwise-good position fixes in one flight log.
-                    _mav = self.data.get('mav_state')
-                    if _mav is not None:
-                        _qw, _qx, _qy, _qz = _mav['quat']
-                        _yaw_ekf = np.arctan2(2*(_qw*_qz + _qx*_qy),
-                                              1 - 2*(_qy*_qy + _qz*_qz))
-                        _innov = (yaw_ned - _yaw_ekf + np.pi) % (2*np.pi) - np.pi
-                        _n = round(_innov / (np.pi / 2))
-                        if _n != 0:
-                            yaw_ned = (yaw_ned - _n * np.pi / 2 + np.pi) % (2*np.pi) - np.pi
+                    # The square-gate 4-fold corner-labelling ambiguity (solvePnP
+                    # can return a pose off by any multiple of 90° about the
+                    # gate's own normal) is now resolved *inside*
+                    # _attitude_from_pnp, jointly for roll/pitch/yaw against the
+                    # EKF's full current attitude — see that method's docstring.
+                    # tvec/position is unaffected by this ambiguity either way
+                    # (confirmed empirically: relabelling which corner is "TL"
+                    # rotates the recovered orientation but leaves the object's
+                    # centre unchanged), so it's used as-is regardless.
+                    roll_ned, pitch_ned, yaw_ned = self._attitude_from_pnp(
+                        rvec_cam, gate_info['quat'])
                 except Exception:
                     yaw_ned = None
+                    roll_ned = None
+                    pitch_ned = None
 
                 if yaw_ned is not None:
                     # Circular-mean smoothing + outlier rejection (see buffer init comment).
@@ -1083,12 +1323,12 @@ class VisionRX:
             if gate_info is not None:
                 mav = self.data.get('mav_state')
                 if mav is not None:
-                    qw, qx, qy, qz = mav['quat']
-                    R_b2n = np.array([
-                        [1-2*(qy*qy+qz*qz),  2*(qx*qy-qw*qz),  2*(qx*qz+qw*qy)],
-                        [  2*(qx*qy+qw*qz),1-2*(qx*qx+qz*qz),  2*(qy*qz-qw*qx)],
-                        [  2*(qx*qz-qw*qy),  2*(qy*qz+qw*qx),1-2*(qx*qx+qy*qy)],
-                    ])
+                    # gt_correct_quat: this is the main PnP position solve —
+                    # rotating a body-frame gate bearing into NED. GT mode's
+                    # raw yaw convention would rotate it the wrong way (see
+                    # rotations.py's module note) if left uncorrected.
+                    R_b2n = rotations.quat_to_R_body2ned(
+                        rotations.gt_correct_quat(mav['quat'], self._gt_mode))
                     t_gate_body = self._R_cam2body @ tvec_cam
                     t_gate_ned  = R_b2n @ t_gate_body
                     drone_ned   = gate_info['ned'] - t_gate_ned
@@ -1139,7 +1379,9 @@ class VisionRX:
                     # gap since the last sample is large enough to matter.
                     if self._pnp_vel_buf and (now - self._pnp_vel_buf[-1][0]) > 0.15:
                         self._pnp_vel_buf.clear()
+                        self._pnp_vel_ned_buf.clear()
                     self._pnp_vel_buf.append((now, t_gate_body.copy(), _gyro_q))
+                    self._pnp_vel_ned_buf.append((now, drone_ned.copy()))
                     # Windowed velocity: least-squares slope over all buffered samples,
                     # not an endpoint difference. Endpoint-difference only ever uses 2 of
                     # the N buffered positions (the oldest and newest), so raising
@@ -1157,10 +1399,10 @@ class VisionRX:
                     # velocity — confirmed in the same flight log, immediately after a
                     # hover-reset buffer clear. Better to report no PnP velocity for the
                     # ~0.3s refill period than a noise-dominated one.
-                    if len(self._pnp_vel_buf) >= 8:
+                    if len(self._pnp_vel_buf) >= self._vel_min_frames:
                         _ts   = np.array([t for t, _, _ in self._pnp_vel_buf])
                         _dt_win = float(_ts[-1] - _ts[0])
-                        if _dt_win >= 0.3:
+                        if _dt_win >= self._vel_min_span_s:
                             _R_now = self._quat_to_R(_gyro_q)
                             # Sanity cap: if the total rotation implied is extreme
                             # (near-tumbling), first-order integration and the
@@ -1186,7 +1428,66 @@ class VisionRX:
                                 _v_gate_rel_body = _coef[0]   # d(t_gate_body)/dt, current-body-frame
                                 # Gate is stationary: v_drone_ned = -R_b2n @ d(t_gate_body)/dt,
                                 # rotated by the CURRENT attitude only (see comment above).
-                                vel_ned_pnp = -(R_b2n @ _v_gate_rel_body)
+                                _vel_body = -(R_b2n @ _v_gate_rel_body)
+                                _sigma_body = self._ols_slope_sigma(_A, _relpos, _coef)
+
+                    # Second, independent estimate: regress the already-computed
+                    # drone_ned (world-NED position) directly. No de-rotation
+                    # needed here — these samples are already in a common frame
+                    # — so this is exactly as simple as it looks, at the cost of
+                    # the file-header comment's concern: each sample carries its
+                    # OWN tick's attitude estimate baked in, so if attitude drifts
+                    # or glitches between samples, this regression inherits it
+                    # directly (unlike the body-frame one above, which only uses
+                    # attitude once, at the end). That tradeoff is exactly why
+                    # this runs ALONGSIDE the body-frame estimate rather than
+                    # replacing it: the two have different, largely independent
+                    # failure modes (in-window rotation sweep vs. per-sample
+                    # attitude/position glitches), so cross-checking them against
+                    # each other catches whichever one a single method would have
+                    # silently trusted. Confirmed against a real flight log: a
+                    # single bad PnP position sample produced an 18 m/s spurious
+                    # body-frame-regression velocity that only decayed back to
+                    # correct over ~0.3s as the buffer refilled — the same bad
+                    # sample would have thrown the NED-position regression off by
+                    # a comparable amount at the same instant, which is exactly
+                    # the kind of disagreement the check below is meant to catch.
+                    if len(self._pnp_vel_ned_buf) >= self._vel_min_frames:
+                        _ts2 = np.array([t for t, _ in self._pnp_vel_ned_buf])
+                        if float(_ts2[-1] - _ts2[0]) >= self._vel_min_span_s:
+                            _pos2   = np.array([p for _, p in self._pnp_vel_ned_buf])
+                            _ts2_c  = _ts2 - _ts2[0]
+                            _A2     = np.vstack([_ts2_c, np.ones_like(_ts2_c)]).T
+                            _coef2  = np.linalg.lstsq(_A2, _pos2, rcond=None)[0]
+                            _vel_pos = _coef2[0]   # d(drone_ned)/dt
+                            _sigma_pos_vel = self._ols_slope_sigma(_A2, _pos2, _coef2)
+
+            # Combine the two independent estimates. Agreement is evidence
+            # neither buffer currently contains a corrupted sample — average
+            # them for a less noisy result. Disagreement beyond
+            # vision_vel_cross_check_tol means at least one is compromised
+            # (bad position sample, in-window rotation sweep, gate-reference
+            # mismatch, ...) and — critically — the two methods' failure modes
+            # are different enough that we have no principled way to tell
+            # which one to believe, so reject both rather than guess. Falls
+            # back to whichever single estimate is available if the other
+            # method's buffer hasn't filled yet (they normally fill in lockstep
+            # since both append once per frame, so this is rare in practice).
+            if _vel_body is not None and _vel_pos is not None:
+                if float(np.linalg.norm(_vel_body - _vel_pos)) <= self._vel_cross_check_tol:
+                    # Inverse-variance weighted average, using each regression's
+                    # own per-tick fit-quality sigma (see _ols_slope_sigma)
+                    # instead of a flat 50/50 mean — whichever fit was actually
+                    # better (longer/cleaner window) counts for more.
+                    _w_body = 1.0 / max(_sigma_body**2, 1e-6)
+                    _w_pos  = 1.0 / max(_sigma_pos_vel**2, 1e-6)
+                    vel_ned_pnp = (_w_body * _vel_body + _w_pos * _vel_pos) / (_w_body + _w_pos)
+                    _sigma_vel_dyn = float(np.sqrt(1.0 / (_w_body + _w_pos)))
+                else:
+                    vel_ned_pnp = None
+            else:
+                vel_ned_pnp = _vel_body if _vel_body is not None else _vel_pos
+                _sigma_vel_dyn = _sigma_body if _vel_body is not None else _sigma_pos_vel
 
             if vel_ned_pnp is not None:
                 # Gate PnP velocity against max(current_speed, v_ref) × factor.
@@ -1197,6 +1498,7 @@ class VisionRX:
                 _vel_max = max(_v_now, self._v_ref) * self._vel_max_factor
                 if float(np.linalg.norm(vel_ned_pnp)) > _vel_max:
                     vel_ned_pnp = None
+                    _sigma_vel_dyn = None
 
             if drone_ned is not None or yaw_ned is not None or vel_ned_pnp is not None:
                 # Position sigma grows with range: PnP lateral accuracy is sub-metre
@@ -1210,14 +1512,36 @@ class VisionRX:
                 # of applying one fixed sigma to both regimes.
                 _sigma_pos_dyn = (self._ekf_vis_sigma
                                    + self._ekf_vis_sigma_k * float(tvec_cam[2]))
+                # Same range-scaling idea applied to yaw/attitude (see
+                # ekf_vision_yaw_sigma_range_k/ekf_vision_att_sigma_range_k in
+                # params.yaml): the rotation solve comes from the same corner
+                # detections as position, so it degrades with range the same
+                # way. k=0 (default) reproduces today's flat-sigma behaviour.
+                _sigma_yaw_dyn = (self._ekf_vis_yaw_sigma
+                                   + self._ekf_vis_yaw_sigma_k * float(tvec_cam[2]))
+                _sigma_att_dyn = (self._ekf_vis_att_sigma
+                                   + self._ekf_vis_att_sigma_k * float(tvec_cam[2]))
+                # Per-tick fit-quality sigma (see _ols_slope_sigma), floored at
+                # ekf_vision_vel_sigma so a near-singular fit can't produce an
+                # unrealistically small sigma. Lets update_velocity's Kalman
+                # gain trust a long/clean-window fit more and a short/noisy one
+                # (e.g. right after a reacquisition, before the buffer refills)
+                # less, instead of one fixed sigma for every fit regardless of
+                # actual quality.
+                _sigma_vel_out = (max(_sigma_vel_dyn, self._ekf_vis_vel_sigma)
+                                   if _sigma_vel_dyn is not None else self._ekf_vis_vel_sigma)
                 self.data['_vision_ekf_update'] = {
                     'pos_ned':   drone_ned,
                     'vel_ned':   vel_ned_pnp,
                     'yaw_ned':   yaw_ned,
+                    'roll_ned':  roll_ned,
+                    'pitch_ned': pitch_ned,
                     'sigma_pos': _sigma_pos_dyn,
-                    'sigma_vel': self._ekf_vis_vel_sigma,
-                    'sigma_yaw': self._ekf_vis_yaw_sigma,
+                    'sigma_vel': _sigma_vel_out,
+                    'sigma_yaw': _sigma_yaw_dyn,
+                    'sigma_att': _sigma_att_dyn,
                     'yaw_gate':  self._ekf_vis_yaw_gate,
+                    'att_gate':  self._ekf_vis_att_gate,
                     'gate':      self._ekf_vis_gate,
                     'vel_gate':  self._ekf_vis_vel_gate,
                     'wall_t':    time.time(),   # item 4: capture timestamp for latency compensation
@@ -1231,7 +1555,9 @@ class VisionRX:
                         wall_t=_vu['wall_t'], pos_ned=_vu['pos_ned'], vel_ned=_vu['vel_ned'],
                         yaw_ned=_vu['yaw_ned'], sigma_pos=_vu['sigma_pos'], sigma_vel=_vu['sigma_vel'],
                         sigma_yaw=_vu['sigma_yaw'], gate=_vu['gate'], vel_gate=_vu['vel_gate'],
-                        yaw_gate=_vu['yaw_gate'])
+                        yaw_gate=_vu['yaw_gate'],
+                        roll_ned=_vu['roll_ned'], pitch_ned=_vu['pitch_ned'],
+                        sigma_att=_vu['sigma_att'], att_gate=_vu['att_gate'])
 
             if drone_ned is not None:
                 _dist_m = float(tvec_cam[2])
@@ -1303,6 +1629,8 @@ class VisionRX:
                 drone_ned = drone_ned,
                 vel_ned   = vel_ned_pnp,
                 gate_ned  = gate_info['ned'] if gate_info is not None else None,
+                skip_reason       = _pnp_skip_reason,
+                gate_id_rejected  = _gate_id_rejected,
             )
 
             annotated = img.copy()
@@ -1325,7 +1653,9 @@ class VisionRX:
                             (0, 255, 255), 1, cv2.LINE_AA)
 
             if self._debug_overlay:
-                annotated = self._draw_overlay(annotated, tvec_cam, centre_px, corners, vel_ned_pnp)
+                annotated = self._draw_overlay(annotated, tvec_cam, centre_px, corners, vel_ned_pnp,
+                                                pnp_skip_reason=_pnp_skip_reason,
+                                                gate_id_rejected=_gate_id_rejected)
 
             # Always save frames with a detection; rate-limit background frames
             self.logger.log_frame(frame_id, annotated, force=detected,

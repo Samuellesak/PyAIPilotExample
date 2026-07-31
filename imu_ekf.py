@@ -34,6 +34,7 @@ import numpy as np
 
 from ekf import QuadEKF
 from dyn import _quat_to_R as _dyn_quat_to_R
+import rotations
 
 
 def _quat_mult(q1, q2):
@@ -46,6 +47,13 @@ def _quat_mult(q1, q2):
         w1*y2 - x1*z2 + y1*w2 + z1*x2,
         w1*z2 + x1*y2 - y1*x2 + z1*w2,
     ])
+
+
+def _quat_to_euler_deg(q):
+    """ZYX Tait-Bryan (roll, pitch, yaw) in degrees from q = [qw, qx, qy, qz].
+    See rotations.py (quat_to_euler) for the shared radians formula."""
+    roll, pitch, yaw = rotations.quat_to_euler(q)
+    return np.degrees(roll), np.degrees(pitch), np.degrees(yaw)
 
 
 class IMUEKFHandler:
@@ -140,6 +148,40 @@ class IMUEKFHandler:
             ])
             print(f'[IMUEKFHandler] model_predict_shadow → {self._mp_shadow_path}', flush=True)
 
+        # Shadow log: live EKF estimate vs ground truth, error computed every
+        # tick. Most meaningful with ground_truth_mode: false (a genuinely
+        # free-running EKF) — in ground_truth_mode: true this would just show
+        # ~0 error, since self._ekf.x IS gt every tick by construction. Reuses
+        # the same raw-GT read + R_align/sim_ned_offset/q_align transform as
+        # the ground-truth-override block below, so the comparison is in the
+        # EKF's own (hover-reset-zeroed) frame — comparing against raw
+        # unaligned GT would show a frame offset, not real estimation error.
+        self._gt_err_shadow_enabled = bool(param.get('ekf_gt_error_shadow', False))
+        self._gt_err_shadow_tick    = 0
+        self._gt_err_shadow_writer  = None
+        self._gt_err_shadow_file    = None
+        self._gt_err_shadow_path    = None
+        if self._gt_err_shadow_enabled:
+            import csv, os
+            _dir = (logger.session_dir
+                    if logger is not None and hasattr(logger, 'session_dir')
+                    else 'logs')
+            os.makedirs(_dir, exist_ok=True)
+            self._gt_err_shadow_path   = os.path.join(_dir, 'ekf_gt_error_shadow.csv')
+            self._gt_err_shadow_file   = open(self._gt_err_shadow_path, 'w', newline='', buffering=1)
+            self._gt_err_shadow_writer = csv.writer(self._gt_err_shadow_file)
+            self._gt_err_shadow_writer.writerow([
+                't_wall_s',
+                'pN', 'pE', 'pD', 'gt_pN', 'gt_pE', 'gt_pD',
+                'pos_err_N', 'pos_err_E', 'pos_err_D', 'pos_err_norm',
+                'vN', 'vE', 'vD', 'gt_vN', 'gt_vE', 'gt_vD',
+                'vel_err_N', 'vel_err_E', 'vel_err_D', 'vel_err_norm',
+                'roll_deg', 'pitch_deg', 'yaw_deg',
+                'roll_gt_deg', 'pitch_gt_deg', 'yaw_gt_deg',
+                'roll_err_deg', 'pitch_err_deg', 'yaw_err_deg',
+            ])
+            print(f'[IMUEKFHandler] ekf_gt_error_shadow → {self._gt_err_shadow_path}', flush=True)
+
     def register(self, rx):
         """Attach this handler as the HIGHRES_IMU callback on a MAVLinkRX instance."""
         rx._on_imu_cb = self.on_imu_msg
@@ -225,12 +267,9 @@ class IMUEKFHandler:
             if _att_reset is not None:
                 _psi_sim   = float(_att_reset['yaw_rad'])
                 _delta_psi = self._init_yaw_rad - _psi_sim
-                _cd, _sd   = np.cos(_delta_psi), np.sin(_delta_psi)
-                self._R_align = np.array([[_cd, -_sd, 0.0],
-                                          [_sd,  _cd, 0.0],
-                                          [0.0,  0.0, 1.0]])
                 self._q_align = np.array([np.cos(_delta_psi / 2), 0.0, 0.0,
                                           np.sin(_delta_psi / 2)])
+                self._R_align = rotations.quat_to_R_body2ned(self._q_align)
                 if abs(np.rad2deg(_delta_psi)) > 1.0:
                     print(f'[IMUEKFHandler] GT frame yaw correction: '
                           f'sim={np.rad2deg(_psi_sim):.1f}°  '
@@ -425,6 +464,27 @@ class IMUEKFHandler:
         # corrupting velocity too. Deliberately separate from vision_settle_sec
         # below: roll/pitch (what this update corrects) and yaw (what that one
         # protects) settle on different timescales post-reset.
+        #
+        # Briefly tried making this run continuously (motivated by a flight
+        # where a frozen/stale gyro reading drove roll/pitch to diverge
+        # unboundedly with zero ongoing correction — see update_attitude
+        # below, added the same session, for the actual fix to that gap) —
+        # reverted after confirming on a real log that the |acc_norm-g|<2.0
+        # threshold does NOT reliably protect against this vehicle's real
+        # flight profile: a genuine -39° GT pitch dive at t=2.02s had
+        # accnorm=9.79 (well inside the 2.0 threshold), so update_accel fired
+        # and dragged the estimate from the true -39° toward level, landing
+        # at -17° — wrong by 22° from a single "protected" update, repeating
+        # every time the vehicle maneuvers aggressively (128 of 245 ticks in
+        # one 4s window). The banked-turn/dive norm-cancellation risk this
+        # window was originally added to avoid is real and frequent for a
+        # racing profile, not occasional — restored the short window.
+        # update_attitude (PnP-based) was tried as the ongoing roll/pitch
+        # correction instead, since it doesn't look at acceleration — but it
+        # has now also been disabled (below) after causing a crash via a
+        # different failure mode (planar-target PnP pose ambiguity). Currently
+        # there is no ongoing roll/pitch correction between accel_settle_sec
+        # windows; only the short post-reset accel window and update_zupt.
         _accel_settle_window = (
             not self._hover_reset_done
             or (self._hover_reset_t is not None
@@ -470,6 +530,13 @@ class IMUEKFHandler:
         )
         if (vis is not None and _vision_settled
                 and not self._param.get('ground_truth_mode', False)):
+            # Single overall trust knob: divides every vision-update sigma
+            # below before it reaches the Kalman update, without touching any
+            # gate (gates decide what's an outlier; this only affects how much
+            # a within-gate fix moves the state). 1.0 = today's calibrated
+            # behaviour. See params.yaml's vision_authority comment.
+            _vision_authority = float(np.clip(
+                self._param.get('vision_authority', 1.0), 0.05, 1.0))
             if vis.get('pos_ned') is not None:
                 # PnP is world-frame; EKF is local-frame (zeroed at hover entry).
                 local_pos = np.asarray(vis['pos_ned']) - self._pos_offset_ned
@@ -487,11 +554,11 @@ class IMUEKFHandler:
                             break
                     local_pos = local_pos + (self._ekf.x[0:3] - _pos_hist)
                 self._ekf.update_position(
-                    local_pos, sigma_pos=vis['sigma_pos'], gate_dist=vis['gate'],
+                    local_pos, sigma_pos=vis['sigma_pos'] / _vision_authority, gate_dist=vis['gate'],
                     t=_vis_t, max_speed=self._param.get('ekf_vision_pos_max_speed', 15.0))
             if vis.get('vel_ned') is not None:
                 self._ekf.update_velocity(
-                    vis['vel_ned'], sigma_vel=vis['sigma_vel'],
+                    vis['vel_ned'], sigma_vel=vis['sigma_vel'] / _vision_authority,
                     gate_dist=vis['vel_gate'])
             if vis.get('yaw_ned') is not None:
                 # Confidence ramp: vision_settle_sec is a hard on/off cliff, so
@@ -516,10 +583,35 @@ class IMUEKFHandler:
                                     - self._param.get('vision_settle_sec', 1.50))
                 _ramp_frac = float(np.clip(_t_since_settle / max(_yaw_ramp_sec, 1e-6),
                                             0.0, 1.0))
-                _sigma_yaw_eff = _sigma_yaw_max + (vis['sigma_yaw'] - _sigma_yaw_max) * _ramp_frac
+                _sigma_yaw_base = vis['sigma_yaw'] / _vision_authority
+                _sigma_yaw_eff = _sigma_yaw_max + (_sigma_yaw_base - _sigma_yaw_max) * _ramp_frac
                 self._ekf.update_yaw(
                     vis['yaw_ned'], sigma_yaw=_sigma_yaw_eff,
                     gate_dist=vis.get('yaw_gate', 1.0))
+            # RE-ENABLED: was DISABLED 2026-07-29 after a real crash into gate
+            # 1's bottom beam — the gate's 4 corners are coplanar, and
+            # solvePnP on a near-planar target has a well-known pose ambiguity
+            # (two rotations reproject almost equally well) that gets worse
+            # the more head-on the view, i.e. exactly during final approach.
+            # roll_ned swung across the full [-pi, +pi] range (std=2.5 rad)
+            # tick-to-tick while GT roll sat near 0; the fixed gate_dist=5.0
+            # didn't reject it since each self-consistent-but-wrong rotation
+            # only produced a moderate gravity-vector innovation, dragging EKF
+            # roll to a ~24 deg error within ~1s and diverging into the beam.
+            # Since then vision_rx.py's _pnp_gate gained a position-consistency
+            # tie-break (an independent anchor a single bad frame can't have
+            # already poisoned) that roll/pitch/yaw all share via the same
+            # disambiguated rotation. Before flying this live with
+            # ground_truth_mode: false, re-validate offline against logged
+            # flights (ideally the original crash log) via
+            # `ekf_shadow.py --use-attitude` — see its docstring — and use the
+            # fitted ekf_vision_att_sigma/ekf_vision_att_gate rather than
+            # flying on unvalidated defaults.
+            if vis.get('roll_ned') is not None and vis.get('pitch_ned') is not None:
+                self._ekf.update_attitude(
+                    vis['roll_ned'], vis['pitch_ned'],
+                    sigma_att=self._param.get('ekf_vision_att_sigma', 0.15) / _vision_authority,
+                    gate_dist=self._param.get('ekf_vision_att_gate', 5.0))
 
         # ── Item 1: Velocity-heading yaw update ───────────────────────────────
         # At high horizontal speed, velocity direction ≈ nose heading.
@@ -598,6 +690,61 @@ class IMUEKFHandler:
             except Exception:
                 pass
 
+        # ── EKF-vs-GT error shadow log ──────────────────────────────────────────
+        # Independent of the EKF-log block above (fetches its own raw GT read)
+        # so it works even when self._logger is None — that block's
+        # _att_diag/_lpn_diag/_gt_*_diag locals are scoped inside `if
+        # self._logger is not None:` and aren't available out here.
+        if self._gt_err_shadow_enabled and self._hover_reset_done and self._gt_err_shadow_writer is not None:
+            _latest_ge = self._data.get('mavlink', {}).get('latest', {})
+            _att_ge = _latest_ge.get('ATTITUDE')
+            _lpn_ge = _latest_ge.get('LOCAL_POSITION_NED')
+        else:
+            _att_ge = _lpn_ge = None
+        if _att_ge is not None and _lpn_ge is not None:
+            self._gt_err_shadow_tick += 1
+            if self._gt_err_shadow_tick % 10 == 0:
+                # Align raw GT into the EKF's own hover-reset-zeroed frame —
+                # same transform as the ground-truth-override block below.
+                # Comparing self._ekf.x against RAW (unaligned) GT would show
+                # a frame offset baked in at hover-reset, not real estimation
+                # error.
+                _gt_pos_ge  = np.array(_lpn_ge['pos_ned_m'], dtype=float)
+                _gt_vel_ge  = np.array(_lpn_ge['vel_ned_mps'], dtype=float)
+                _gt_quat_ge = np.array(_att_ge['quat'], dtype=float)
+                gt_pos = self._R_align @ (_gt_pos_ge - self._sim_ned_offset)
+                gt_vel = self._R_align @ _gt_vel_ge
+                gt_quat = _quat_mult(_gt_quat_ge, self._q_align)
+                _qn = float(np.linalg.norm(gt_quat))
+                if _qn > 1e-9:
+                    gt_quat = gt_quat / _qn
+
+                pos = self._ekf.x[0:3]
+                vel = self._ekf.x[3:6]
+                quat = self._ekf.x[6:10]
+                pos_err = pos - gt_pos
+                vel_err = vel - gt_vel
+                roll, pitch, yaw = _quat_to_euler_deg(quat)
+                roll_gt, pitch_gt, yaw_gt = _quat_to_euler_deg(gt_quat)
+                roll_err  = (roll  - roll_gt  + 180) % 360 - 180
+                pitch_err = (pitch - pitch_gt + 180) % 360 - 180
+                yaw_err   = (yaw   - yaw_gt   + 180) % 360 - 180
+
+                self._gt_err_shadow_writer.writerow([
+                    f'{now:.4f}',
+                    f'{pos[0]:.4f}', f'{pos[1]:.4f}', f'{pos[2]:.4f}',
+                    f'{gt_pos[0]:.4f}', f'{gt_pos[1]:.4f}', f'{gt_pos[2]:.4f}',
+                    f'{pos_err[0]:.4f}', f'{pos_err[1]:.4f}', f'{pos_err[2]:.4f}',
+                    f'{float(np.linalg.norm(pos_err)):.4f}',
+                    f'{vel[0]:.4f}', f'{vel[1]:.4f}', f'{vel[2]:.4f}',
+                    f'{gt_vel[0]:.4f}', f'{gt_vel[1]:.4f}', f'{gt_vel[2]:.4f}',
+                    f'{vel_err[0]:.4f}', f'{vel_err[1]:.4f}', f'{vel_err[2]:.4f}',
+                    f'{float(np.linalg.norm(vel_err)):.4f}',
+                    f'{roll:.3f}', f'{pitch:.3f}', f'{yaw:.3f}',
+                    f'{roll_gt:.3f}', f'{pitch_gt:.3f}', f'{yaw_gt:.3f}',
+                    f'{roll_err:.3f}', f'{pitch_err:.3f}', f'{yaw_err:.3f}',
+                ])
+
         # ── Publish EKF state to shared dict ──────────────────────────────────
         self._data['mav_state'] = {
             'pos_ned':  self._ekf.pos_ned,
@@ -642,7 +789,11 @@ class IMUEKFHandler:
 
     # ------------------------------------------------------------------
     def save(self):
-        """Close shadow CSV and generate a comparison plot PNG."""
+        """Close shadow CSVs and generate comparison plot PNGs."""
+        self._save_model_predict_shadow()
+        self._save_gt_error_shadow()
+
+    def _save_model_predict_shadow(self):
         if self._mp_shadow_file is None:
             return
         # Null out writer first — on_imu_msg checks writer is not None before writing,
@@ -740,3 +891,92 @@ class IMUEKFHandler:
         fig.savefig(png_path, dpi=120)
         plt.close(fig)
         print(f'[IMUEKFHandler] shadow plot saved → {png_path}', flush=True)
+
+    def _save_gt_error_shadow(self):
+        if self._gt_err_shadow_file is None:
+            return
+        _writer = self._gt_err_shadow_writer
+        _file   = self._gt_err_shadow_file
+        self._gt_err_shadow_writer = None
+        self._gt_err_shadow_file   = None
+        _file.flush()
+        _file.close()
+
+        if self._gt_err_shadow_path is None:
+            return
+
+        import csv, os
+        import numpy as np
+
+        rows = []
+        try:
+            with open(self._gt_err_shadow_path, newline='') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    rows.append({k: float(v) for k, v in row.items()})
+        except Exception as e:
+            print(f'[IMUEKFHandler] gt_error plot: could not read CSV — {e}', flush=True)
+            return
+
+        if len(rows) < 2:
+            print('[IMUEKFHandler] gt_error plot: not enough rows to plot', flush=True)
+            return
+
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print('[IMUEKFHandler] gt_error plot: matplotlib not available', flush=True)
+            return
+
+        t  = np.array([r['t_wall_s'] for r in rows])
+        t -= t[0]
+
+        pos_err_N = np.array([r['pos_err_N'] for r in rows])
+        pos_err_E = np.array([r['pos_err_E'] for r in rows])
+        pos_err_D = np.array([r['pos_err_D'] for r in rows])
+        pos_err_norm = np.array([r['pos_err_norm'] for r in rows])
+        vel_err_N = np.array([r['vel_err_N'] for r in rows])
+        vel_err_E = np.array([r['vel_err_E'] for r in rows])
+        vel_err_D = np.array([r['vel_err_D'] for r in rows])
+        vel_err_norm = np.array([r['vel_err_norm'] for r in rows])
+        roll_err  = np.array([r['roll_err_deg']  for r in rows])
+        pitch_err = np.array([r['pitch_err_deg'] for r in rows])
+        yaw_err   = np.array([r['yaw_err_deg']   for r in rows])
+
+        fig, axes = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
+        fig.suptitle('EKF vs ground truth error (live sensor-mode estimate)', fontsize=13)
+
+        axes[0].plot(t, pos_err_N, label='N', lw=0.8, alpha=0.8)
+        axes[0].plot(t, pos_err_E, label='E', lw=0.8, alpha=0.8)
+        axes[0].plot(t, pos_err_D, label='D', lw=0.8, alpha=0.8)
+        axes[0].plot(t, pos_err_norm, label='|err|', color='k', lw=1.2)
+        axes[0].set_ylabel('pos err [m]', fontsize=9)
+        axes[0].legend(fontsize=8, loc='upper left', ncol=4)
+        axes[0].grid(True, lw=0.4)
+
+        axes[1].plot(t, vel_err_N, label='N', lw=0.8, alpha=0.8)
+        axes[1].plot(t, vel_err_E, label='E', lw=0.8, alpha=0.8)
+        axes[1].plot(t, vel_err_D, label='D', lw=0.8, alpha=0.8)
+        axes[1].plot(t, vel_err_norm, label='|err|', color='k', lw=1.2)
+        axes[1].set_ylabel('vel err [m/s]', fontsize=9)
+        axes[1].legend(fontsize=8, loc='upper left', ncol=4)
+        axes[1].grid(True, lw=0.4)
+
+        axes[2].plot(t, roll_err,  label='roll',  lw=0.8, alpha=0.8)
+        axes[2].plot(t, pitch_err, label='pitch', lw=0.8, alpha=0.8)
+        axes[2].set_ylabel('roll/pitch err [deg]', fontsize=9)
+        axes[2].legend(fontsize=8, loc='upper left', ncol=2)
+        axes[2].grid(True, lw=0.4)
+
+        axes[3].plot(t, yaw_err, color='tab:red', lw=1.0)
+        axes[3].set_ylabel('yaw err [deg]', fontsize=9)
+        axes[3].set_xlabel('time [s]', fontsize=9)
+        axes[3].grid(True, lw=0.4)
+
+        fig.tight_layout()
+        png_path = os.path.splitext(self._gt_err_shadow_path)[0] + '.png'
+        fig.savefig(png_path, dpi=120)
+        plt.close(fig)
+        print(f'[IMUEKFHandler] gt_error plot saved → {png_path}', flush=True)

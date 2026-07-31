@@ -320,8 +320,15 @@ class MAVLinkRX:
             'race_finished':           int(race_finish_time_ns >= 0),
         }
         self.data['mavlink']['latest']['RACE_STATUS'] = row
-        # Backward-compat keys read by controller and flight scripts
-        self.data['active_gate_index'] = int(active_gate_index)
+        # Backward-compat keys read by controller and flight scripts.
+        # Monotonic: active_gate_index never legitimately decreases during a
+        # race, so a stale/delayed message can't undo controller.py's own
+        # advance (it locally bumps this same key ahead of RACE_STATUS on a
+        # confirmed gate pass — see its wp-advance handling — so this message
+        # arriving afterward with an older value would otherwise silently
+        # revert that correction and reopen the exact desync it was fixing).
+        _prev_agi = self.data.get('active_gate_index', -1)
+        self.data['active_gate_index'] = max(int(active_gate_index), _prev_agi)
         self.data['race_started']      = (race_start_boot_time_ms > 0)
 
     def on_track_data_packet(self, msg):

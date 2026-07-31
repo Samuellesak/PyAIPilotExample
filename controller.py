@@ -1,9 +1,9 @@
-import math
 import time
 import numpy as np
 from pymavlink import mavutil
 
 from carrot_tracker import CarrotTracker
+import rotations
 
 MAVLINK_CMD_SIM_RESET = 31000
 CONTROL_HZ            = 250
@@ -24,14 +24,10 @@ INTEGRATE_DELAY    = 2.0    # horizontal (N/E) integrator delay after hover entr
 INTEGRATE_DELAY_V  = 0.0    # vertical (D) integrator delay — activate immediately
 
 
-def _rot_from_quat(q):
-    """Rotation matrix R: v_body = R @ v_NED.  q = [qw, qx, qy, qz]."""
-    qw, qx, qy, qz = q
-    return np.array([
-        [1-2*(qy*qy+qz*qz),   2*(qx*qy+qw*qz),   2*(qx*qz-qw*qy)],
-        [  2*(qx*qy-qw*qz), 1-2*(qx*qx+qz*qz),   2*(qy*qz+qw*qx)],
-        [  2*(qx*qz+qw*qy),   2*(qy*qz-qw*qx), 1-2*(qx*qx+qy*qy)],
-    ])
+# v_body = R @ v_NED — see rotations.py (centralized after a real bug was
+# traced to this formula's transpose being reused under the same function
+# name elsewhere in the codebase).
+_rot_from_quat = rotations.quat_to_R_ned2body
 
 
 class Controller:
@@ -42,6 +38,11 @@ class Controller:
         self.system_boot_ms   = system_boot_ms
         self.param            = param
         self._logger          = logger
+        # GT mode's ATTITUDE-derived yaw is a different convention than
+        # standard NED (psi_gt = -psi_NED — see _gt_yaw_convention's
+        # docstring). Cached once here rather than re-read per use, and to
+        # give every read/write of this flag one canonical name to grep for.
+        self._gt_mode         = bool(param.get('ground_truth_mode', False))
 
         self.T_max  = param['T_max_motor']
         self.T_hover = param['m'] * param['g'] / 4.0
@@ -61,6 +62,12 @@ class Controller:
         self._Ki_vE    = float(param['Ki_vE'])
         self._Kp_vD    = float(param['Kp_vD'])
         self._Ki_vD    = float(param['Ki_vD'])
+        # Derivative gains (derivative-on-measurement, not on error) — damps velocity
+        # overshoot without reacting to v_ned_ref steps at waypoint transitions.
+        # Default 0.0 (off) preserves existing PI-only behaviour.
+        self._Kd_vN    = float(param.get('Kd_vN', 0.0))
+        self._Kd_vE    = float(param.get('Kd_vE', 0.0))
+        self._Kd_vD    = float(param.get('Kd_vD', 0.0))
         # Velocity feedforward coefficients: ff = v_ref / tau_v adds the acceleration
         # needed to hold v_ref against drag without waiting for integrator wind-up.
         _tau_vN = float(param.get('tau_vN', 0.0))
@@ -71,6 +78,11 @@ class Controller:
         # Pre-commands acceleration for changing reference, reducing tracking lag.
         # Applied to the smoothed reference (post-LP) so noise is not amplified.
         self._K_dv        = float(param.get('K_dv', 0.0))
+        # Separate D-axis lag-compensator gain: vD was never wired to the N/E lag
+        # comp above (only _a_lag_N/_a_lag_E existed), so vD tracked v_ref with pure
+        # lag. Independent gain lets vD run more aggressively than K_dv without
+        # touching the already-tuned horizontal response.
+        self._K_dv_D      = float(param.get('K_dv_D', self._K_dv))
         self._v_ref_prev  = np.zeros(3)
         # First-order LP on v_ned_ref: smooths carrot oscillation before PI.
         # tau_ref_smooth=0 disables (pass-through). Applied before PT2 and PI.
@@ -102,11 +114,7 @@ class Controller:
                   "drone will hold altitude indefinitely", flush=True)
 
         # Camera tilt matrix (cam→body FRD) — mirrors vision_rx.py, reads cam_tilt_deg from params.
-        _tilt = math.radians(float(param.get('cam_tilt_deg', 20.0)))
-        _st, _ct = math.sin(_tilt), math.cos(_tilt)
-        self._R_cam2body = np.array([[0, _st, _ct],
-                                     [1,  0,   0 ],
-                                     [0, _ct, -_st]], dtype=float)
+        self._R_cam2body = rotations.cam_to_body_matrix(param.get('cam_tilt_deg', 20.0))
 
         # Cascade integrators
         self.xi_vel      = np.zeros(3)              # NED velocity integrals [m]
@@ -123,6 +131,7 @@ class Controller:
         self._vE_filt      = 0.0                    # filtered EKF vE [m/s]
         self._vD_filt      = 0.0                    # filtered EKF vD [m/s]
         self._T_coll_filt  = 4.0 * self.T_hover     # filtered collective [N]
+        self._v_meas_filt_prev = None                # previous filtered v_ned, for D term
         self._TAU_VH       = float(param.get('tau_vel_h', 0.15))   # horizontal velocity filter τ [s]
         self._TAU_VD       = float(param.get('tau_vel_d', 0.15))   # vertical   velocity filter τ [s]
         self._TAU_T_COLL   = 0.30                   # T_coll output filter τ [s]
@@ -149,6 +158,42 @@ class Controller:
         self._vis_tvec_hold     = None   # last valid locked tvec_cam (3,) or None
         self._vis_tvec_hold_age = 0      # frames since last fresh locked measurement
         self._vis_hold_frames   = int(param.get('vision_hold_frames', 5))
+
+        # EMA smoothing for the live vision-driven active-waypoint update (see
+        # wp_live_update_tau below) — damps reacquisition jumps so they don't
+        # freeze into the next segment's tangent anchor once tracker.wp advances.
+        self._wp_active_filt    = None   # filtered NED position, or None until first sample
+        self._wp_active_filt_wp = None   # tracker.wp index the filter currently belongs to
+        self._wp_live_update_tau = float(param.get('wp_live_update_tau', 0.2))   # [s]
+
+        # Reacquisition blend: ramps the vision-bearing/yaw override's authority
+        # back in after a REAL vision loss (vis_ctrl_mode CARROT->PNP), instead of
+        # snapping to full-strength pursuit the instant a fresh detection reappears.
+        # Ordinary brief HOLD flicker is unaffected (w stays at 1.0 throughout).
+        self._vis_ctrl_mode_prev    = None
+        self._reacq_blend_w         = 1.0
+        self._vision_reacq_blend_tau = float(param.get('vision_reacq_blend_tau', 0.4))   # [s]
+
+        # Blind-search altitude nudge: while a gate should be visible (close enough)
+        # but hasn't been detected for a while, bias the D reference downward so a
+        # gate that's dropped below the camera FOV comes back into view sooner.
+        self._carrot_mode_since        = None   # wall time vis_ctrl_mode entered CARROT, or None
+        self._search_descend_offset    = 0.0    # [m] current bounded descend bias
+        self._vision_search_range_m    = float(param.get('vision_search_range_m', 15.0))
+        self._vision_search_trigger_sec = float(param.get('vision_search_trigger_sec', 0.5))
+        self._vision_search_max_descend_m = float(param.get('vision_search_max_descend_m', 3.0))
+        self._vision_search_descend_mps   = float(param.get('vision_search_descend_mps', 0.6))
+
+        # Vertical visual-centering nudge: while the gate is still visible but
+        # close to the top/bottom of frame, bias the D velocity reference to
+        # bring it back toward vertical center — catches a developing "too
+        # high"/"too low" miss proactively, before the gate ever leaves frame
+        # (the blind-search nudge above only fires once it's already lost,
+        # which can be too late for a segment needing a large sustained
+        # descent/climb). Same visual-servo idea as the yaw blend below, on
+        # the vertical axis via velocity since yaw can't center it vertically.
+        self._vis_vnudge_border_frac = float(param.get('vision_vnudge_border_frac', 0.6))
+        self._vis_vnudge_max_mps     = float(param.get('vision_vnudge_max_mps', 1.5))
 
         # PT2 filter on the velocity reference — smooths step-changes when switching
         # between carrot and vision-bearing modes so direction changes are gradual.
@@ -424,6 +469,28 @@ class Controller:
                 self._v_ref_pt2_x = np.asarray(_v0, dtype=float).copy()
                 self._v_ref_pt2_v = np.zeros(3)
             det = self.data.get('gate_detection', {})
+            # Both raw controller-level vision paths below (waypoint override
+            # and the bearing-pursuit override further down) blindly assumed
+            # any detection this frame belongs to tracker.wp's target — with
+            # no check against WHICH gate vision_rx.py actually resolved it
+            # against. vision_rx.py already tracks this correctly via
+            # active_gate_index (agi) for its own gate_info lookup; agi and
+            # tracker.wp are two independently-updated indices (RACE_STATUS
+            # vs. controller's own gate-pass/commit logic) that can transiently
+            # disagree right at a gate-passage boundary. Confirmed in a flight
+            # log: right after tracker.wp advanced to target G3, a lingering
+            # detection of the just-passed G2 (agi hadn't caught up yet) got
+            # assigned straight to tracker.waypoints[wp]==G3's slot via the
+            # override below, dragging that target ~30+ m off — the carrot's
+            # own tangent geometry then aimed the drone increasingly sideways
+            # over the next ~0.3s, a divergence with the same signature as
+            # (but a different cause from) the earlier reacquisition-angle bug.
+            # active_gate_index is 0-indexed by gate; tracker.wp is 1-indexed
+            # into waypoints (waypoints[1]=gate 0), hence the -1. Default of 0
+            # matches vision_rx.py's own fallback before the first RACE_STATUS
+            # arrives (tracker.wp also starts at 1), so this guard doesn't
+            # disable the override during the initial gate-0 approach.
+            _agi_matches_wp = (self.data.get('active_gate_index', 0) == self.tracker.wp - 1)
             # Refine target waypoint to PnP-measured gate position in local NED.
             # gate_local = pos_ned (EKF local) + R_b2n @ R_cam2body @ tvec_cam
             # This uses only what the camera sees — no track data dependency.
@@ -432,13 +499,47 @@ class Controller:
             # reads tvec_cam directly rather than going through
             # _vision_ekf_update, so a bad frame here would snap the live
             # carrot target straight to a bad position with zero smoothing.
-            if not self._debug_waypoints_only:
+            if not self._debug_waypoints_only and _agi_matches_wp:
                 if det.get('detected') and det.get('tvec_cam') is not None:
                     _tvec = np.asarray(det['tvec_cam'], dtype=float)
                     _t_body = self._R_cam2body @ _tvec
-                    R_bn = _rot_from_quat(quat)
+                    # gt_correct_quat: this rotates a body-frame bearing into
+                    # NED (same operation as vision_rx.py's PnP position
+                    # solve / tie-break sites and the pursuit-override/yaw-
+                    # blend sites below) — GT mode's raw quat convention
+                    # would rotate it the wrong way if left uncorrected. This
+                    # was the missed 4th site _gt_yaw_convention's docstring
+                    # warned about.
+                    R_bn = _rot_from_quat(
+                        rotations.gt_correct_quat(quat, self._gt_mode))
                     R_nb = R_bn.T
-                    self.tracker.waypoints[self.tracker.wp] = pos_ned + R_nb @ _t_body
+                    _wp_raw = pos_ned + R_nb @ _t_body
+                    # EMA-smooth before this reaches the tracker's tangent geometry
+                    # (wp_live_update_tau): a reacquisition-after-vision-loss jump
+                    # landing here unfiltered gets frozen forever as r0 once
+                    # tracker.wp advances. On the first detection of a newly-
+                    # targeted gate, initialize the filter from whatever
+                    # tracker.waypoints[wp] ALREADY holds (the static track-data
+                    # default, or an already-smoothed next_gate_ned median-filter
+                    # estimate built up while still approaching the PREVIOUS
+                    # gate — see the next-waypoint block below) rather than
+                    # snapping straight to this single fresh sample. Confirmed
+                    # in a flight log: that snap produced a real ~1.5 m/s
+                    # one-tick reference jump right after a gate passage, right
+                    # when a decent next_gate_ned prior already existed — this
+                    # was assumed to have no useful prior to blend from, which
+                    # is often false. Blending (not resetting) is always safe:
+                    # if the prior really is a crude default, it converges to
+                    # live detections at the same wp_live_update_tau rate as
+                    # ordinary mid-segment updates, no slower.
+                    if self._wp_active_filt_wp != self.tracker.wp:
+                        self._wp_active_filt    = np.asarray(
+                            self.tracker.waypoints[self.tracker.wp], dtype=float).copy()
+                        self._wp_active_filt_wp = self.tracker.wp
+                    _alpha_wp = np.exp(-_actual_dt / self._wp_live_update_tau)
+                    self._wp_active_filt = (_alpha_wp * self._wp_active_filt
+                                             + (1.0 - _alpha_wp) * _wp_raw)
+                    self.tracker.waypoints[self.tracker.wp] = self._wp_active_filt.copy()
 
             # Update next waypoint from vision-confirmed second-gate NED position.
             # Only applied once position is stable (median over next_gate_min_frames).
@@ -449,22 +550,32 @@ class Controller:
             # this block had no gate of its own, so it started actually overwriting
             # the next waypoint with a real (and apparently offset) vision-derived
             # position — causing a beam strike at the second gate.
-            if not self._debug_waypoints_only:
+            # Also gated on _agi_matches_wp: next_gate_ned is computed in
+            # vision_rx.py relative to ITS OWN active_gate_index (the gate
+            # after agi's current target) — writing it to tracker.wp+1 is only
+            # correct when tracker.wp == agi+1. During a desync this would
+            # otherwise land in the wrong slot, same class of bug as the
+            # waypoint/pursuit overrides above.
+            if not self._debug_waypoints_only and _agi_matches_wp:
                 _ng_ned = self.data.get('next_gate_ned')
                 if _ng_ned is not None:
                     _wp_next = self.tracker.wp + 1
                     if _wp_next < self.tracker.n_waypoints:
                         self.tracker.waypoints[_wp_next] = np.asarray(_ng_ned, dtype=float)
 
-            v_ned_ref_carrot, psi_ref_carrot = self.tracker.update(pos_ned)
+            v_ned_ref_carrot, psi_ref_carrot = self.tracker.update(pos_ned, dt=_actual_dt)
             v_ref_for_gains = v_ned_ref_carrot
 
             # Vision-bearing override: replace NE components of v_ned_ref with a
             # direction from the PnP gate bearing — bypasses EKF position drift.
             # Uses last known tvec for up to vision_hold_frames frames so brief YOLO
             # flicker doesn't snap control back to the carrot on every missed frame.
+            # Also gated on _agi_matches_wp (see above) — without it, a lingering
+            # detection of the just-passed gate right at a wp/agi desync would
+            # aim the pursuit at the WRONG gate (behind/beside, not ahead).
             _fresh_tvec = (det.get('tvec_cam')
-                           if (det.get('pnp_locked') and not self._debug_waypoints_only)
+                           if (det.get('pnp_locked') and not self._debug_waypoints_only
+                               and _agi_matches_wp)
                            else None)
 
             # Publish current mode for the vision debug overlay. TRANSITION
@@ -477,6 +588,20 @@ class Controller:
                 else 'HOLD'   if self._vis_tvec_hold is not None
                 else 'CARROT'
             )
+
+            # Reacquisition blend: a real loss (CARROT, vision_hold_frames already
+            # expired) followed by a fresh PNP lock is exactly the situation that
+            # produced the "flies straight at the gate at an unfavorable angle"
+            # bug — the override below used to snap to full pursuit strength
+            # instantly. Reset the blend weight to 0 only on that specific
+            # transition; ordinary brief HOLD flicker never touches it, so
+            # continuous-lock behavior (e.g. G0/G1) is unchanged.
+            if (self._vis_ctrl_mode_prev == 'CARROT'
+                    and self.data['vis_ctrl_mode'] == 'PNP'):
+                self._reacq_blend_w = 0.0
+            _alpha_reacq = np.exp(-_actual_dt / self._vision_reacq_blend_tau)
+            self._reacq_blend_w = 1.0 - _alpha_reacq * (1.0 - self._reacq_blend_w)
+            self._vis_ctrl_mode_prev = self.data['vis_ctrl_mode']
 
             if _fresh_tvec is not None:
                 # Fresh locked measurement — update cache and reset age.
@@ -492,35 +617,193 @@ class Controller:
                 self._vis_tvec_hold     = None
                 self._vis_tvec_hold_age = 0
 
-            if self._vis_tvec_hold is not None:
+            # Suppressed once committed (TRANSITION): vision_rx.py already stops
+            # producing fresh detections during transit for exactly this reason
+            # ("close range and steep viewing angles... the real target gate is
+            # already being flown through open-loop by the carrot at this
+            # point") — but that suppression is stamped with ctrl_mode_at_capture
+            # (up to ~170ms old), so a detection captured just before commit
+            # began can still arrive and populate/refresh _vis_tvec_hold after
+            # tracker.committed goes True. And bearing angle ~ atan(offset/range)
+            # blows up as range shrinks, so even a tiny positional wobble right
+            # at the gate swings the raw bearing (and therefore this override's
+            # commanded direction) violently — confirmed in a flight log: vc_E
+            # jumped from -1 to +4 m/s in one tick while nominally in
+            # TRANSITION. Gating on tracker.committed here closes that gap:
+            # once committed, ALL of the raw vision-bypass paths below (pursuit,
+            # vertical nudge, yaw blend) defer fully to the carrot's own
+            # geometry, matching what TRANSITION is supposed to mean.
+            if self._vis_tvec_hold is not None and not self.tracker.committed:
                 _tvec_v  = self._vis_tvec_hold
                 _t_body_v = self._R_cam2body @ _tvec_v
                 _horiz_v = float(np.sqrt(_t_body_v[0]**2 + _t_body_v[1]**2))
                 if _horiz_v > 1.0:   # gate at least 1 m away horizontally
                     _dir_xb = _t_body_v[0] / _horiz_v   # body-forward component
                     _dir_yb = _t_body_v[1] / _horiz_v   # body-right  component
-                    _psi_v  = quat_to_euler(quat)[2]
+                    # Standard NED convention required here (see
+                    # _gt_yaw_convention) — this rotates a body-frame bearing
+                    # into NED, and GT's raw psi_meas convention would mirror
+                    # the result instead of just rotating it wrong.
+                    _psi_v  = self._gt_yaw_convention(quat_to_euler(quat)[2])
                     _cp, _sp = np.cos(_psi_v), np.sin(_psi_v)
                     _dir_n  =  _cp * _dir_xb - _sp * _dir_yb
                     _dir_e  =  _sp * _dir_xb + _cp * _dir_yb
+                    # Alignment-scaled pursuit speed: _dir_xb is cos(bearing
+                    # angle off the nose), so this ramps the commanded speed
+                    # from 0 (gate 90°+ off to the side) to full v_ref (gate
+                    # dead ahead) instead of always commanding full v_ref in
+                    # whatever direction the raw bearing points. Confirmed in
+                    # a flight log this fixed-speed version has a fundamental
+                    # instability: a lateral offset barely deflects the
+                    # bearing angle at long range (weak correction) but
+                    # deflects it sharply at close range (strong correction),
+                    # so the loop's effective gain rises sharply as the gate
+                    # is approached — this produced a growing, then-reversing
+                    # multi-second oscillation on both N/E and (compounded by
+                    # the vertical nudge riding along) D, independent of and
+                    # not fixed by carrot-side tuning (lookahead_gain,
+                    # corner_cut_frac), since those don't apply once pursuit
+                    # dominates the reference. Scaling speed by alignment
+                    # removes the sharp effective-gain-vs-range dependence:
+                    # a large off-axis bearing now commands a gentle approach
+                    # instead of a full-speed dash that has to be corrected
+                    # again once the bearing swings past it.
+                    _align = float(np.clip(_dir_xb, 0.0, 1.0))
+                    _pursuit_speed = self.tracker.v_ref * _align
+                    # Blend pursuit-at-gate against the carrot tracker's own
+                    # cross-track-corrected N/E reference, weighted by
+                    # _reacq_blend_w (see above) — right after a real vision
+                    # loss this stays close to the carrot's tangent-following,
+                    # self-correcting geometry instead of snapping straight at
+                    # wherever the gate now appears (which produced the steep,
+                    # unfavorable-angle approach after reacquisition). Ramps to
+                    # full pursuit strength as trust rebuilds; already 1.0 during
+                    # continuous tracking, so today's working behavior (G0/G1) is
+                    # unchanged.
+                    _w = self._reacq_blend_w
                     v_ref_for_gains = np.array([
-                        self.tracker.v_ref * _dir_n,
-                        self.tracker.v_ref * _dir_e,
+                        _w * _pursuit_speed * _dir_n + (1.0 - _w) * v_ned_ref_carrot[0],
+                        _w * _pursuit_speed * _dir_e + (1.0 - _w) * v_ned_ref_carrot[1],
                         v_ned_ref_carrot[2],
                     ])
+
+            # Blind-search altitude nudge: while the target gate is close enough
+            # that it should be detectable (vision_search_range_m) but hasn't been
+            # for a while (vision_search_trigger_sec of continuous CARROT mode),
+            # bias the D reference downward so a gate that's dropped below the
+            # camera FOV comes back into view sooner. Gated on proximity (not just
+            # "no detection") so this never fires during ordinary long inter-gate
+            # cruise, where CARROT mode is normal and expected. Bounded and
+            # smoothly unwound the instant vision reacquires or the drone drifts
+            # out of range, so it never strands the drone below its nominal path.
+            if self.data['vis_ctrl_mode'] == 'CARROT':
+                if self._carrot_mode_since is None:
+                    self._carrot_mode_since = _now
+            else:
+                self._carrot_mode_since = None
+
+            _dist_to_target = float(np.linalg.norm(
+                self.tracker.waypoints[self.tracker.wp] - pos_ned))
+            # debug_waypoints_only disables the vision-pursuit override
+            # entirely (see _fresh_tvec above), so vis_ctrl_mode can never
+            # leave 'CARROT' in that mode regardless of whether vision is
+            # actually detecting the gate — it's not "blind", vision-driven
+            # control is just switched off by design. Without this guard the
+            # descend nudge misread that as a permanent vision loss and
+            # ramped toward its full descend cap on every approach, flying
+            # ~1m below the gate even with the gate in plain view.
+            _searching = (
+                not self._debug_waypoints_only
+                and self._carrot_mode_since is not None
+                and (_now - self._carrot_mode_since) > self._vision_search_trigger_sec
+                and _dist_to_target < self._vision_search_range_m
+            )
+            # _search_descend_offset (m) is the bounded target descent distance;
+            # the velocity bias actually commanded is its derivative, so the
+            # bias is +descend_mps while ramping toward the cap, 0 once capped
+            # (no further net descent commanded), and -descend_mps while
+            # unwinding back to nominal — the accumulated commanded descent
+            # never exceeds vision_search_max_descend_m.
+            _search_target = self._vision_search_max_descend_m if _searching else 0.0
+            _search_step   = self._vision_search_descend_mps * _actual_dt
+            _prev_offset   = self._search_descend_offset
+            if _prev_offset < _search_target:
+                self._search_descend_offset = min(_search_target, _prev_offset + _search_step)
+            elif _prev_offset > _search_target:
+                self._search_descend_offset = max(_search_target, _prev_offset - _search_step)
+            _search_vel_bias = (self._search_descend_offset - _prev_offset) / max(_actual_dt, 1e-6)
+            v_ref_for_gains = v_ref_for_gains.copy()
+            v_ref_for_gains[2] += _search_vel_bias
 
             # Visual yaw correction from orange centroid (bearing-only).
             # When the centroid is available, blend the carrot psi toward the
             # camera bearing so the drone points its nose at the detected orange blob.
-            cx_det = None if self._debug_waypoints_only else det.get('centre_px')
+            # Also gated on _agi_matches_wp (see above) — this and the vertical
+            # nudge below are the other two consumers of a raw per-frame
+            # detection that need the same protection as the waypoint/pursuit
+            # overrides: without it, a lingering detection of the wrong gate
+            # during an agi/tracker.wp desync would still bias yaw/altitude
+            # toward it even with position/velocity correctly guarded. Also
+            # gated on tracker.committed — see the pursuit override above for
+            # why a near-field bearing/pixel position is too noise-sensitive
+            # to trust once committed to the final approach.
+            cx_det = (None if (self._debug_waypoints_only or not _agi_matches_wp
+                                or self.tracker.committed)
+                      else det.get('centre_px'))
+
+            # Vertical visual-centering nudge (see __init__ for rationale).
+            # cam_cy is the image half-height (principal point), so dy_px/cam_cy
+            # is ~0 at vertical center and ~±1 at the top/bottom border. Only
+            # activates past vision_vnudge_border_frac of the way to the edge,
+            # so ordinary comfortably-centered flight is unaffected — this is
+            # a proactive edge-of-frame correction, not a general vertical
+            # centering servo (position/velocity from PnP already do that job
+            # once the gate is confidently locked).
+            _vnudge_bias = 0.0
+            if cx_det is not None:
+                _cam_cy = self.param.get('cam_cy', 180.0)
+                dy_px = float(cx_det[1]) - _cam_cy
+                _border_frac = abs(dy_px) / _cam_cy if _cam_cy > 0 else 0.0
+                if _border_frac > self._vis_vnudge_border_frac:
+                    _excess = ((_border_frac - self._vis_vnudge_border_frac)
+                               / (1.0 - self._vis_vnudge_border_frac))
+                    _excess = float(np.clip(_excess, 0.0, 1.0))
+                    # dy_px > 0: gate below center (near bottom border) ->
+                    # descend (positive Down) to bring it back toward center.
+                    # dy_px < 0: gate above center (near top border) -> climb.
+                    _vnudge_bias = float(np.sign(dy_px) * _excess * self._vis_vnudge_max_mps)
+                    v_ref_for_gains = v_ref_for_gains.copy()
+                    v_ref_for_gains[2] += _vnudge_bias
+
+            # Publish transition/reacquisition-stage diagnostics for the
+            # logger and the vision debug overlay (see log_carrot below and
+            # vision_rx.py's _draw_overlay) — the full locked/transition/
+            # search/reacquisition pipeline has enough interacting pieces
+            # that they need to be visible together, live and in the log,
+            # not just inferred after the fact from position traces.
+            self.data['agi_matches_wp']        = _agi_matches_wp
+            self.data['reacq_blend_w']         = self._reacq_blend_w
+            self.data['search_active']         = bool(_searching)
+            self.data['search_descend_offset'] = self._search_descend_offset
+            self.data['vnudge_bias']           = _vnudge_bias
+
             if cx_det is not None:
                 dx_px = float(cx_det[0]) - self.param.get('cam_cx', 320.0)
-                _cur_yaw = quat_to_euler(quat)[2]
+                # Standard NED convention required here (see _gt_yaw_convention)
+                # — psi_ref_carrot below is always standard NED, and blending
+                # it against a GT-convention _cur_yaw would corrupt it with a
+                # mirrored delta instead of a correctly-signed one.
+                _cur_yaw = self._gt_yaw_convention(quat_to_euler(quat)[2])
                 psi_vis = _wrap_pi(_cur_yaw +
                                    np.arctan2(dx_px, self.param.get('cam_fx', 320.0)))
                 dpsi_vis = _wrap_pi(psi_vis - psi_ref_carrot)
                 _VIS_BLEND = 0.4   # weight of visual bearing vs carrot waypoint yaw
-                psi_ref_carrot = _wrap_pi(psi_ref_carrot + _VIS_BLEND * dpsi_vis)
+                # Scaled by the same reacquisition ramp as the velocity pursuit
+                # blend above, so heading also stays tangent-following right
+                # after a real vision loss instead of snapping toward "point
+                # nose at gate."
+                psi_ref_carrot = _wrap_pi(psi_ref_carrot
+                                           + _VIS_BLEND * self._reacq_blend_w * dpsi_vis)
 
             # Rate-limit yaw reference
             dpsi = _wrap_pi(psi_ref_carrot - self._psi_cmd)
@@ -545,6 +828,11 @@ class Controller:
                 carrot_pos = self.tracker.carrot_pos,
                 drone_pos  = pos_ned,
                 mode       = self.data.get('vis_ctrl_mode', ''),
+                agi_match      = self.data.get('agi_matches_wp', True),
+                reacq_blend_w  = self.data.get('reacq_blend_w', 1.0),
+                search_active  = self.data.get('search_active', False),
+                search_offset  = self.data.get('search_descend_offset', 0.0),
+                vnudge_bias    = self.data.get('vnudge_bias', 0.0),
             )
 
         # Advance carrot waypoint when sim signals gate passage — via either
@@ -580,6 +868,21 @@ class Controller:
                 else:
                     self.tracker.wp = new_wp
                     self._wp_pending = None
+                    # Keep active_gate_index in lockstep with tracker.wp instead
+                    # of waiting for the sim's own RACE_STATUS message to catch
+                    # up. Confirmed in a flight log: a COLLISION-triggered
+                    # advance can fire before RACE_STATUS reports the new gate
+                    # index, leaving _agi_matches_wp (and vision_rx.py's own
+                    # gate_info resolution, which reads this same shared value)
+                    # stuck on the just-passed gate for however long RACE_STATUS
+                    # lags — not just one frame, but potentially the whole
+                    # approach to the next gate, during which NEITHER the raw
+                    # controller overrides NOR the EKF's vision fusion get any
+                    # correction toward the real target, since both key off
+                    # active_gate_index. new_wp-1 >= agi always holds (from the
+                    # max() above), so this only ever advances the index, never
+                    # regresses it if RACE_STATUS already agrees or is ahead.
+                    self.data['active_gate_index'] = new_wp - 1
                     print(f"[GATE PASSED {_trigger}] "
                           f"tracker.wp → {self.tracker.wp}", flush=True)
 
@@ -592,6 +895,8 @@ class Controller:
             if _along >= self._gate_pass_dist or _elapsed >= self._gate_pass_timeout:
                 self.tracker.wp  = _new_wp
                 self._wp_pending = None
+                # See the immediate-advance branch above for why this is needed.
+                self.data['active_gate_index'] = _new_wp - 1
                 self._wp_transition_reset()
                 print(f"[WP ADVANCE] tracker.wp → {_new_wp}  "
                       f"(along={_along:.1f} m  elapsed={_elapsed:.2f} s)", flush=True)
@@ -738,6 +1043,33 @@ class Controller:
         if self._v_ref_smooth is not None:
             self._v_ref_prev = self._v_ref_smooth.copy()
 
+    def _gt_yaw_convention(self, psi):
+        """Flip between standard NED yaw (0=North, +CW towards East — the
+        convention carrot_tracker.py and every psi_ref in this file uses)
+        and the sim's GT-mode ATTITUDE convention (psi_gt = -psi_NED; GT's
+        ATTITUDE yaw is not corrected in mavlink_rx.py, see _outer_loop's
+        r_des sign note). A pure negation, so the same call converts either
+        direction. Identity outside GT mode, where quat_to_euler(quat)[2] is
+        already standard NED.
+
+        Every quat_to_euler(quat)[2] read from mav_state's quaternion (i.e.
+        every psi_meas) needs this before it's compared against or combined
+        with a standard-convention angle like psi_ref — confirmed via a real
+        GT flight log that skipping it drives the true heading to -psi_ref
+        (a left/right mirror of the intended direction) while the raw
+        logged error still reads ~0, since the loop faithfully converges
+        its own (mis-defined) error term. Found and fixed three call sites
+        that needed this in one pass (_outer_loop's e_psi, the vision-
+        bearing velocity override, and the visual-yaw-blend-from-centroid).
+
+        Same underlying issue also turned up in vision_rx.py, which builds
+        rotation matrices straight from mav_state['quat'] with no GT
+        awareness at all — see rotations.gt_yaw_flip/gt_correct_quat (this
+        method is now a thin wrapper around gt_yaw_flip). Grep for those two
+        names, not just this method, before adding a fourth site.
+        """
+        return rotations.gt_yaw_flip(psi, self._gt_mode)
+
     # ------------------------------------------------------------------
     # Outer loop: NED velocity + yaw → desired body rates + collective
     # ------------------------------------------------------------------
@@ -749,6 +1081,16 @@ class Controller:
         #   q_des>0 → nose-UP rate to sim (confirmed empirically from cascade logs)
         #   r_des sign: GT sends −r_des (psi_meas = −psi_NED from ATTITUDE);
         #               non-GT sends +r_des (psi_meas standard NED from EKF gyros)
+        #
+        # psi_ref (from carrot_tracker, atan2(ea_E, ea_N)) is always standard-
+        # convention NED — it has no GT awareness. Convert it into psi_meas's
+        # convention (see _gt_yaw_convention) before using it below, so both
+        # the error term and this function's own psi_ref_deg debug log are
+        # self-consistent with psi_meas. Confirmed against a real GT flight
+        # log: without this, logged psi_err tracked ~0 throughout (the loop
+        # faithfully converges its own error term) while the actual camera
+        # view was consistently offset to the mirror-opposite side of the gate.
+        psi_ref = self._gt_yaw_convention(psi_ref)
 
         # ── Gain scheduling ───────────────────────────────────────────────────
         # Interpolate K_att and Kp_v* linearly with |v_ned_ref| so gains ramp up
@@ -789,10 +1131,16 @@ class Controller:
         # Scaling v_ned_ref down here means e_vel starts small and grows together
         # with the gain, keeping their product — the commanded tilt — bounded
         # through the same transition instead of just delaying when it saturates.
-        # D (altitude) is excluded, matching Kp_vD staying unramped below.
+        # D (altitude) reference is ramped too, same as N/E, so vD_ref starts at
+        # 0 on the first carrot-activation tick instead of stepping straight to
+        # whatever the carrot/tracker hands over. Kp_vD/Ki_vD themselves stay
+        # unramped (see below) so the vertical loop still has full authority to
+        # track that ramping target from tick 1 — liftoff isn't delayed, only the
+        # target it's chasing eases in.
         v_ned_ref = v_ned_ref.copy()
         v_ned_ref[0] *= _att_ramp
         v_ned_ref[1] *= _att_ramp
+        v_ned_ref[2] *= _att_ramp
 
         # Low-pass filter all three EKF velocity channels before computing errors.
         # Horizontal (vN, vE): longer τ because the cold-start spurious velocity
@@ -807,6 +1155,16 @@ class Controller:
         self._vD_filt = alpha_vD * self._vD_filt + (1.0 - alpha_vD) * v_ned_meas[2]
         v_ned_meas_filt = np.array([self._vN_filt, self._vE_filt, self._vD_filt])
 
+        # ── Derivative term (derivative-on-measurement) ─────────────────────────
+        # d(v_meas_filt)/dt, not d(error)/dt: differentiating the filtered
+        # measurement (rather than v_ref - v_meas) means a stepped v_ned_ref
+        # (waypoint transitions, mode switches) doesn't inject a derivative
+        # kick — only actual velocity change feeds the D term.
+        if self._v_meas_filt_prev is None:
+            self._v_meas_filt_prev = v_ned_meas_filt.copy()
+        dv_meas = (v_ned_meas_filt - self._v_meas_filt_prev) / max(dt, 1e-4)
+        self._v_meas_filt_prev = v_ned_meas_filt.copy()
+
         # ── 1st-order LP on v_ned_ref ─────────────────────────────────────────
         # Smooths carrot oscillation before it reaches the PI and lag FF.
         # tau_ref_smooth=0 (default) disables.
@@ -820,12 +1178,15 @@ class Controller:
         # ── Reference-derivative feedforward ──────────────────────────────────
         # a_lag = K_dv * dv_ref/dt: pre-commands the acceleration needed to track
         # a changing reference, reducing velocity tracking lag during transitions.
-        if self._K_dv > 0.0:
+        # D axis uses its own gain (K_dv_D) — vD's dynamics/noise floor differ from
+        # N/E, so it needs independent tuning rather than sharing K_dv.
+        if self._K_dv > 0.0 or self._K_dv_D > 0.0:
             _dv = np.clip((v_ned_ref - self._v_ref_prev) / max(dt, 0.001), -20.0, 20.0)
             _a_lag_N = self._K_dv * _dv[0]
             _a_lag_E = self._K_dv * _dv[1]
+            _a_lag_D = self._K_dv_D * _dv[2]
         else:
-            _a_lag_N = _a_lag_E = 0.0
+            _a_lag_N = _a_lag_E = _a_lag_D = 0.0
         self._v_ref_prev = v_ned_ref.copy()
 
         e_vel = v_ned_ref - v_ned_meas_filt
@@ -862,8 +1223,10 @@ class Controller:
         # (~11 m/s upward) would otherwise cut collective to ~0.5 N/motor.
         g   = self._g
         a_N = (_Kp_vN_eff * e_vel_c[0] + self._Ki_vN * self.xi_vel[0]
+               - self._Kd_vN * dv_meas[0]
                + self._ff_vN * v_ned_ref[0] + _a_lag_N)
         a_E = (_Kp_vE_eff * e_vel_c[1] + self._Ki_vE * self.xi_vel[1]
+               - self._Kd_vE * dv_meas[1]
                + self._ff_vE * v_ned_ref[1] + _a_lag_E)
 
         # Rotate desired NED acceleration into body-frame components.
@@ -889,7 +1252,8 @@ class Controller:
         # Collective thrust (tilt-corrected); a_z > 0 = NED-down = less lift needed.
         # T_collective is the TOTAL thrust fed into the mixer's first row (T1+T2+T3+T4),
         # so use 4*T_hover (=m*g), not T_hover (=m*g/4) which is per-motor hover thrust.
-        a_z = _Kp_vD_eff * e_vel_c[2] + self._Ki_vD * self.xi_vel[2]
+        a_z = (_Kp_vD_eff * e_vel_c[2] + self._Ki_vD * self.xi_vel[2]
+               - self._Kd_vD * dv_meas[2] + _a_lag_D)
         T_raw = 4.0 * self.T_hover * (1.0 - a_z / g) / R22
         # Output filter: removes R22 (attitude) noise that the vD filter cannot catch.
         alpha_T = np.exp(-dt / self._TAU_T_COLL)
@@ -931,8 +1295,7 @@ class Controller:
         #   GT   — ATTITUDE yaw is NOT negated in mavlink_rx → psi_meas = −psi_NED
         #          → r_des is sign-inverted → negate before send
         #   non-GT — EKF gyro integration → psi_meas = standard NED → send as-is
-        _gt_mode = bool(self.param.get('ground_truth_mode', False))
-        _r_cmd   = float(-r_des if _gt_mode else r_des)
+        _r_cmd   = float(-r_des if self._gt_mode else r_des)
         self.sim_conn.mav.set_attitude_target_send(
             int(time.time() * 1e3) & 0xFFFFFFFF,
             self.sim_conn.target_system,
@@ -1063,22 +1426,5 @@ def _wrap_pi(angle):
 
 
 
-# Quaternion → Euler angles (roll, pitch, yaw) to unify rotation representation across the controller.
-def quat_to_euler(q):
-    qw,qx,qy,qz = q
-
-    roll = np.arctan2(
-        2*(qw*qx + qy*qz),
-        1-2*(qx*qx+qy*qy)
-    )
-
-    pitch = np.arcsin(
-        np.clip(2*(qw*qy-qz*qx),-1,1)
-    )
-
-    yaw = np.arctan2(
-        2*(qw*qz+qx*qy),
-        1-2*(qy*qy+qz*qz)
-    )
-
-    return roll,pitch,yaw
+# Quaternion → Euler angles (roll, pitch, yaw) — see rotations.py.
+quat_to_euler = rotations.quat_to_euler

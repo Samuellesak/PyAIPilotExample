@@ -1,6 +1,8 @@
 import numpy as np
 import yaml
 
+import rotations
+
 
 def load_params(yaml_path="params.yaml"):
     """
@@ -102,17 +104,10 @@ def load_params(yaml_path="params.yaml"):
     return p
 
 
-def _quat_to_R(q):
-    """
-    Rotation matrix R such that  v_body = R @ v_NED.
-    q = [qw, qx, qy, qz] unit quaternion representing NED-to-body rotation.
-    """
-    qw, qx, qy, qz = q
-    return np.array([
-        [1 - 2*(qy*qy + qz*qz),     2*(qx*qy + qw*qz),     2*(qx*qz - qw*qy)],
-        [    2*(qx*qy - qw*qz), 1 - 2*(qx*qx + qz*qz),     2*(qy*qz + qw*qx)],
-        [    2*(qx*qz + qw*qy),     2*(qy*qz - qw*qx), 1 - 2*(qx*qx + qy*qy)],
-    ])
+# Rotation matrix R such that v_body = R @ v_NED — see rotations.py
+# (centralized; kept as _quat_to_R here since ekf_shadow.py, imu_ekf.py,
+# linearize.py, and lqi.py all import this name from dyn.py).
+_quat_to_R = rotations.quat_to_R_ned2body
 
 
 def _omega_matrix(omega):

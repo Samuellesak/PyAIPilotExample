@@ -26,6 +26,8 @@ for the carrot tracker and altitude hold over the time scale of a flight.
 
 import numpy as np
 
+import rotations
+
 
 class QuadEKF:
     _IP  = slice(0, 3)    # position NED       [m]
@@ -205,6 +207,75 @@ class QuadEKF:
 
         self._apply_update(innov, H, self._R_a)
         return True, float(np.linalg.norm(innov))
+
+    def update_attitude(self, roll_meas, pitch_meas, sigma_att=0.15, gate_dist=5.0):
+        """
+        Roll/pitch measurement from PnP (see vision_rx.py's gate-orientation
+        solve, which yields a full R_b2n — update_yaw already consumes its
+        yaw component; this consumes the roll/pitch half of the same matrix).
+
+        Reformulated as a synthetic gravity-vector measurement so it can
+        reuse _H_acc_quat's existing Jacobian rather than deriving a new one:
+        the body-frame gravity direction implied by (roll_meas, pitch_meas)
+        alone (yaw=0; gravity direction in body frame is yaw-invariant) is
+        compared against R_b2n(q).T @ [0,0,-g] from the CURRENT full state,
+        whose own yaw doesn't affect the comparison — same mechanism as
+        update_accel, just with the "measurement" coming from vision instead
+        of the accelerometer. This is vision's only source of *ongoing*
+        roll/pitch correction that doesn't go silent during real linear
+        acceleration the way update_accel must (see its docstring) — PnP
+        doesn't care whether the vehicle is accelerating, only how the gate
+        looks.
+        No adaptive gate-widening here (unlike update_position/velocity/yaw)
+        — kept as simple as update_accel's fixed threshold for this first
+        version; add streak-widening later if a real lockout shows up.
+
+        IMU-consistency check against the vision-immune gyro-only shadow
+        quaternion (_q_imu_ref) — identical pattern to update_yaw's imu_innov
+        check, added for the same reason: gating only against the live state
+        (self.x) can't catch a persistent, gradually-compounding roll/pitch
+        bias, since each small update drags the state and the next update is
+        then judged against that already-nudged value, looking "consistent"
+        the whole way. Confirmed in a flight log: a real ~10-20° attitude/yaw
+        error developed and persisted for the rest of an approach following a
+        gate handoff — small enough per-tick that neither this gate nor
+        update_yaw's own state-based gate ever rejected an individual step.
+        _q_imu_ref is gyro-only and resynced to vision only after a cooldown
+        (see update_yaw/__init__), so it can't be dragged the same way over a
+        single approach.
+        Returns (applied: bool, innov_norm: float).
+        """
+        if not (np.isfinite(roll_meas) and np.isfinite(pitch_meas)):
+            return False, float('nan')
+
+        g = self._g
+        # ZYX quaternion from (roll, pitch, yaw=0) — same convention as set_attitude.
+        q_synth = rotations.euler_to_quat(roll_meas, pitch_meas, 0.0)
+        z_meas  = _rot_b2n(q_synth).T @ np.array([0., 0., -g])
+
+        z_pred_imu = _rot_b2n(self._q_imu_ref).T @ np.array([0., 0., -g])
+        imu_innov_norm = float(np.linalg.norm(z_meas - z_pred_imu))
+        if imu_innov_norm > gate_dist:
+            return False, imu_innov_norm
+
+        q = self.x[self._IQ]
+        z_pred = _rot_b2n(q).T @ np.array([0., 0., -g])
+        innov  = z_meas - z_pred
+        innov_norm = float(np.linalg.norm(innov))
+        if innov_norm > gate_dist:
+            return False, innov_norm
+
+        H = np.zeros((3, self.N))
+        H[:, 6:10] = _H_acc_quat(q, g)
+        R = (sigma_att ** 2) * np.eye(3)
+
+        self._apply_update(innov, H, R)
+        # Resync only after a cooldown, not on every acceptance — see
+        # update_yaw's identical pattern and __init__'s note.
+        if self._q_imu_ref_age >= self._V_IMU_REF_RESYNC_SEC:
+            self._q_imu_ref     = self.x[self._IQ].copy()
+            self._q_imu_ref_age = 0.0
+        return True, innov_norm
 
     def update_zupt(self, gyro_raw, acc_raw,
                     gyro_threshold=0.3, acc_threshold=1.5):
@@ -451,18 +522,10 @@ class QuadEKF:
         from (φ, θ, psi) using the ZYX Tait-Bryan convention:
             q = q_z(psi) * q_y(theta) * q_x(phi)
         """
-        qw, qx, qy, qz = self.x[self._IQ]
-        # Extract roll and pitch from current EKF quaternion
-        phi   = np.arctan2(2.0*(qw*qx + qy*qz), 1.0 - 2.0*(qx*qx + qy*qy))
-        theta = np.arcsin(np.clip(2.0*(qw*qy - qz*qx), -1.0, 1.0))
-        # Rebuild quaternion with corrected yaw
-        cp, sp = np.cos(phi/2),   np.sin(phi/2)
-        ct, st = np.cos(theta/2), np.sin(theta/2)
-        cy, sy = np.cos(psi/2),   np.sin(psi/2)
-        self.x[6]  = cy*ct*cp + sy*st*sp   # qw
-        self.x[7]  = cy*ct*sp - sy*st*cp   # qx
-        self.x[8]  = cy*st*cp + sy*ct*sp   # qy
-        self.x[9]  = sy*ct*cp - cy*st*sp   # qz
+        # Extract roll and pitch from current EKF quaternion, rebuild with
+        # corrected yaw — see rotations.py for the shared euler<->quat formulas.
+        phi, theta, _ = rotations.quat_to_euler(self.x[self._IQ])
+        self.x[6:10] = rotations.euler_to_quat(phi, theta, psi)
         # Normalise to guard against floating-point drift
         self.x[self._IQ] /= np.linalg.norm(self.x[self._IQ])
         self._q_imu_ref     = self.x[self._IQ].copy()
@@ -470,13 +533,7 @@ class QuadEKF:
 
     def set_attitude(self, phi, theta, psi):
         """Rebuild quaternion from explicit roll/pitch/yaw (ZYX Tait-Bryan)."""
-        cp, sp = np.cos(phi/2),   np.sin(phi/2)
-        ct, st = np.cos(theta/2), np.sin(theta/2)
-        cy, sy = np.cos(psi/2),   np.sin(psi/2)
-        self.x[6]  = cy*ct*cp + sy*st*sp   # qw
-        self.x[7]  = cy*ct*sp - sy*st*cp   # qx
-        self.x[8]  = cy*st*cp + sy*ct*sp   # qy
-        self.x[9]  = sy*ct*cp - cy*st*sp   # qz
+        self.x[6:10] = rotations.euler_to_quat(phi, theta, psi)
         self.x[self._IQ] /= np.linalg.norm(self.x[self._IQ])
         self._q_imu_ref     = self.x[self._IQ].copy()
         self._q_imu_ref_age = 0.0
@@ -489,16 +546,8 @@ class QuadEKF:
         Decompose current quat into pitch (θ) and yaw (ψ), then rebuild
         from (phi, θ, ψ) using the ZYX Tait-Bryan convention.
         """
-        qw, qx, qy, qz = self.x[self._IQ]
-        theta = np.arcsin(np.clip(2.0*(qw*qy - qz*qx), -1.0, 1.0))
-        psi   = np.arctan2(2.0*(qw*qz + qx*qy), 1.0 - 2.0*(qy*qy + qz*qz))
-        cp, sp = np.cos(phi/2),   np.sin(phi/2)
-        ct, st = np.cos(theta/2), np.sin(theta/2)
-        cy, sy = np.cos(psi/2),   np.sin(psi/2)
-        self.x[6]  = cy*ct*cp + sy*st*sp   # qw
-        self.x[7]  = cy*ct*sp - sy*st*cp   # qx
-        self.x[8]  = cy*st*cp + sy*ct*sp   # qy
-        self.x[9]  = sy*ct*cp - cy*st*sp   # qz
+        _, theta, psi = rotations.quat_to_euler(self.x[self._IQ])
+        self.x[6:10] = rotations.euler_to_quat(phi, theta, psi)
         self.x[self._IQ] /= np.linalg.norm(self.x[self._IQ])
         self._q_imu_ref     = self.x[self._IQ].copy()
         self._q_imu_ref_age = 0.0
@@ -546,23 +595,12 @@ class QuadEKF:
 
 # ── Module-level pure helpers ─────────────────────────────────────────────
 
-def _yaw_of_quat(q):
-    """Extract NED yaw [rad] from q = [qw, qx, qy, qz]. Shared by update_yaw
-    and its IMU-consistency check so both use the identical formula."""
-    qw, qx, qy, qz = q
-    f = 2.0 * (qw * qz + qx * qy)
-    g = 1.0 - 2.0 * (qy * qy + qz * qz)
-    return float(np.arctan2(f, g))
+# Extract NED yaw [rad] from q = [qw,qx,qy,qz]. Shared by update_yaw and its
+# IMU-consistency check so both use the identical formula — see rotations.py.
+_yaw_of_quat = rotations.quat_to_yaw
 
-
-def _rot_b2n(q):
-    """R_body_to_NED: v_NED = R @ v_body.  q = [qw, qx, qy, qz]."""
-    qw, qx, qy, qz = q
-    return np.array([
-        [1 - 2*(qy*qy + qz*qz),  2*(qx*qy - qw*qz),  2*(qx*qz + qw*qy)],
-        [    2*(qx*qy + qw*qz),  1 - 2*(qx*qx + qz*qz),  2*(qy*qz - qw*qx)],
-        [    2*(qx*qz - qw*qy),  2*(qy*qz + qw*qx),  1 - 2*(qx*qx + qy*qy)],
-    ])
+# R_body_to_NED: v_NED = R @ v_body.  q = [qw, qx, qy, qz]. — see rotations.py
+_rot_b2n = rotations.quat_to_R_body2ned
 
 
 def _omega_mat(omega):
