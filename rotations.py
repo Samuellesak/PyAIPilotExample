@@ -170,6 +170,26 @@ def gt_correct_quat(q, gt_mode):
     return euler_to_quat(roll, pitch, gt_yaw_flip(yaw, True))
 
 
+def rotate_body_to_ned(v_body, quat, gt_mode):
+    """v_ned = R_body2ned(gt_correct_quat(quat)) @ v_body — THE chokepoint for
+    "rotate a body-frame vector into NED, GT-aware."
+
+    Every site that does this and then compares/combines the result with a
+    standard-NED-convention value must go through this function rather than
+    building quat_to_R_body2ned(quat) inline — see the GT-mode module note
+    above for why: this exact operation was independently re-implemented at
+    4 sites across vision_rx.py/controller.py, 3 of which remembered
+    gt_correct_quat and 1 of which (a next-gate-candidate NED computation)
+    didn't, silently reintroducing the same bug the other 3 sites had
+    already fixed. Route every future call through here instead.
+
+    Does not apply to extracting a yaw-invariant quantity (e.g. "which body
+    direction is NED-down") — that doesn't need gt_correct_quat at all, see
+    the module note above; don't route those calls through this function.
+    """
+    return quat_to_R_body2ned(gt_correct_quat(quat, gt_mode)) @ np.asarray(v_body, dtype=float)
+
+
 # ── Rotation comparison ──────────────────────────────────────────────────
 
 def rotation_angle_distance(Ra, Rb):

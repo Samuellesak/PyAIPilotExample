@@ -105,7 +105,7 @@ cam_tilt_deg: 20.0   #20 degree upward tilt of the camera (positive = nose up, n
 # going from ground_truth_mode: true to false) without re-tuning four params in
 # lockstep. Fit alongside sigma_acc_imu/model via `ekf_shadow.py --fit-mode gap`
 # rather than hand-picked — see that file's docstring. 0.0856
-vision_authority: 1.0
+vision_authority: 0.3174
 # Position updates: sigma_pos = ekf_vision_sigma + ekf_vision_sigma_range_k * range_m
 # (see vision_rx.py). Was disabled for a long time ("PnP pos noise causes EKF path
 # jumps") — root cause turned out to be the fixed 0.5 m sigma treating far-range PnP
@@ -196,6 +196,33 @@ ekf_vision_yaw_sigma_range_k: 0.03   # additional 1-sigma yaw per metre of PnP r
 ekf_vision_att_sigma_range_k: 0.04   # additional 1-sigma roll/pitch per metre of PnP range [rad/m]
 vision_yaw_window_frames: 5  # circular-mean smoothing window for PnP yaw before it reaches the EKF
 vision_yaw_outlier_deg: 12.0  # reject a single yaw_ned frame this far from the window's circular mean
+# Shared pose-disambiguation policy (pose_disambiguation.py) for both of
+# vision_rx.py's ambiguity sites: _pnp_gate's 2-solution IPPE front/back flip
+# and _attitude_from_pnp's 4-fold corner-labelling ambiguity (square gates
+# can be relabelled by any multiple of 90° about the gate normal). Both used
+# to be resolved (independently, via two separately hand-written and
+# separately patched implementations) by scoring candidates against the
+# EKF's OWN current attitude — self-referential, so once the EKF drifted
+# even a little, a wrong candidate could look "closer" and get picked,
+# feeding back into the EKF and drifting it further next frame. Confirmed in
+# a flight log: yaw_ned locked onto a wrong candidate for several
+# consecutive frames (60-130° off a true ~175-180° heading) — a sustained
+# wrong-mode lock, not single-frame noise, so vision_yaw_outlier_deg's
+# circular-mean filter never caught it, dragging EKF yaw error from ~2° to
+# ~22° over ~4s with vision_authority at 1.0 (raising trust alone doesn't
+# help — the measurement itself was wrong, not just under-trusted). Fixed
+# structurally: pose_disambiguation.disambiguate() never scores against a
+# live EKF/attitude estimate at all — only position-consistency against
+# mav_state['pos_ned'] (independent, reliable) when available, or
+# rate-limited continuity against the pipeline's own last-accepted output
+# otherwise. The two params below tune that shared policy.
+vision_pnp_continuity_max_rate: 3.0  # [rad/s] max plausible rotation-candidate switch rate (continuity tier)
+# How far apart (metres) candidates' implied positions must be before
+# position-consistency is used to disambiguate at all — below this they're
+# treated as position-degenerate (always true for corner-labelling, since
+# relabelling doesn't move tvec) and resolved via continuity instead. Not
+# yet fitted from flight data; start conservative.
+vision_pose_position_degenerate_tol_m: 1.0  # [m]
 # Confidence ramp for the first vision-yaw updates after vision_settle_sec's hard
 # cliff — see imu_ekf.py's update_yaw call for why. sigma_yaw ramps linearly from
 # vision_yaw_sigma_initial down to ekf_vision_yaw_sigma over this many seconds.
@@ -225,7 +252,7 @@ gate_height_default: 1.5     # [m]
 vision_conf_min: 0.6
 
 # Gate distance lock — prevents distant-gate detections from corrupting PnP
-vision_max_gate_dist: 32.0   # reject PnP solutions farther than this [m]
+vision_max_gate_dist: 62.0   # reject PnP solutions farther than this [m]
 vision_vel_max_factor: 2.5   # reject PnP velocity > v_ref * this (e.g. 2.5 × 2 m/s = 5 m/s)
 vision_lock_frames: 5        # consecutive valid PnP frames required to acquire lock
 vision_lock_miss: 30         # consecutive missed frames before lock is released
@@ -310,17 +337,22 @@ vision_vel_cross_check_tol: 2.0   # max disagreement between the two PnP velocit
 # ordinary PnP noise averages out rather than dominating the fit.
 vision_vel_min_frames: 8     # minimum buffered samples before a velocity fit is attempted
 vision_vel_min_span_s: 0.3   # minimum time span [s] covered by those samples
-vision_hold_frames: 5        # frames to hold last locked tvec after YOLO flicker
-vision_ref_omega0: 0            # [rad/s] PT2 natural freq for v_ref smoothing; 0 = disabled (raw carrot reference)
-vision_ref_zeta: 1.0            # PT2 damping ratio (1.0 = critically damped, no overshoot)
+# vision_hold_frames (frames to hold last locked tvec after YOLO flicker) and
+# vision_ref_omega0/vision_ref_zeta (PT2 filter on v_ref) retired by the
+# gate-transition rewrite — gate_lock.py's own miss_max (vision_lock_miss
+# below) now absorbs ordinary brief flicker without ever dropping the lock,
+# and the PT2 filter was already dead code here (omega0=0) before removal.
+#
 # EMA time constant smoothing the live vision-driven update of the CURRENT
-# target waypoint (controller.py, feeds the carrot tracker's tangent geometry).
+# target waypoint — now owned by CarrotTracker.set_live_target()
+# (carrot_tracker.py), feeding the tracker's own tangent geometry directly,
+# rather than controller.py blending it externally before writing it in.
 # Was a raw per-frame overwrite with zero smoothing — a reacquisition-after-
 # vision-loss jump landing there unfiltered got frozen forever as the fixed
 # anchor for the next segment's tangent once the gate was passed, compounding
 # a bad approach angle gate-to-gate. Resets with no lag on the first sample of
 # a new segment, so a freshly-targeted gate isn't chased in slow motion.
-wp_live_update_tau: 0.2   # [s]
+wp_live_update_tau: 0.5   # [s]
 # Ramps the vision-bearing/visual-yaw override's authority back in after a
 # REAL vision loss (CARROT mode -> fresh PNP lock), instead of snapping to
 # full-strength pursuit-at-the-gate the instant a fresh detection reappears.
@@ -350,8 +382,9 @@ vision_search_descend_mps: 0.6     # ramp rate for the descend bias (both in and
 # drone flew too high and missed a gate whose approach segment required the
 # largest sustained descent on the track). Border-fraction gating means
 # ordinary comfortably-centered flight is unaffected.
-vision_vnudge_border_frac: 0.6   # start nudging once the gate is this far toward the top/bottom edge (0-1)
-vision_vnudge_max_mps: 1.5       # max additional vertical velocity bias right at the border [m/s]
+#NUDGE
+vision_vnudge_border_frac: 0.2   # start nudging once the gate is this far toward the top/bottom edge (0-1)
+vision_vnudge_max_mps: 0       # max additional vertical velocity bias right at the border [m/s]
 vision_debug_overlay: true    # set true to open a live OpenCV window with mode + bearing overlay
 next_gate_min_frames: 5      # frames second-gate PnP must be consistent before waypoint update
 
@@ -471,7 +504,7 @@ commit_dist_m: 3
 # from 0 at the start of commit to this fraction (max) exactly at the gate —
 # 0 disables (old dead-straight behaviour). Start conservative; a too-large
 # value risks cutting the corner enough to affect gate-hit accuracy.
-corner_cut_frac: 1.4
+corner_cut_frac: 0.2
 
 # Blends carrot_pos/v_ned_ref from their pre-transition value over this many
 # seconds right after tr acker.wp advances, instead of snapping straight to
@@ -496,19 +529,20 @@ hover_only: false
 # Set to true to skip YOLO detection entirely and fly only on the params.yaml waypoints.
 # Gate-NED overrides and visual yaw blending are disabled; waypoint advance still
 # happens via the sim COLLISION signal.  Use this to isolate path-following bugs.
-debug_waypoints_only: false
+
 # Opt-in, independent of debug_waypoints_only: lets vision_rx.py still run
 # YOLO/PnP and log vision_fix.csv (for ekf_shadow.py's offline replay) while
 # debug_waypoints_only stays true — controller.py's own debug_waypoints_only
 # check already ignores vision data regardless of whether real detections
 # exist, so this does not change flight behavior, only adds YOLO's CPU cost.
-vision_detect_for_logging: true
+debug_waypoints_only: false
 ground_truth_mode: false
 
+vision_detect_for_logging: true
 
 use_model_predict: true
-sigma_acc_imu: 3.1683  # raw IMU specific force 1-sigma [m/s²]  — weight in blend
-sigma_acc_model: 1.9857 # motor model specific force 1-sigma [m/s²] — lower = trust model more; adaptive at runtime
+sigma_acc_imu: 2.3655  # raw IMU specific force 1-sigma [m/s²]  — weight in blend
+sigma_acc_model: 2.9211 # motor model specific force 1-sigma [m/s²] — lower = trust model more; adaptive at runtime
 # Fitted via ekf_shadow.py --fit-config +model against logs/20260729_154249
 # (vision-free, whole-flight replay): RMS saturates for sigma_imu/sigma_model
 # ratio >~20-50 (88.16 at ratio=1 -> 65.85 at ratio=100 -> 65.847 asymptote),
@@ -524,7 +558,7 @@ yolo_enabled: true
 
 
 v_ref: 5            # reference cruise speed [m/s]
-lookahead_gain: 1   # lookahead distance = lookahead_gain * v_ref [m]; larger = smoother carrot direction 1.6
+lookahead_gain: 1.3   # lookahead distance = lookahead_gain * v_ref [m]; larger = smoother carrot direction 1.6
 
 # Outer loop: velocity PI -> desired tilt angle -> P on tilt error -> desired rates
 # R22 = cos(roll)*cos(pitch): thrust compensation factor for tilt.  At level flight
@@ -533,16 +567,16 @@ lookahead_gain: 1   # lookahead distance = lookahead_gain * v_ref [m]; larger = 
 # Per-axis velocity PI gains (NED frame).  No position hold loop — altitude is managed
 # by vD alone: v_ref_D=0 in hover, carrot D component during race.
 #---------------------------------------------------------------------------------------------------------------------
-Kp_vN: 1     # North velocity P  [1/s]  — sysid_vel: τ_v=4.59 s, T_settle=1.5 s
+Kp_vN: 1.5     # North velocity P  [1/s]  — sysid_vel: τ_v=4.59 s, T_settle=1.5 s
 Ki_vN: 0.1    # North velocity I  [1/s²]
 Kd_vN: 0.0    # North velocity D  [s]    — derivative-on-measurement; 0=off
 
-Kp_vE: 1   # East  velocity P  [1/s]  — sysid_vel: τ_v=4.44 s, T_settle=1.5 s
+Kp_vE: 1.5   # East  velocity P  [1/s]  — sysid_vel: τ_v=4.44 s, T_settle=1.5 s
 Ki_vE: 0.1    # East  velocity I  [1/s²]
 Kd_vE: 0    # East  velocity D  [s]    — derivative-on-measurement; 0=off
 
 
-Kp_vD: 1     # Down  velocity P  [1/s]  — was 2.5 ("stronger correction for vD drift"),
+Kp_vD: 1.5     # Down  velocity P  [1/s]  — was 2.5 ("stronger correction for vD drift"),
              # reduced to match horizontal: confirmed in a flight log that vD is
              # noisy/dead-reckoned (no baro/GPS) with no filtering (tau_vel_d=0,
              # see that param's note — a filter here made a transition-phase
@@ -555,9 +589,8 @@ Kp_vD: 1     # Down  velocity P  [1/s]  — was 2.5 ("stronger correction for vD
 Ki_vD: 0.1   # Down  velocity I  [1/s²] — small integral to trim steady-state vD offset
 Kd_vD: 0.1   # Down  velocity D  [s]    — derivative-on-measurement; 0=off
 
- 
-K_att: 5
-K_psi: 5       # yaw P   [1/s] 2
+K_att: 6
+K_psi: 6       # yaw P   [1/s] 2
 Ki_psi: 0.0002     # yaw I   [1/s^2]  = K_psi^2 / 5 0.2
 
 MAX_TILT_DEG: 60.0   # outer loop tilt limit [deg]; 55° → ~8 m/s² heading authority for high-speed flight
@@ -565,8 +598,8 @@ MAX_TILT_DEG: 60.0   # outer loop tilt limit [deg]; 55° → ~8 m/s² heading au
 
 tau_vN: 4.59     # North velocity plant time constant [s]  — used for feedforward
 tau_vE: 4.44     # East  velocity plant time constant [s]  — used for feedforward
-K_dv: 1.0        # reference-derivative lag compensator gain [s]; 0=off, tune 0.3–0.5 
-K_dv_D: 1.0      # same lag comp, D axis only [s]; independent of K_dv since vD was never
+K_dv: 1.5        # reference-derivative lag compensator gain [s]; 0=off, tune 0.3–0.5 
+K_dv_D: 1.5      # same lag comp, D axis only [s]; independent of K_dv since vD was never
                  # getting a lag-comp term before (N/E-only) — start ~2x K_dv, tune from there
 # [s] 1st-order LP on v_ned_ref before PI; smooths carrot direction oscillation; 0=off
 # Raised from 0.15: waypoint transitions on this course can flip the lateral
@@ -579,7 +612,7 @@ K_dv_D: 1.0      # same lag comp, D axis only [s]; independent of K_dv since vD 
 # position estimate every tick, so it needs a heavier time constant to smooth
 # out. Tradeoff: more lag between a real course change and the commanded
 # tilt — watch the commit-phase approach (commit_dist_m) for sluggishness.
-tau_ref_smooth: 0.4
+tau_ref_smooth: 0.6
 
 
 # ── Velocity measurement filter time constants ────────────────────────────────

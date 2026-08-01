@@ -97,6 +97,13 @@ class CarrotTracker:
         self._last_rC     = None
         self._last_v_ref  = None
 
+        # Live-target EMA state for set_live_target() below — smooths an
+        # externally-supplied (vision-derived) update to a waypoint slot
+        # instead of the caller overwriting it raw every call.
+        self._live_target_tau  = float(param.get('wp_live_update_tau', 0.2))   # [s]
+        self._live_target_idx  = None   # which waypoints[] index the filter currently belongs to
+        self._live_target_filt = None   # filtered NED position, or None until first call
+
     # ── Main update ───────────────────────────────────────────────────────────
 
     def update(self, pos_ned, dt=None):
@@ -263,6 +270,44 @@ class CarrotTracker:
         self._last_psi = psi_ref
 
         return v_ned_ref, psi_ref
+
+    # ── Live target update (vision-driven, external caller) ────────────────
+
+    def set_live_target(self, idx, ned, dt=None):
+        """Blend a fresh externally-supplied (vision-derived) NED position
+        into waypoints[idx] via EMA, instead of the caller overwriting it
+        raw every call — a reacquisition-after-vision-loss jump landing
+        here unfiltered gets frozen forever as r0 once wp advances past it
+        (confirmed in a flight log: an unfiltered snap produced a ~1.5 m/s
+        one-tick reference jump right after a gate passage).
+
+        On the first call for a given idx (a new segment just became
+        active, or this is the first live update ever), seed the filter
+        directly from the CURRENT waypoints[idx] value — no smoothing lag
+        on a fresh target — rather than snapping straight to this single
+        fresh reading. Blending (not resetting) is always safe: even a
+        crude static default converges to live detections at the same
+        wp_live_update_tau rate as any later update, never slower.
+
+        idx : which waypoints[] slot to update. Caller is responsible for
+              only calling this for the CURRENTLY active target (e.g.
+              gated on gate-identity match upstream) — this method has no
+              way to know whether idx is the right one.
+        ned : fresh externally-measured NED position for that target.
+        dt  : seconds since the last call for THIS idx; falls back to the
+              nominal control period if omitted (mirrors update()'s own dt
+              fallback).
+        """
+        ned = np.asarray(ned, dtype=float)
+        _dt = float(dt) if dt is not None else 0.004
+        if self._live_target_idx != idx:
+            self._live_target_filt = np.asarray(self.waypoints[idx], dtype=float).copy()
+            self._live_target_idx  = idx
+        alpha = (np.exp(-_dt / self._live_target_tau)
+                 if self._live_target_tau > 0.0 else 0.0)
+        self._live_target_filt = (alpha * self._live_target_filt
+                                   + (1.0 - alpha) * ned)
+        self.waypoints[idx] = self._live_target_filt.copy()
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
