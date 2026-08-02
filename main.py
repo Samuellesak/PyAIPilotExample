@@ -2,8 +2,10 @@
 # Sample Python client for the AI GP controller
 #
 
+import os
 import time
 import msvcrt
+import traceback
 
 from setup import setup_components
 
@@ -54,7 +56,34 @@ print("Starting control loop...", flush=True)
 _flight_start = time.time()
 try:
     while True:
-        controller.update()
+        # An uncaught exception here previously just unwound straight to
+        # the bottom of this try (still saving logs via finally, still
+        # printing a traceback via Python's default handling) — but with
+        # nothing recorded IN the session's own log directory, there was no
+        # way to correlate a later flight-log analysis back to the exact
+        # failure. Confirmed in a flight log: carrot.csv/cascade.csv (both
+        # logged from inside controller.update()) stopped mid-flight while
+        # ekf.csv/vision.csv (logged from independent MAVLink/vision
+        # threads that don't call into controller.update() at all) kept
+        # running for tens of seconds after — consistent with
+        # controller.update() throwing here, silently ending active
+        # control (hence the drone "losing control") while the background
+        # threads kept logging whatever the now-uncontrolled drone did
+        # next. Persisting the traceback alongside the rest of that
+        # flight's logs turns the next occurrence into a direct answer
+        # instead of another round of inference from position/attitude
+        # traces.
+        try:
+            controller.update()
+        except Exception:
+            _tb = traceback.format_exc()
+            print(_tb, flush=True)
+            if logger is not None:
+                _tb_path = os.path.join(logger.session_dir, 'crash_traceback.txt')
+                with open(_tb_path, 'w') as _f:
+                    _f.write(_tb)
+                print(f"[main] crash traceback saved -> {_tb_path}", flush=True)
+            raise
         if time.time() - _flight_start >= FLIGHT_TIMEOUT_S:
             print(f"\nFlight timeout ({FLIGHT_TIMEOUT_S:.0f}s), saving logs...", flush=True)
             break

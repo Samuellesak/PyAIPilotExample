@@ -392,6 +392,34 @@ vision_pursuit_turn_rate_max_deg: 60.0   # [deg/s]
 # frame. This trades approach speed for convergence time instead.
 vision_reacq_speed_range_m: 12.0    # [m] only active this close to the target
 vision_reacq_speed_min_frac: 0.5    # horizontal speed fraction at trust_w=0 (1.0 = no cap)
+# Recovery guard: carrot_tracker's own committed flag is computed purely
+# from the drone's own (possibly drifted) EKF position — nothing checks it
+# against an independent source before it triggers COMMIT (which suppresses
+# vision for the whole flight-through). Confirmed in a flight log: a
+# drifted position tripped committed near a gate that vision, once it came
+# back, measured 27.75m away. When committed is true but a fresh, locked,
+# gate_id-matching vision fix reports a range beyond commit_dist_m by more
+# than vision_recovery_sanity_margin_m, RECOVERY overrides every other mode
+# (including COMMIT) and flies at a capped speed toward a point
+# vision_recovery_margin_m back from the gate along the known segment —
+# the intended pathway, not straight at the gate and not wherever the
+# carrot's own (still-committed) internal geometry aims. Exits once within
+# vision_recovery_exit_dist_m of that point, or after vision_recovery_
+# timeout_s regardless, so a persistently uncooperative vision feed can't
+# strand the drone in recovery forever. See vision_mode.RecoveryGuard.
+vision_recovery_sanity_margin_m: 5.0   # [m] beyond commit_dist_m that counts as a real mismatch, not PnP noise
+vision_recovery_exit_dist_m:     2.5   # [m] close enough to the recovery point to consider it reached
+vision_recovery_timeout_s:      15.0   # [s] safety valve — give up waiting and resume normal mode logic
+vision_recovery_margin_m:        8.0   # [m] how far back from the gate the recovery point sits, along the segment
+vision_recovery_speed_mps:       3.0   # [m/s] capped speed while flying to the recovery point
+# Cross-track distance from the direct line between the current and next
+# gate at which the pursuit override's direct-at-the-gate direction is
+# fully suppressed (weight 0), in favor of carrot's own pathway-following
+# pursuit. Blended in via min(trust_w, this), not instead of trust_w — both
+# must agree (vision confident AND back on the path) before gate-bearing
+# pursuit gets full weight. Yaw is untouched; this only affects the N/E
+# velocity direction. Not yet fitted from flight data; start conservative.
+vision_path_recover_dist_m: 4.0   # [m] cross-track distance for zero pursuit weight; 0 at the line, ramps linearly
 # Blind-search altitude nudge: while the target gate is close enough that it
 # should be detectable but hasn't been for a while (both conditions below),
 # bias the D reference downward so a gate that's dropped below the camera FOV

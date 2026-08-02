@@ -1,13 +1,14 @@
 """
 test_vision_mode.py — regression tests for vision_mode.py's Mode/
-VisionModeTracker/VerticalAssist/PursuitGuidance. Run:
+VisionModeTracker/VerticalAssist/PursuitGuidance/RecoveryGuard. Run:
 `python test_vision_mode.py`.
 """
 
 import numpy as np
 
-from pose_estimate import LockState
-from vision_mode import Mode, VisionModeTracker, VerticalAssist, PursuitGuidance
+from pose_estimate import LockState, PoseEstimate
+from vision_mode import (Mode, VisionModeTracker, VerticalAssist, PursuitGuidance,
+                          RecoveryGuard, path_convergence_weight)
 
 
 def main():
@@ -178,6 +179,100 @@ def main():
               n3 == 0.0 and e3 == 0.0)
     except Exception as e:
         check(f"zero-norm input does not raise (raised {e!r})", False)
+
+    # 15. RecoveryGuard: a fresh, locked, gate_id-matching pose reporting a
+    #     range far beyond commit_dist_m + sanity_margin_m while committed
+    #     is true -> mismatch -> active.
+    def _pose(fresh, range_m, has_pnp=True):
+        return PoseEstimate(state=LockState.LOCKED, fresh=fresh,
+                             position_ned=(np.zeros(3) if has_pnp else None),
+                             range_m=range_m)
+
+    rg = RecoveryGuard(sanity_margin_m=5.0, exit_dist_m=2.5, timeout_s=15.0)
+    active = rg.update(raw_committed=True, pose=_pose(True, 30.0), gate_id_match=True,
+                        commit_dist_m=3.0, dist_to_recovery_point=20.0, now=0.0)
+    check("large range mismatch while committed triggers recovery", active is True and rg.active)
+
+    # 16. No mismatch: range within commit_dist_m + margin is ordinary PnP
+    #     noise, not evidence committed is wrong.
+    rg2 = RecoveryGuard(sanity_margin_m=5.0, exit_dist_m=2.5, timeout_s=15.0)
+    active2 = rg2.update(raw_committed=True, pose=_pose(True, 4.0), gate_id_match=True,
+                          commit_dist_m=3.0, dist_to_recovery_point=20.0, now=0.0)
+    check("range within commit_dist_m+margin does not trigger recovery", active2 is False)
+
+    # 17. Not committed at all -> nothing to veto, regardless of range.
+    rg3 = RecoveryGuard(sanity_margin_m=5.0, exit_dist_m=2.5, timeout_s=15.0)
+    active3 = rg3.update(raw_committed=False, pose=_pose(True, 30.0), gate_id_match=True,
+                          commit_dist_m=3.0, dist_to_recovery_point=20.0, now=0.0)
+    check("not committed -> no recovery regardless of range", active3 is False)
+
+    # 18. Stale (not fresh) or wrong-gate pose can't be trusted to veto a
+    #     commit — no entry.
+    rg4 = RecoveryGuard(sanity_margin_m=5.0, exit_dist_m=2.5, timeout_s=15.0)
+    check("stale pose does not trigger recovery",
+          rg4.update(raw_committed=True, pose=_pose(False, 30.0), gate_id_match=True,
+                      commit_dist_m=3.0, dist_to_recovery_point=20.0, now=0.0) is False)
+    rg5 = RecoveryGuard(sanity_margin_m=5.0, exit_dist_m=2.5, timeout_s=15.0)
+    check("gate_id mismatch does not trigger recovery",
+          rg5.update(raw_committed=True, pose=_pose(True, 30.0), gate_id_match=False,
+                      commit_dist_m=3.0, dist_to_recovery_point=20.0, now=0.0) is False)
+
+    # 19. Latching: once active, stays active on a later tick even with a
+    #     stale pose (fresh vision data can be sparse exactly when this
+    #     matters) as long as neither exit condition is met yet.
+    rg6 = RecoveryGuard(sanity_margin_m=5.0, exit_dist_m=2.5, timeout_s=15.0)
+    rg6.update(raw_committed=True, pose=_pose(True, 30.0), gate_id_match=True,
+               commit_dist_m=3.0, dist_to_recovery_point=20.0, now=0.0)
+    still_active = rg6.update(raw_committed=True, pose=_pose(False, None, has_pnp=False),
+                               gate_id_match=True, commit_dist_m=3.0,
+                               dist_to_recovery_point=15.0, now=1.0)
+    check("recovery latches active across a stale-pose tick", still_active is True)
+
+    # 20. Exit via distance: reaching the recovery point ends recovery.
+    ended_by_distance = rg6.update(raw_committed=True, pose=_pose(False, None, has_pnp=False),
+                                    gate_id_match=True, commit_dist_m=3.0,
+                                    dist_to_recovery_point=1.0, now=2.0)
+    check("recovery exits once within exit_dist_m of the recovery point",
+          ended_by_distance is False and rg6.active is False)
+
+    # 21. Exit via timeout even while still far from the recovery point.
+    rg7 = RecoveryGuard(sanity_margin_m=5.0, exit_dist_m=2.5, timeout_s=5.0)
+    rg7.update(raw_committed=True, pose=_pose(True, 30.0), gate_id_match=True,
+               commit_dist_m=3.0, dist_to_recovery_point=20.0, now=0.0)
+    timed_out = rg7.update(raw_committed=True, pose=_pose(False, None, has_pnp=False),
+                            gate_id_match=True, commit_dist_m=3.0,
+                            dist_to_recovery_point=18.0, now=10.0)
+    check("recovery exits via timeout even while still far from the recovery point",
+          timed_out is False and rg7.active is False)
+
+    # 22. path_convergence_weight: exactly on the line -> full weight,
+    #     regardless of how far along the (infinite) line the point is.
+    r0 = np.array([0.0, 0.0, 0.0])
+    ea = np.array([1.0, 0.0, 0.0])   # line running along North
+    check("on the line at the origin -> weight 1.0",
+          np.isclose(path_convergence_weight(np.array([0.0, 0.0, 0.0]), r0, ea, 4.0), 1.0))
+    check("on the line far along it -> still weight 1.0",
+          np.isclose(path_convergence_weight(np.array([50.0, 0.0, 0.0]), r0, ea, 4.0), 1.0))
+    check("on the line behind the segment start -> still weight 1.0 (infinite line, not clamped)",
+          np.isclose(path_convergence_weight(np.array([-20.0, 0.0, 0.0]), r0, ea, 4.0), 1.0))
+
+    # 23. At or beyond recover_dist_m of cross-track distance -> weight 0.
+    check("cross-track == recover_dist_m -> weight 0.0",
+          np.isclose(path_convergence_weight(np.array([10.0, 4.0, 0.0]), r0, ea, 4.0), 0.0))
+    check("cross-track beyond recover_dist_m -> clamped to weight 0.0",
+          path_convergence_weight(np.array([10.0, 9.0, 0.0]), r0, ea, 4.0) == 0.0)
+
+    # 24. Linear ramp in between, and only the PERPENDICULAR component
+    #     matters — along-track offset doesn't affect the weight.
+    check("halfway to recover_dist_m -> weight 0.5",
+          np.isclose(path_convergence_weight(np.array([0.0, 2.0, 0.0]), r0, ea, 4.0), 0.5))
+    check("same cross-track, different along-track -> same weight",
+          np.isclose(path_convergence_weight(np.array([37.0, 2.0, 0.0]), r0, ea, 4.0), 0.5))
+
+    # 25. recover_dist_m <= 0 is a degenerate "no recovery gating" config
+    #     -> always full weight rather than dividing by zero.
+    check("recover_dist_m == 0 -> always weight 1.0",
+          path_convergence_weight(np.array([0.0, 99.0, 0.0]), r0, ea, 0.0) == 1.0)
 
     print(f"\n{'ALL PASSED' if n_fail == 0 else f'{n_fail} CHECK(S) FAILED'}")
     return n_fail == 0

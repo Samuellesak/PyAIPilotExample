@@ -5,7 +5,8 @@ from pymavlink import mavutil
 from carrot_tracker import CarrotTracker
 import rotations
 from pose_estimate import PoseEstimate
-from vision_mode import Mode, VisionModeTracker, VerticalAssist, PursuitGuidance
+from vision_mode import (Mode, VisionModeTracker, VerticalAssist, PursuitGuidance,
+                          RecoveryGuard, path_convergence_weight)
 
 MAVLINK_CMD_SIM_RESET = 31000
 CONTROL_HZ            = 250
@@ -189,6 +190,25 @@ class Controller:
         # ramping.
         self._reacq_speed_range_m  = float(param.get('vision_reacq_speed_range_m', 12.0))
         self._reacq_speed_min_frac = float(param.get('vision_reacq_speed_min_frac', 0.5))
+
+        # Recovery guard — vetoes a COMMIT trigger vision evidence directly
+        # contradicts and flies back to a known point on the pathway
+        # instead of trusting the (possibly-wrong) commit-phase geometry
+        # or beelining straight at a now-distant gate. See
+        # vision_mode.RecoveryGuard's docstring.
+        self._recovery_guard = RecoveryGuard(
+            sanity_margin_m=float(param.get('vision_recovery_sanity_margin_m', 5.0)),
+            exit_dist_m=float(param.get('vision_recovery_exit_dist_m', 2.5)),
+            timeout_s=float(param.get('vision_recovery_timeout_s', 15.0)),
+        )
+        self._recovery_margin_m  = float(param.get('vision_recovery_margin_m', 8.0))
+        self._recovery_speed_mps = float(param.get('vision_recovery_speed_mps', 3.0))
+
+        # Cross-track distance at which the pursuit override's direct-at-
+        # the-gate direction is fully suppressed in favor of carrot's own
+        # pathway-pursuit — see vision_mode.path_convergence_weight's
+        # docstring for why trust_w alone isn't sufficient here.
+        self._path_recover_dist_m = float(param.get('vision_path_recover_dist_m', 4.0))
 
         # Launch-sequence bookkeeping
         self._t_start        = None   # wall-clock time of first valid state
@@ -520,6 +540,39 @@ class Controller:
             # CARROT precedence (see Mode.COMMIT's docstring for why its
             # wire value is still the literal string 'TRANSITION').
             mode = self._vision_mode.effective_mode(pose.state, self.tracker.committed)
+
+            # Recovery point: recovery_margin_m back from the current
+            # target gate along the segment's own known endpoints — a
+            # point ON the intended pathway, not the gate itself and not
+            # wherever carrot_tracker's own internal geometry currently
+            # aims (that geometry is driven by the same position estimate
+            # RecoveryGuard exists to distrust). Cheap to compute every
+            # tick; only acted on when recovery is actually active.
+            _seg_r0  = np.asarray(self.tracker.waypoints[self.tracker.wp - 1], dtype=float)
+            _seg_r1  = np.asarray(self.tracker.waypoints[self.tracker.wp], dtype=float)
+            _seg_vec = _seg_r1 - _seg_r0
+            _seg_len = float(np.linalg.norm(_seg_vec))
+            _seg_ea  = _seg_vec / _seg_len if _seg_len > 1e-6 else np.array([1.0, 0.0, 0.0])
+            _recovery_point = _seg_r1 - self._recovery_margin_m * _seg_ea
+            _rec_vec  = _recovery_point - pos_ned
+            _rec_dist = float(np.linalg.norm(_rec_vec))
+            # How close to the direct line between the two gates the drone
+            # currently is — used below to keep the pursuit override from
+            # cutting a diagonal at the gate before cross-track error from
+            # a BLIND stretch has actually closed. See
+            # path_convergence_weight's docstring.
+            _path_conv_w = path_convergence_weight(
+                pos_ned, _seg_r0, _seg_ea, self._path_recover_dist_m)
+
+            # See RecoveryGuard's docstring: vetoes a COMMIT that vision
+            # evidence directly contradicts and takes priority over every
+            # other mode — including COMMIT itself — until the drone is
+            # back on the pathway or the attempt times out.
+            if self._recovery_guard.update(
+                    raw_committed=self.tracker.committed, pose=pose,
+                    gate_id_match=gate_id_match, commit_dist_m=self.tracker.commit_dist,
+                    dist_to_recovery_point=_rec_dist, now=_now):
+                mode = Mode.RECOVERY
             self.data['vis_ctrl_mode'] = mode.value
 
             # Vision-bearing pursuit override: replace NE components of
@@ -539,7 +592,19 @@ class Controller:
             # right at the gate swings the raw bearing violently (confirmed
             # in a flight log: vc_E jumped -1 to +4 m/s in one tick while
             # nominally in TRANSITION).
-            if (mode in (Mode.TRACKING, Mode.REACQUIRING)
+            if mode == Mode.RECOVERY:
+                # Head straight at the recovery point at a capped, gentle
+                # speed instead of the ordinary gate-bearing pursuit law.
+                # PursuitGuidance's rate limit exists to protect against
+                # overshoot on a bearing that swings as range closes on the
+                # gate — here the target is a fixed point on the pathway,
+                # not a shrinking-range bearing, so a direct heading is
+                # enough; the speed cap is what keeps this a controlled
+                # recovery rather than another aggressive correction.
+                self._pursuit_guidance.reset()
+                if _rec_dist > 1e-3:
+                    v_ref_for_gains = (_rec_vec / _rec_dist) * self._recovery_speed_mps
+            elif (mode in (Mode.TRACKING, Mode.REACQUIRING)
                     and gate_id_match and not self._debug_waypoints_only):
                 _t_body_v = pose.gate_bearing_body_m
                 _horiz_v = float(np.sqrt(_t_body_v[0]**2 + _t_body_v[1]**2))
@@ -596,8 +661,17 @@ class Controller:
                     # unfavorable-angle approach after reacquisition). Ramps to
                     # full pursuit strength as trust rebuilds; already 1.0 during
                     # continuous tracking, so today's working behavior (G0/G1) is
-                    # unchanged.
-                    _w = self._vision_mode.trust_w
+                    # unchanged. Also capped by _path_conv_w: trust_w alone
+                    # reaches 1.0 on a fixed vision-confidence schedule that
+                    # doesn't know whether the drone has actually rejoined
+                    # the direct line between gates yet — without this cap,
+                    # a real cross-track offset from a BLIND stretch can
+                    # still be present once trust_w says "fully trust
+                    # vision," and gate-bearing pursuit would cut a
+                    # diagonal straight at the gate instead of closing that
+                    # offset first. Once back near the line, _path_conv_w
+                    # is 1.0 and this is exactly today's behavior.
+                    _w = min(self._vision_mode.trust_w, _path_conv_w)
                     v_ref_for_gains = np.array([
                         _w * _pursuit_speed * _dir_n + (1.0 - _w) * v_ned_ref_carrot[0],
                         _w * _pursuit_speed * _dir_e + (1.0 - _w) * v_ned_ref_carrot[1],

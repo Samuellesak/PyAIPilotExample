@@ -33,19 +33,46 @@ def _wrap_pi(angle):
     return (angle + np.pi) % (2 * np.pi) - np.pi
 
 
+def path_convergence_weight(pos_ned, seg_r0, seg_ea, recover_dist_m):
+    """1.0 when pos_ned sits on the segment line through seg_r0 along unit
+    tangent seg_ea, ramping linearly down to 0.0 at recover_dist_m of
+    perpendicular (cross-track) distance from that line.
+
+    Gates how much weight controller.py's pursuit override gives its
+    direct-at-the-gate direction, alongside (via min()) the existing
+    trust_w. trust_w alone is a vision-confidence ramp on a fixed time
+    schedule (vision_reacq_blend_tau) — it reflects "how long has vision
+    looked stable," not "has the drone actually gotten back near the
+    path," so it can reach full weight before cross-track error from a
+    BLIND stretch has actually closed, letting direct gate-bearing
+    pursuit cut a diagonal across to the gate instead of first rejoining
+    the line. Stateless by design: position is already smooth tick to
+    tick (unlike raw vision bearings), so unlike trust_w this needs no
+    ramp of its own — it's recomputed fresh from the current cross-track
+    distance every call.
+    """
+    along   = np.dot(np.asarray(pos_ned, dtype=float) - seg_r0, seg_ea)
+    on_line = seg_r0 + along * seg_ea
+    cross_track = float(np.linalg.norm(np.asarray(pos_ned, dtype=float) - on_line))
+    if recover_dist_m <= 0.0:
+        return 1.0
+    return float(np.clip(1.0 - cross_track / recover_dist_m, 0.0, 1.0))
+
+
 class Mode(Enum):
     TRACKING    = "TRACKING"
     REACQUIRING = "REACQUIRING"
     BLIND       = "BLIND"
+    RECOVERY    = "RECOVERY"
     # Wire value deliberately kept as the legacy literal string 'TRANSITION'
     # (not 'COMMIT') — log.py's _plot_carrot hardcodes 'TRANSITION' to shade
     # carrot.png's commit-phase span, and vision_rx.py's _in_transit check
     # (`ctrl_mode_at_capture == 'TRANSITION'`) gates flight-safety-relevant
     # detection suppression during commit. Neither file is touched by this
     # rewrite; keeping this member's value unchanged means both keep working
-    # with zero changes. The other three members are free to use their new
-    # names since nothing outside controller.py hardcodes 'PNP'/'HOLD'/
-    # 'CARROT' (verified repo-wide).
+    # with zero changes. The other members are free to use their own names
+    # since nothing outside controller.py hardcodes 'PNP'/'HOLD'/'CARROT'
+    # (verified repo-wide).
     COMMIT = "TRANSITION"
 
 
@@ -216,3 +243,60 @@ class PursuitGuidance:
 
     def reset(self):
         self._dir = None
+
+
+@dataclass
+class RecoveryGuard:
+    """Vetoes a carrot-tracker COMMIT trigger that vision evidence directly
+    contradicts, and manages the resulting recovery episode.
+
+    tracker.committed is computed purely from the drone's own EKF position
+    projected onto the current segment (carrot_tracker.py, untouched by
+    this rewrite) — nothing checks it against an independent source before
+    it fires. Confirmed in a flight log: a drifted position estimate
+    tripped committed early, vision got suppressed for the whole commit-
+    phase flight-through (by design, to avoid near-gate bearing noise), and
+    by the time transit ended the gate measured 27.75m away against the 3m
+    commit_dist_m that triggered entry — nothing upstream ever found out
+    committed was wrong until GateLock's own spike check started rejecting
+    the (correct) recovery data, because its reference range was now stale
+    from before the mis-triggered commit.
+
+    Entry: committed is true, but a FRESH, locked, gate_id-matching pose
+    reports a range well beyond commit_dist_m — not just PnP noise at
+    close range. Latches active rather than requiring the mismatch to keep
+    re-firing every tick, since fresh vision data can be sparse exactly
+    when this matters most (that sparseness is usually why committed got
+    triggered wrong in the first place). Exit: the drone reaches the
+    recovery point, or a timeout elapses so a persistently uncooperative
+    vision feed can't strand the drone in recovery forever — whichever
+    comes first.
+    """
+    sanity_margin_m: float
+    exit_dist_m:     float
+    timeout_s:       float
+
+    active:      bool            = False
+    _entered_at: Optional[float] = field(default=None, repr=False)
+
+    def update(self, raw_committed: bool, pose, gate_id_match: bool,
+               commit_dist_m: float, dist_to_recovery_point: float,
+               now: float) -> bool:
+        """Returns True iff RECOVERY should override this tick's mode."""
+        if self.active:
+            timed_out = (self._entered_at is not None
+                         and (now - self._entered_at) > self.timeout_s)
+            if dist_to_recovery_point < self.exit_dist_m or timed_out:
+                self.active = False
+                self._entered_at = None
+            return self.active
+
+        mismatch = (
+            raw_committed and gate_id_match
+            and pose.fresh and pose.has_pnp and pose.range_m is not None
+            and pose.range_m > commit_dist_m + self.sanity_margin_m
+        )
+        if mismatch:
+            self.active = True
+            self._entered_at = now
+        return self.active

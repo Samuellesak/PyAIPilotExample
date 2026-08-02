@@ -533,14 +533,15 @@ class VisionRX:
         # ── Mode badge ────────────────────────────────────────────────────────
         # Mode names/values from vision_mode.py's Mode enum — TRANSITION is
         # the one wire value deliberately kept unchanged from before the
-        # gate-transition rewrite (see Mode.COMMIT's docstring); the other
-        # three are the new TRACKING/REACQUIRING/BLIND names. Falls back
-        # gracefully to an unrecognized-string display for anything else.
+        # gate-transition rewrite (see Mode.COMMIT's docstring); the others
+        # are free-form names (TRACKING/REACQUIRING/BLIND/RECOVERY). Falls
+        # back gracefully to an unrecognized-string display for anything else.
         _MODE_CFG = {
             'TRACKING':    ((0,  200,  0),  'TRACK'),
             'REACQUIRING': ((0,  200, 220), 'REACQ'),
             'TRANSITION':  ((30, 140, 255), 'TRANSIT'),
             'BLIND':       ((120,120, 120), 'BLIND'),
+            'RECOVERY':    ((0,   0, 220),  'RECOVER'),
         }
         badge_color, badge_label = _MODE_CFG.get(ctrl_mode, ((100,100,100), ctrl_mode))
         cv2.rectangle(vis, (5, 5), (165, 38), badge_color, -1)
