@@ -158,6 +158,8 @@ python -m tests.test_rotations
 
 `main.py` is unaffected — it stays a plain `python main.py`.
 
+**Running from an IDE:** the editor's "Run ▶" button executes a script directly by path, which breaks these package imports the same way a bare `python sysid/ekf_shadow.py` does. Use the debug configurations in `.vscode/launch.json` instead (Run and Debug panel) — one per runnable script, each running it as `python -m <package>.<module>` with the working directory set to the repo root.
+
 ---
 
 ## Controller Architecture

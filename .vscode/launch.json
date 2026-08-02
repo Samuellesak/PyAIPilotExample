@@ -1,0 +1,205 @@
+{
+    // Debug configurations for running scripts as modules from the repo root.
+    // Needed because flight_model/, ekf/, comms/, control/, vision/, sysid/, and
+    // tests/ use absolute package imports (e.g. `from ekf.ekf import QuadEKF`) —
+    // running a subfolder script directly by path (the editor's ▶ Run button, or
+    // `python sysid/ekf_shadow.py`) puts that script's own folder on sys.path[0]
+    // instead of the repo root, so sibling packages can't be found. Use one of
+    // these configurations (Run and Debug panel) instead of the ▶ button for
+    // any script that isn't at the repo root.
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "main.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "flight_model.linearize",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "flight_model.linearize",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "flight_model.lqi",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "flight_model.lqi",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "comms.msg_probe",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "comms.msg_probe",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "vision.vision_debug",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "vision.vision_debug",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "vision.vision_param_opt",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "vision.vision_param_opt",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "vision.gate_vision_calib",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "vision.gate_vision_calib",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "vision.check_yolo",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "vision.check_yolo",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "sysid.sysid",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "sysid.sysid",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "sysid.flight_sysid",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "sysid.flight_sysid",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "sysid.flight_sysid_gt",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "sysid.flight_sysid_gt",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "sysid.flight_sysid_rot",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "sysid.flight_sysid_rot",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "sysid.flight_sysid_vel",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "sysid.flight_sysid_vel",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "sysid.fit_shadow",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "sysid.fit_shadow",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "sysid.ekf_shadow",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "sysid.ekf_shadow",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "sysid.thrust_test",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "sysid.thrust_test",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "sysid.ned_calibration",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "sysid.ned_calibration",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "sysid.plot_calib",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "sysid.plot_calib",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "tests.test_rotations",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "tests.test_rotations",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "tests.test_carrot_tracker",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "tests.test_carrot_tracker",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "tests.test_gate_lock",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "tests.test_gate_lock",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "tests.test_pose_disambiguation",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "tests.test_pose_disambiguation",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "tests.test_vision_mode",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "tests.test_vision_mode",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "YOLO/YOLO.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/YOLO/YOLO.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

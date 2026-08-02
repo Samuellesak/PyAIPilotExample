@@ -569,7 +569,7 @@ commit_dist_m: 3
 # from 0 at the start of commit to this fraction (max) exactly at the gate —
 # 0 disables (old dead-straight behaviour). Start conservative; a too-large
 # value risks cutting the corner enough to affect gate-hit accuracy.
-corner_cut_frac: 0.2
+corner_cut_frac: 0.1
 
 # Blends carrot_pos/v_ned_ref from their pre-transition value over this many
 # seconds right after tr acker.wp advances, instead of snapping straight to
