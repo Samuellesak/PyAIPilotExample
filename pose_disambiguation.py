@@ -56,6 +56,8 @@ class PoseCandidate:
 class DisambiguationResult:
     index:  int    # which candidate was chosen
     method: str    # 'unambiguous' | 'position' | 'continuity' | 'continuity_implausible' | 'cold_start'
+                    # — callers must only persist this pick as the new continuity anchor when
+                    # method != 'continuity_implausible' (see disambiguate()'s docstring)
     margin: float  # diagnostics only: chosen-vs-runner-up gap, in the tier's native units (m or rad)
 
 
@@ -82,8 +84,21 @@ def disambiguate(
     max_rotation_rate_rad_s since last_accepted_t, the pick is still
     returned (it's the best available among a small discrete set — there is
     no second self-consistent strategy to fall back to once the EKF is out
-    of the picture) but flagged via method='continuity_implausible' for the
-    caller's own diagnostics/logging.
+    of the picture) but flagged via method='continuity_implausible'.
+
+    That flag is not just diagnostics: it is also the caller's contract for
+    whether to persist this pick as the NEW last_accepted_R/_t. Confirmed in
+    a flight log that a caller which persists unconditionally lets a single
+    implausible pick (e.g. a 4-fold corner-labelling relabelling that
+    briefly wins on raw angle during a fast real turn) become the anchor for
+    every subsequent frame — the SAME wrong branch then stays closest to its
+    own now-wrong anchor indefinitely, since angle-order vs. last_accepted_R
+    is unchanged by which branch last_accepted_R itself sits on. A caller
+    that only persists on method=='continuity' (never on
+    'continuity_implausible') breaks that loop: the anchor stays on the last
+    trusted pick, so the true candidate keeps a fair (indeed growing, as
+    now - last_accepted_t widens the plausible-rate window) chance to win
+    again on the next frame instead of being permanently disadvantaged.
 
     Tier 3 (cold start): no last_accepted_R at all (true flight start, or a
     long-enough gap that continuity itself would be groundless) — pick

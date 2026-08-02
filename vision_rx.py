@@ -257,15 +257,31 @@ class VisionRX:
         self._pos_degenerate_tol_m = float(
             _p.get('vision_pose_position_degenerate_tol_m', 1.0))   # [m]
 
+        # Landmark aid: when a detection fails the current-target identity
+        # check, see if it matches a course-sequence NEIGHBOUR gate instead
+        # (self._waypoints) and if so use it as a position-only EKF fix —
+        # see _landmark_gate_fix. Tolerance is deliberately tighter than the
+        # primary gate-identity check (vision_gate_id_tol_m): this is a
+        # confirmatory cross-check against the full static layout, not the
+        # single expected-range comparison the primary check makes, so a
+        # loose match here risks anchoring the EKF to the wrong gate
+        # entirely. Sigma is inflated on top of the normal range-scaled
+        # sigma to reflect that extra cross-gate-identity uncertainty.
+        self._landmark_aid_enabled  = bool(_p.get('vision_landmark_aid_enabled', True))
+        self._landmark_match_tol_m  = float(_p.get('vision_landmark_match_tol_m', 5.0))
+        self._landmark_sigma_mult   = float(_p.get('vision_landmark_sigma_mult', 2.0))
+
         # _pnp_gate's continuity anchors: last-accepted rotation (+ its
         # timestamp, for the rate-limit above) per target. Kept separate per
-        # target — the primary/current-gate call and the next-gate-candidate
-        # call each need their own anchor, or the two would clobber each
-        # other's state every frame they both fire.
+        # target — the primary/current-gate call, the next-gate-candidate
+        # call, and the landmark-aid call each need their own anchor, or
+        # they'd clobber each other's state every frame more than one fires.
         self._last_pnp_R_primary   = None
         self._last_pnp_R_primary_t = None
         self._last_pnp_R_next      = None
         self._last_pnp_R_next_t    = None
+        self._last_pnp_R_landmark   = None
+        self._last_pnp_R_landmark_t = None
 
         # _attitude_from_pnp's continuity anchor. Deliberately NOT cleared on
         # an active_gate_index change (unlike the two anchors above) — those
@@ -622,7 +638,10 @@ class VisionRX:
         _y += 24
 
         if gate_id_rejected:
-            cv2.putText(vis, 'ID REJECT: wrong gate?', (5, _y),
+            _lm_wp = self.data.get('landmark_fix_wp')
+            _reject_lbl = (f'ID REJECT: landmark fix wp {_lm_wp}' if _lm_wp is not None
+                           else 'ID REJECT: wrong gate?')
+            cv2.putText(vis, _reject_lbl, (5, _y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 220), 2, cv2.LINE_AA)
             _y += 24
         elif pnp_skip_reason:
@@ -806,9 +825,77 @@ class VisionRX:
 
         if best_tvec[2] < 0.5:
             return None, None
-        setattr(self, continuity_attr, chosen.R_b2n)
-        setattr(self, continuity_attr + '_t', now)
+        # Only persist this pick as the new continuity anchor when it was
+        # rate-plausible. Confirmed in a flight log: persisting an
+        # implausible pick unconditionally lets a single wrong candidate
+        # (e.g. an IPPE front/back flip) become self-perpetuating, since
+        # every subsequent frame then scores against that now-wrong anchor
+        # — see pose_disambiguation.disambiguate()'s docstring for the full
+        # mechanism. Using this frame's pick as the OUTPUT is still fine
+        # (best available among a small discrete set); just don't let it
+        # poison what the NEXT frame compares against.
+        if result.method != 'continuity_implausible':
+            setattr(self, continuity_attr, chosen.R_b2n)
+            setattr(self, continuity_attr + '_t', now)
         return best_tvec, best_rvec
+
+    def _landmark_gate_fix(self, corners_px, agi):
+        """When a detection fails the current-target identity check, see
+        whether it matches a course-sequence NEIGHBOUR gate instead
+        (self._waypoints, the same static layout track_gates_ned refines at
+        runtime) — a gate seen in the distance while the current target is
+        out of view still tells us exactly where the drone is, via the same
+        gate_ned -> drone_ned inversion the primary path uses (see the main
+        PnP position solve above), just anchored on a different, already-
+        known gate position instead of the current target's.
+
+        Deliberately position-only (no yaw/velocity): this path only sees a
+        given gate intermittently, so it can't build the same-gate frame-to-
+        frame continuity vel-regression/yaw-smoothing depend on. Restricted
+        to the two course-sequence neighbours of the current target (not the
+        full waypoint list) to keep the match unambiguous, and disambiguates
+        its own PnP solution via a dedicated continuity anchor
+        (_last_pnp_R_landmark) so it can't disturb the primary/next-gate
+        anchors.
+
+        Feeds self.data['_vision_ekf_update'] directly and nothing else —
+        never touches gate_detection/pose_estimate, so it cannot reach
+        controller.py's pursuit-override or live-target-write paths (both
+        gated on gate_id_match against the CURRENT target only, independent
+        of this). A wrong match here can bias the EKF position estimate but
+        can never redirect the drone at the wrong gate.
+
+        Returns (drone_ned_fix, matched_waypoint_idx, range_m), or None on
+        no match — the common case, since most rejected detections are
+        genuine noise/false positives, not a neighbour gate.
+        """
+        if agi is None or self._waypoints is None:
+            return None
+        mav = self.data.get('mav_state')
+        if mav is None or mav.get('pos_ned') is None:
+            return None
+        tvec, _ = self._pnp_gate(corners_px, self._gate_w_default, self._gate_h_default,
+                                  continuity_attr='_last_pnp_R_landmark')
+        if tvec is None or tvec[2] > self._max_gate_dist:
+            return None
+
+        R_b2n = rotations.quat_to_R_body2ned(
+            rotations.gt_correct_quat(mav['quat'], self._gt_mode))
+        t_gate_body = self._R_cam2body @ tvec
+        t_gate_ned  = R_b2n @ t_gate_body
+        guess_ned   = np.asarray(mav['pos_ned']) + t_gate_ned
+
+        best_idx, best_dist = None, self._landmark_match_tol_m
+        for wp_idx in (int(agi), int(agi) + 2):   # course-sequence neighbours of agi+1 (current target)
+            if 1 <= wp_idx < len(self._waypoints):
+                d = float(np.linalg.norm(np.asarray(self._waypoints[wp_idx]) - guess_ned))
+                if d < best_dist:
+                    best_idx, best_dist = wp_idx, d
+        if best_idx is None:
+            return None
+
+        drone_ned_fix = np.asarray(self._waypoints[best_idx]) - t_gate_ned
+        return drone_ned_fix, best_idx, float(tvec[2])
 
     def _attitude_from_pnp(self, rvec, gate_quat_wxyz):
         """
@@ -869,8 +956,13 @@ class VisionRX:
         chosen_R = candidates[result.index].R_b2n
         roll, pitch, yaw = rotations.euler_from_R_body2ned(chosen_R)
 
-        self._last_pnp_att_R = chosen_R
-        self._last_pnp_att_t = now
+        # See the matching comment in _pnp_gate: only persist as the new
+        # continuity anchor when the pick was rate-plausible, so a single
+        # wrong 90-degree-rotated candidate can't entrench itself as the
+        # reference every subsequent frame gets scored against.
+        if result.method != 'continuity_implausible':
+            self._last_pnp_att_R = chosen_R
+            self._last_pnp_att_t = now
         return roll, pitch, yaw
 
     # ── Gyro-only attitude tracking (velocity de-rotation helper) ───────────
@@ -963,6 +1055,7 @@ class VisionRX:
         drone_ned = None
         _pnp_skip_reason = None   # diagnostic: why PnP was skipped this frame
         _gate_id_rejected = False   # this frame's detection failed the gate-identity check
+        _landmark_wp_hit = None   # set if a rejected detection matched a neighbour gate instead
         # Use the mode stamped at frame *capture* time (see _recv_loop), not a
         # live read here — process_frame can run up to ~170ms after capture
         # under queueing backlog, by which point controller.py's async control
@@ -990,6 +1083,8 @@ class VisionRX:
             self._last_pnp_R_primary_t = None
             self._last_pnp_R_next      = None
             self._last_pnp_R_next_t    = None
+            self._last_pnp_R_landmark   = None  # "other gate" identity shifts too as agi advances
+            self._last_pnp_R_landmark_t = None
             # _last_pnp_att_R/_t deliberately NOT cleared here — see their
             # __init__ comment: that anchor is the drone's own attitude, not
             # gate-relative, so it doesn't become invalid just because the
@@ -1242,6 +1337,37 @@ class VisionRX:
                     print(f"[VISION] gate-identity recheck failed while locked "
                           f"(range {_measured_range:.1f}m "
                           f"vs expected {_expected_range:.1f}m) — lock dropped", flush=True)
+                # Landmark aid: before discarding this detection outright,
+                # check whether it's actually a NEIGHBOUR gate rather than
+                # noise — see _landmark_gate_fix. Uses corners (not yet
+                # nulled below) — position-only, feeds the EKF directly, and
+                # is otherwise fully independent of everything nulled here.
+                if self._landmark_aid_enabled and corners is not None:
+                    _landmark = self._landmark_gate_fix(corners, agi)
+                    if _landmark is not None:
+                        _lm_ned, _landmark_wp_hit, _lm_range = _landmark
+                        _lm_sigma = ((self._ekf_vis_sigma
+                                      + self._ekf_vis_sigma_k * _lm_range)
+                                     * self._landmark_sigma_mult)
+                        self.data['_vision_ekf_update'] = {
+                            'pos_ned':   _lm_ned,
+                            'vel_ned':   None,
+                            'yaw_ned':   None,
+                            'roll_ned':  None,
+                            'pitch_ned': None,
+                            'sigma_pos': _lm_sigma,
+                            'sigma_vel': self._ekf_vis_vel_sigma,
+                            'sigma_yaw': self._ekf_vis_yaw_sigma,
+                            'sigma_att': self._ekf_vis_att_sigma,
+                            'yaw_gate':  self._ekf_vis_yaw_gate,
+                            'att_gate':  self._ekf_vis_att_gate,
+                            'gate':      self._ekf_vis_gate,
+                            'vel_gate':  self._ekf_vis_vel_gate,
+                            'wall_t':    time.time(),
+                        }
+                        print(f"[VISION] landmark fix: rejected detection matches "
+                              f"waypoint {_landmark_wp_hit} (current target agi={agi}) "
+                              f"at {_lm_range:.1f}m — position-only EKF update", flush=True)
                 tvec_cam  = None
                 rvec_cam  = None
                 gate_info = None
@@ -1258,6 +1384,8 @@ class VisionRX:
                 rvec_cam = None
             # 'no_measurement': tvec_cam was already None going in (solvePnP
             # failure or the hard-range cutoff above) — nothing further to null.
+
+        self.data['landmark_fix_wp'] = _landmark_wp_hit
 
         # ── Orange-centroid fallback ──────────────────────────────────────────
         # When YOLO fails, find the centroid of the orange blob in the tight mask.

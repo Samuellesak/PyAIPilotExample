@@ -22,7 +22,7 @@ class Logger:
       - Every 100th camera frame->  logs/<session>/frames/frame_XXXXXX.jpg
     """
 
-    def __init__(self, log_dir="logs"):
+    def __init__(self, log_dir="logs", frame_seq_index=False):
         session = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.session_dir = os.path.join(log_dir, session)
         self.frames_dir  = os.path.join(self.session_dir, "frames")
@@ -31,6 +31,18 @@ class Logger:
         self._lock        = threading.Lock()
         self._frame_count = 0
         self._closed      = False
+
+        # Saved frames are named after frame_id, which is only every Nth
+        # (rate-limited background frames + forced detection frames) — the
+        # gaps this leaves in the numbering read as missing/black frames in
+        # sequence viewers (e.g. DJV) that expect contiguous numbering.
+        # frame_seq_index prepends a second, gapless ascending counter
+        # (incremented once per actual file write, not per processed
+        # frame) so those tools have a clean sequence to key off, while the
+        # original frame_id stays in the name for correlating against
+        # frame_timestamps.csv/vision.csv.
+        self._frame_seq_index_enabled = bool(frame_seq_index)
+        self._frame_seq_n = 0
 
         self._mavlink_file = open(os.path.join(self.session_dir, "mavlink.txt"), "w")
 
@@ -372,8 +384,14 @@ class Logger:
         with self._lock:
             self._frame_count += 1
             save_this = force or (self._frame_count % 30 == 0)
+            seq = None
+            if save_this and self._frame_seq_index_enabled:
+                seq = self._frame_seq_n
+                self._frame_seq_n += 1
         if save_this:
-            path = os.path.join(self.frames_dir, f"frame_{frame_id:06d}{suffix}.jpg")
+            _seq_prefix = f"{seq:06d}_" if seq is not None else ""
+            path = os.path.join(self.frames_dir,
+                                 f"{_seq_prefix}frame_{frame_id:06d}{suffix}.jpg")
             cv2.imwrite(path, img)
             if sim_time_ns is not None:
                 with self._lock:

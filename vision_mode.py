@@ -29,6 +29,10 @@ import numpy as np
 from pose_estimate import LockState
 
 
+def _wrap_pi(angle):
+    return (angle + np.pi) % (2 * np.pi) - np.pi
+
+
 class Mode(Enum):
     TRACKING    = "TRACKING"
     REACQUIRING = "REACQUIRING"
@@ -165,3 +169,50 @@ class VerticalAssist:
                     search_offset=self._search_offset_m,
                     vnudge_bias=vnudge_term)
         return combined, diag
+
+
+@dataclass
+class PursuitGuidance:
+    """Rate-limits the pursuit-override bearing direction (NED-frame unit
+    vector) so a large one-off correction — e.g. the bearing step right
+    after a long BLIND coast — is flown as a gradual turn-in instead of the
+    override's raw bearing-following law, which points straight at the
+    gate's current bearing every tick with no damping term of its own.
+
+    Confirmed in a flight log: after a ~3s BLIND coast, reacquisition
+    produced an overshoot-then-correct swing (drone_E off by several
+    metres, oscillating rather than decaying smoothly) that a short
+    reacquisition-to-commit runway didn't leave enough time to settle
+    before COMMIT locked the approach in — this is the direct cause of an
+    oblique gate crossing observed downstream. Rate-limiting the direction
+    itself (not just the trust-ramp blend weight, which only scales
+    magnitude toward this same unlimited direction) turns that single
+    violent swing into a gradual turn-in.
+
+    Resets whenever the caller isn't feeding it a live pursuit direction
+    (pursuit override not active this tick) — see reset() — so a stale
+    direction left over from a previous gate can't leak across a
+    BLIND/COMMIT gap into the next gate's reacquisition.
+    """
+    max_turn_rate: float   # rad/s cap on how fast the direction angle can slew
+    _dir: Optional[np.ndarray] = field(default=None, repr=False)
+
+    def update(self, dir_n: float, dir_e: float, dt: float) -> Tuple[float, float]:
+        target = np.array([float(dir_n), float(dir_e)])
+        norm = float(np.linalg.norm(target))
+        if norm < 1e-9:
+            return dir_n, dir_e
+        target = target / norm
+        if self._dir is None:
+            self._dir = target
+        else:
+            cur_ang = float(np.arctan2(self._dir[1], self._dir[0]))
+            tgt_ang = float(np.arctan2(target[1], target[0]))
+            step = float(np.clip(_wrap_pi(tgt_ang - cur_ang),
+                                  -self.max_turn_rate * dt, self.max_turn_rate * dt))
+            new_ang = cur_ang + step
+            self._dir = np.array([np.cos(new_ang), np.sin(new_ang)])
+        return float(self._dir[0]), float(self._dir[1])
+
+    def reset(self):
+        self._dir = None

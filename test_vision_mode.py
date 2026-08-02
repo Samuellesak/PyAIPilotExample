@@ -1,12 +1,13 @@
 """
 test_vision_mode.py — regression tests for vision_mode.py's Mode/
-VisionModeTracker/VerticalAssist. Run: `python test_vision_mode.py`.
+VisionModeTracker/VerticalAssist/PursuitGuidance. Run:
+`python test_vision_mode.py`.
 """
 
 import numpy as np
 
 from pose_estimate import LockState
-from vision_mode import Mode, VisionModeTracker, VerticalAssist
+from vision_mode import Mode, VisionModeTracker, VerticalAssist, PursuitGuidance
 
 
 def main():
@@ -128,6 +129,55 @@ def main():
     check("vnudge is negative (climb) when gate is near the top border",
           diag_t['vnudge_bias'] < 0.0)
     check("vnudge never exceeds vnudge_max_mps", abs(diag_b['vnudge_bias']) <= 1.5 + 1e-9)
+
+    # 9. PursuitGuidance: first call after construction (no cached direction
+    #    yet) seeds directly from the target, unlimited — there's nothing to
+    #    rate-limit against yet.
+    pg = PursuitGuidance(max_turn_rate=np.deg2rad(60.0))
+    n0, e0 = pg.update(0.0, 1.0, dt=0.01)   # dead east, far outside a 0.6deg step
+    check("first call seeds directly from the target direction",
+          np.isclose(n0, 0.0, atol=1e-9) and np.isclose(e0, 1.0, atol=1e-9))
+
+    # 10. A large subsequent swing is capped to max_turn_rate * dt in a
+    #     single call, not applied instantly.
+    n1, e1 = pg.update(1.0, 0.0, dt=0.01)   # target swings 90 deg to dead north
+    ang0 = np.arctan2(e0, n0)
+    ang1 = np.arctan2(e1, n1)
+    step = abs(((ang1 - ang0) + np.pi) % (2 * np.pi) - np.pi)
+    check("single-tick direction change is capped near max_turn_rate*dt",
+          step <= np.deg2rad(60.0) * 0.01 + 1e-6)
+    check("a 90deg target swing is NOT applied in one 0.01s tick",
+          step < np.deg2rad(89.0))
+
+    # 11. Sustained calls at a fixed new target converge to it over time.
+    pg2 = PursuitGuidance(max_turn_rate=np.deg2rad(90.0))
+    pg2.update(1.0, 0.0, dt=0.001)   # seed pointing north
+    n, e = 1.0, 0.0
+    for _ in range(500):   # 500*0.01 = 5.0s, comfortably enough at 90 deg/s for a 90 deg turn
+        n, e = pg2.update(0.0, 1.0, dt=0.01)   # target: dead east
+    check("sustained updates converge to a new target direction",
+          np.isclose(n, 0.0, atol=1e-3) and np.isclose(e, 1.0, atol=1e-3))
+
+    # 12. Output stays a unit vector throughout.
+    check("converged direction is still unit-norm", np.isclose(n**2 + e**2, 1.0, atol=1e-6))
+
+    # 13. reset() drops the cached direction, so the next call snaps
+    #     immediately again (matches first-call/cold-start behaviour).
+    pg2.reset()
+    n2, e2 = pg2.update(1.0, 0.0, dt=0.01)   # target swings back to north
+    check("reset() makes the next call snap directly to the new target",
+          np.isclose(n2, 1.0, atol=1e-9) and np.isclose(e2, 0.0, atol=1e-9))
+
+    # 14. Degenerate (zero-norm) input passes through unchanged rather than
+    #     raising (e.g. a division by zero on normalization).
+    pg3 = PursuitGuidance(max_turn_rate=np.deg2rad(60.0))
+    pg3.update(1.0, 0.0, dt=0.01)
+    try:
+        n3, e3 = pg3.update(0.0, 0.0, dt=0.01)
+        check("zero-norm input does not raise and passes through unchanged",
+              n3 == 0.0 and e3 == 0.0)
+    except Exception as e:
+        check(f"zero-norm input does not raise (raised {e!r})", False)
 
     print(f"\n{'ALL PASSED' if n_fail == 0 else f'{n_fail} CHECK(S) FAILED'}")
     return n_fail == 0

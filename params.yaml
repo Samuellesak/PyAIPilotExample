@@ -282,6 +282,15 @@ vision_gate_id_tol_m: 10.0   # reject PnP if |measured range - expected range to
 # while EKF drift measured this session tops out around a few metres, so this
 # doesn't need to be tight to discriminate the two — see vision_gate_id_tol_m.
 vision_gate_id_recheck_interval_s: 1.5   # [s] periodic re-verification cadence while locked
+# Landmark aid: a detection that fails the gate-identity check above (likely
+# a NEIGHBOUR gate, not noise) is checked against the full course layout
+# (waypoints:) instead of discarded outright — a match gives a position-only
+# EKF fix anchored on the known neighbour gate position. See
+# vision_rx.py's _landmark_gate_fix. Set vision_landmark_aid_enabled: false
+# to fall back to the old discard-on-reject behaviour.
+vision_landmark_aid_enabled: true
+vision_landmark_match_tol_m: 5.0   # [m] max gap between the guessed and known neighbour-gate position to accept
+vision_landmark_sigma_mult: 2.0    # multiplies the normal range-scaled position sigma, for the extra cross-gate-identity uncertainty
 # PnP velocity window [frames]. Was 3 (reduced from 10 for low-lag at high speed),
 # but the estimator was an endpoint difference — using only the oldest and newest
 # of the N buffered positions, so a bigger window never actually reduced noise,
@@ -363,6 +372,26 @@ wp_live_update_tau: 0.5   # [s]
 # prove itself. Ordinary brief HOLD flicker never resets this (stays at 1.0),
 # so continuous-lock behavior is unchanged.
 vision_reacq_blend_tau: 0.4   # [s]
+# Caps how fast the pursuit-override's NED bearing direction can slew,
+# independent of the trust_w ramp above (which only scales magnitude toward
+# this same otherwise-unlimited direction). Confirmed in a flight log: a
+# large one-off bearing correction right after a long BLIND coast produced
+# an overshoot-then-correct oscillation (drone_E off by several metres) that
+# didn't always have time to settle before COMMIT locked in the approach —
+# see vision_mode.PursuitGuidance. Lower = gentler turn-in but slower to
+# correct a real offset; needs to stay fast enough to converge within
+# whatever runway is typically available before COMMIT triggers.
+vision_pursuit_turn_rate_max_deg: 60.0   # [deg/s]
+# Reacquisition speed cap: while mode==REACQUIRING (trust_w still ramping)
+# and within vision_reacq_speed_range_m of the target, horizontal approach
+# speed is scaled down to vision_reacq_speed_min_frac at trust_w=0, linearly
+# back up to full speed as trust_w->1. Confirmed in a flight log: the
+# turn-rate limit above fixed HOW the correction arrives but not WHETHER
+# there's time to finish it — a short BLIND->gate runway let the drone
+# reach the gate still mid-correction (reacq_blend_w~0.6) and clip the
+# frame. This trades approach speed for convergence time instead.
+vision_reacq_speed_range_m: 12.0    # [m] only active this close to the target
+vision_reacq_speed_min_frac: 0.5    # horizontal speed fraction at trust_w=0 (1.0 = no cap)
 # Blind-search altitude nudge: while the target gate is close enough that it
 # should be detectable but hasn't been for a while (both conditions below),
 # bias the D reference downward so a gate that's dropped below the camera FOV
@@ -386,6 +415,14 @@ vision_search_descend_mps: 0.6     # ramp rate for the descend bias (both in and
 vision_vnudge_border_frac: 0.2   # start nudging once the gate is this far toward the top/bottom edge (0-1)
 vision_vnudge_max_mps: 0       # max additional vertical velocity bias right at the border [m/s]
 vision_debug_overlay: true    # set true to open a live OpenCV window with mode + bearing overlay
+# Saved frames are named after frame_id, which skips numbers (rate-limited
+# background frames + forced detection frames) — reads as missing/black
+# frames in sequence viewers (e.g. DJV) that expect contiguous numbering.
+# When true, prepends a second, gapless ascending index to each saved
+# frame's filename (e.g. 000001_frame_004532.jpg) for those tools to key
+# off, while frame_id stays in the name for correlating against
+# frame_timestamps.csv/vision.csv.
+frame_seq_index_enabled: true
 next_gate_min_frames: 5      # frames second-gate PnP must be consistent before waypoint update
 
 # ── Image preprocessing (applied before orange mask) ─────────────────────────

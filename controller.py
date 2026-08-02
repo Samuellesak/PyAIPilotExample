@@ -5,7 +5,7 @@ from pymavlink import mavutil
 from carrot_tracker import CarrotTracker
 import rotations
 from pose_estimate import PoseEstimate
-from vision_mode import Mode, VisionModeTracker, VerticalAssist
+from vision_mode import Mode, VisionModeTracker, VerticalAssist, PursuitGuidance
 
 MAVLINK_CMD_SIM_RESET = 31000
 CONTROL_HZ            = 250
@@ -175,6 +175,20 @@ class Controller:
             vnudge_max_mps      = float(param.get('vision_vnudge_max_mps', 1.5)),
             cam_cy              = float(param.get('cam_cy', 180.0)),
         )
+
+        # Pursuit-override direction rate-limiter (vision_mode.py) — damps
+        # the overshoot-then-correct swing a large one-off bearing
+        # correction (e.g. after a long BLIND coast) otherwise produces in
+        # the raw bearing-following pursuit law. See PursuitGuidance's
+        # docstring.
+        self._pursuit_guidance = PursuitGuidance(
+            max_turn_rate=np.deg2rad(float(param.get('vision_pursuit_turn_rate_max_deg', 60.0))))
+        # Reacquisition speed cap — see the matching comment where it's
+        # applied. Buys convergence time by slowing the approach instead of
+        # letting the drone close in at full speed while trust_w is still
+        # ramping.
+        self._reacq_speed_range_m  = float(param.get('vision_reacq_speed_range_m', 12.0))
+        self._reacq_speed_min_frac = float(param.get('vision_reacq_speed_min_frac', 0.5))
 
         # Launch-sequence bookkeeping
         self._t_start        = None   # wall-clock time of first valid state
@@ -544,6 +558,13 @@ class Controller:
                     _cp, _sp = np.cos(_psi_v), np.sin(_psi_v)
                     _dir_n  =  _cp * _dir_xb - _sp * _dir_yb
                     _dir_e  =  _sp * _dir_xb + _cp * _dir_yb
+                    # Rate-limit the pursuit direction itself (not just the
+                    # trust_w blend weight below, which only scales the
+                    # magnitude toward this same otherwise-unlimited
+                    # direction) — see PursuitGuidance's docstring for why
+                    # the raw bearing-following law overshoots on a large
+                    # one-off correction.
+                    _dir_n, _dir_e = self._pursuit_guidance.update(_dir_n, _dir_e, _actual_dt)
                     # Alignment-scaled pursuit speed: _dir_xb is cos(bearing
                     # angle off the nose), so this ramps the commanded speed
                     # from 0 (gate 90°+ off to the side) to full v_ref (gate
@@ -582,6 +603,12 @@ class Controller:
                         _w * _pursuit_speed * _dir_e + (1.0 - _w) * v_ned_ref_carrot[1],
                         v_ned_ref_carrot[2],
                     ])
+            else:
+                # Pursuit not active this tick (BLIND/COMMIT, no gate_id
+                # match, or debug_waypoints_only) — drop the rate-limiter's
+                # cached direction so a stale bearing from a previous gate
+                # can't leak into the next reacquisition.
+                self._pursuit_guidance.reset()
 
             # Vertical assist (vision_mode.py): merges the old blind-search
             # descend nudge and vertical visual-centering nudge under one
@@ -607,6 +634,28 @@ class Controller:
                 self._debug_waypoints_only)
             v_ref_for_gains = v_ref_for_gains.copy()
             v_ref_for_gains[2] += _vassist_bias
+
+            # Reacquisition speed cap: while still building trust
+            # (REACQUIRING) close to the target, slow the horizontal
+            # approach instead of closing in at full speed while the
+            # pursuit-guidance correction above is still converging.
+            # Confirmed in a flight log: the drone reached the gate
+            # mid-correction (reacq_blend_w~0.6) and clipped the frame —
+            # PursuitGuidance fixed HOW the correction arrives (smooth, not
+            # oscillating) but not WHETHER there's enough time left to
+            # finish it before impact; this buys that time back by trading
+            # approach speed for it instead of direction smoothness.
+            # Scoped to REACQUIRING only (not BLIND, which flies the
+            # nominal path at full speed) and scaled by trust_w itself, so
+            # it's bounded by the same vision_reacq_blend_tau-driven ramp,
+            # not a separate unbounded slow-crawl — a persistently-lost
+            # gate still gets flown at normal pace once mode drops to
+            # BLIND.
+            if (mode == Mode.REACQUIRING and not self._debug_waypoints_only
+                    and _dist_to_target < self._reacq_speed_range_m):
+                _speed_scale = (self._reacq_speed_min_frac + (1.0 - self._reacq_speed_min_frac)
+                                 * self._vision_mode.trust_w)
+                v_ref_for_gains[:2] *= _speed_scale
 
             # Publish transition/reacquisition-stage diagnostics for the
             # logger and the vision debug overlay (see log_carrot below and

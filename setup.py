@@ -25,7 +25,8 @@ def setup_components(shared_data, system_boot_ms, server_ip, server_udp_port):
     # -------------------------------
     # Logger  (None when logging=0)
     # -------------------------------
-    logger = Logger() if param.get('logging', 1) else None
+    logger = (Logger(frame_seq_index=bool(param.get('frame_seq_index_enabled', False)))
+              if param.get('logging', 1) else None)
     if logger is not None:
         logger.set_waypoints(param['waypoints'])
 
