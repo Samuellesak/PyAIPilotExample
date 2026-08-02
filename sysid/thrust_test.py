@@ -153,7 +153,7 @@ def main():
     # ── MAVLink receive thread ───────────────────────────────────────────────
     shared = {}
     import threading
-    from mavlink_rx import MAVLinkRX
+    from comms.mavlink_rx import MAVLinkRX
     rx = MAVLinkRX.create_mavlink_rx(conn, shared, logger)
 
     # ── Reset + arm ─────────────────────────────────────────────────────────

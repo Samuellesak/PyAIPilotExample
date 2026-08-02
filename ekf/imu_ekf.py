@@ -9,9 +9,9 @@ MAVLink transport layer with no physics knowledge.
 
 Usage
 -----
-    from dyn import load_params
-    from mavlink_rx import MAVLinkRX
-    from imu_ekf import IMUEKFHandler
+    from flight_model.dyn import load_params
+    from comms.mavlink_rx import MAVLinkRX
+    from ekf.imu_ekf import IMUEKFHandler
 
     param  = load_params()
     shared = {}
@@ -290,7 +290,7 @@ class IMUEKFHandler:
             self._hover_reset_t = time.time()
 
         # ── Sim sensor → FRD conversion ───────────────────────────────────────
-        from sim_convention import sim_to_frd_gyro
+        from flight_model.sim_convention import sim_to_frd_gyro
         gyro = sim_to_frd_gyro(gx, gy, gz)
         acc  = np.array([ax, ay, az])
 
