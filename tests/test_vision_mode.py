@@ -1,13 +1,13 @@
 """
 test_vision_mode.py — regression tests for vision_mode.py's Mode/
 VisionModeTracker/VerticalAssist/PursuitGuidance/RecoveryGuard. Run:
-`python test_vision_mode.py`.
+`python -m tests.test_vision_mode` from the repo root.
 """
 
 import numpy as np
 
-from pose_estimate import LockState, PoseEstimate
-from vision_mode import (Mode, VisionModeTracker, VerticalAssist, PursuitGuidance,
+from vision.pose_estimate import LockState, PoseEstimate
+from vision.vision_mode import (Mode, VisionModeTracker, VerticalAssist, PursuitGuidance,
                           RecoveryGuard, path_convergence_weight)
 
 

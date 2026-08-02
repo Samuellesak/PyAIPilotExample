@@ -1,11 +1,11 @@
 from pymavlink import mavutil
-from timesync import TimeSync
-from vision_rx import VisionRX
-from mavlink_rx import MAVLinkRX
-from imu_ekf import IMUEKFHandler
-from controller import Controller
+from comms.timesync import TimeSync
+from vision.vision_rx import VisionRX
+from comms.mavlink_rx import MAVLinkRX
+from ekf.imu_ekf import IMUEKFHandler
+from control.controller import Controller
 from log import Logger
-from dyn import load_params
+from flight_model.dyn import load_params
 
 def setup_components(shared_data, system_boot_ms, server_ip, server_udp_port):
     # -------------------------------

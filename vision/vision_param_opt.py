@@ -46,8 +46,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pymavlink import mavutil
 
-from dyn import load_params
-from mavlink_rx import MAVLinkRX
+from flight_model.dyn import load_params
+from comms.mavlink_rx import MAVLinkRX
 from ultralytics import YOLO as _YOLO
 
 # ── Camera UDP ────────────────────────────────────────────────────────────────

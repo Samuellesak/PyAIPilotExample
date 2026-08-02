@@ -12,7 +12,7 @@ Per-frame console report:
   - All YOLO box confidences
   - Best box (highest conf): centre, size, orange_frac in bbox, keypoints + any_zero flag
 
-Usage: python vision_debug.py
+Usage (from the repo root): python -m vision.vision_debug
   Press 's' once sim is loaded and drone is stationary facing the gate.
 """
 
@@ -32,7 +32,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO as _YOLO
 
-from dyn import load_params
+from flight_model.dyn import load_params
 
 CAM_IP   = "0.0.0.0"
 CAM_PORT = 5600

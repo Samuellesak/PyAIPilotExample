@@ -3,12 +3,12 @@ test_carrot_tracker.py — regression tests for CarrotTracker.set_live_target(),
 the one method added to this file by the gate-transition rewrite (Phase B).
 Everything else in carrot_tracker.py is untouched and out of scope here — it
 has been flight-validated extensively this session. Run:
-`python test_carrot_tracker.py`.
+`python -m tests.test_carrot_tracker` from the repo root.
 """
 
 import numpy as np
 
-from carrot_tracker import CarrotTracker
+from control.carrot_tracker import CarrotTracker
 
 
 def _make_tracker():

@@ -7,8 +7,8 @@ tests that verify the NED frame is configured correctly.  No ground-truth
 signals are required (LOCAL_POSITION_NED / ATTITUDE / ODOMETRY / GATE_INFO are
 all absent in this sim configuration).
 
-Usage:
-    python ned_calibration.py [log_dir]
+Usage (from the repo root):
+    python -m sysid.ned_calibration [log_dir]
 
 If log_dir is omitted the most-recent subdirectory of logs/ is used.
 """

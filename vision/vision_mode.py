@@ -26,7 +26,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from pose_estimate import LockState
+from vision.pose_estimate import LockState
 
 
 def _wrap_pi(angle):

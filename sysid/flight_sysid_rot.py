@@ -42,9 +42,9 @@ Phase sequence:
   PITCH_POS -> PITCH_NEG -> SETTLE_P ->
   YAW_POS -> YAW_NEG -> SETTLE_Y -> KILL
 
-Run:
-  python flight_sysid_rot.py            # fly + fit
-  python flight_sysid_rot.py --fit-only logs/sysid_rot_<ts>/sysid_rot.csv
+Run (from the repo root):
+  python -m sysid.flight_sysid_rot            # fly + fit
+  python -m sysid.flight_sysid_rot --fit-only logs/sysid_rot_<ts>/sysid_rot.csv
   Press 's' to arm and start.
 """
 
@@ -60,7 +60,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
 
-from dyn import load_params
+from flight_model.dyn import load_params
 from setup import setup_components
 
 # ── Tuning constants ─────────────────────────────────────────────────────────
@@ -630,7 +630,7 @@ if __name__ == '__main__':
     if '--fit-only' in sys.argv:
         idx = sys.argv.index('--fit-only')
         if idx + 1 >= len(sys.argv):
-            print('Usage: python flight_sysid_rot.py --fit-only <path/to/sysid_rot.csv>')
+            print('Usage: python -m sysid.flight_sysid_rot --fit-only <path/to/sysid_rot.csv>')
             sys.exit(1)
         _fit_only(sys.argv[idx + 1])
     else:

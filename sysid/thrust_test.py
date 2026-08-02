@@ -27,9 +27,9 @@ Outputs
 - logs/thrust_test_<timestamp>/thrust_test.csv
 - logs/thrust_test_<timestamp>/thrust_test.png
 
-Usage
+Usage (from the repo root)
 -----
-  python thrust_test.py
+  python -m sysid.thrust_test
 """
 
 import time
@@ -43,7 +43,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pymavlink import mavutil
 
-from dyn import load_params
+from flight_model.dyn import load_params
 from log import Logger
 
 # ── Test parameters ──────────────────────────────────────────────────────────

@@ -2,10 +2,10 @@ import time
 import numpy as np
 from pymavlink import mavutil
 
-from carrot_tracker import CarrotTracker
-import rotations
-from pose_estimate import PoseEstimate
-from vision_mode import (Mode, VisionModeTracker, VerticalAssist, PursuitGuidance,
+from control.carrot_tracker import CarrotTracker
+from flight_model import rotations
+from vision.pose_estimate import PoseEstimate
+from vision.vision_mode import (Mode, VisionModeTracker, VerticalAssist, PursuitGuidance,
                           RecoveryGuard, path_convergence_weight)
 
 MAVLINK_CMD_SIM_RESET = 31000
@@ -234,7 +234,7 @@ class Controller:
             except FileNotFoundError:
                 raise RuntimeError(
                     "controller_type=2 (LQI) requires lqi_gains.npz — "
-                    "run 'python lqi.py' first.")
+                    "run 'python -m flight_model.lqi' first.")
             self._lqi_K     = _lqi['K']                      # (N, 4, 14)
             self._lqi_ztrim = _lqi['z_trim']                 # (N, 10)
             self._lqi_utrim = _lqi['u_trim']                 # (N,  4)

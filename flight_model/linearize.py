@@ -21,9 +21,9 @@ State layout (13,):
   [6:10] quaternion [qw,qx,qy,qz] NED-to-body (unit)
   [10:13] body rates [p, q, r]    [rad/s]
 
-Usage
+Usage (from the repo root)
 -----
-  python linearize.py
+  python -m flight_model.linearize
 
 Load results
 ------------
@@ -35,7 +35,7 @@ Load results
 import numpy as np
 from scipy.optimize import fsolve
 
-from dyn import load_params, dyn, _quat_to_R
+from flight_model.dyn import load_params, dyn, _quat_to_R
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 SPEEDS_KMH = [0, 20, 40, 60, 80, 100, 120, 140]

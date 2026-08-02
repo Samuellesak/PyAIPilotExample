@@ -34,16 +34,16 @@ vision_fix.csv: raw shared['_vision_ekf_update'] fixes (pos/vel/yaw + sigma/gate
                 ground_truth_mode too (that flag only gates whether imu_ekf.py
                 *consumes* the fix, not whether vision_rx.py produces it).
 
-Usage
+Usage (from the repo root)
 -----
-    python ekf_shadow.py                           # auto-find latest logs/*/ekf.csv
-    python ekf_shadow.py logs/<session>            # explicit session dir
-    python ekf_shadow.py logs/<session> --write    # write fitted sigmas to params.yaml
-    python ekf_shadow.py --fit-config +model       # fit against a config other than 'full'
-    python ekf_shadow.py --fit-stride 10           # subsample the fit residual (default 5)
-    python ekf_shadow.py --fit-mode gap            # fit only inter-vision-fix drift (see below)
-    python ekf_shadow.py --use-attitude            # also fit + replay PnP roll/pitch fusion
-    python ekf_shadow.py --fix-acc-model           # hold sigma_acc_imu/model fixed, fit only the rest
+    python -m sysid.ekf_shadow                           # auto-find latest logs/*/ekf.csv
+    python -m sysid.ekf_shadow logs/<session>            # explicit session dir
+    python -m sysid.ekf_shadow logs/<session> --write    # write fitted sigmas to params.yaml
+    python -m sysid.ekf_shadow --fit-config +model       # fit against a config other than 'full'
+    python -m sysid.ekf_shadow --fit-stride 10           # subsample the fit residual (default 5)
+    python -m sysid.ekf_shadow --fit-mode gap            # fit only inter-vision-fix drift (see below)
+    python -m sysid.ekf_shadow --use-attitude            # also fit + replay PnP roll/pitch fusion
+    python -m sysid.ekf_shadow --fix-acc-model           # hold sigma_acc_imu/model fixed, fit only the rest
 
 --fit-mode full (default): residual is every tick's pos/vel error, stride-
     subsampled. On a vision-dense flight this buries the blend's signal — most
@@ -100,7 +100,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from ruamel.yaml import YAML
 
-from ekf import QuadEKF
+from ekf.ekf import QuadEKF
 
 # Round-trip YAML (not plain PyYAML): preserves params.yaml's comments,
 # ordering, and formatting across --write. A plain yaml.safe_load/yaml.dump
@@ -112,7 +112,7 @@ from ekf import QuadEKF
 _yaml_rt = YAML()
 _yaml_rt.preserve_quotes = True
 _yaml_rt.width = 4096   # avoid re-wrapping long comment/value lines on write
-from dyn import load_params, _quat_to_R
+from flight_model.dyn import load_params, _quat_to_R
 
 
 # ── 1. Locate + load session ──────────────────────────────────────────────────

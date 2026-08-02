@@ -1,6 +1,7 @@
 """
 test_pose_disambiguation.py — regression tests for pose_disambiguation.py's
-candidate-selection policy. Run: `python test_pose_disambiguation.py`.
+candidate-selection policy. Run: `python -m tests.test_pose_disambiguation`
+from the repo root.
 
 Same bare-script style as test_rotations.py (no framework). Because
 pose_disambiguation.py has zero live-pipeline dependency (no cv2, no
@@ -10,8 +11,8 @@ before ever flying the rewrite.
 
 import numpy as np
 
-import rotations as rot
-from pose_disambiguation import PoseCandidate, disambiguate
+from flight_model import rotations as rot
+from vision.pose_disambiguation import PoseCandidate, disambiguate
 
 
 def _yaw_R(yaw_rad):

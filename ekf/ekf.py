@@ -26,7 +26,7 @@ for the carrot tracker and altitude hold over the time scale of a flight.
 
 import numpy as np
 
-import rotations
+from flight_model import rotations
 
 
 class QuadEKF:

@@ -1,7 +1,7 @@
 import numpy as np
 import yaml
 
-import rotations
+from flight_model import rotations
 
 
 def load_params(yaml_path="params.yaml"):

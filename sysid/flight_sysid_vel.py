@@ -39,8 +39,8 @@ Sign corrections (empirically confirmed by flight_sysid_gt.py):
 
 Requires: ground_truth_mode: true  in params.yaml.
 
-Run:
-    python flight_sysid_vel.py
+Run (from the repo root):
+    python -m sysid.flight_sysid_vel
     Press 's' to arm and start.
 """
 
@@ -51,7 +51,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dyn import load_params
+from flight_model.dyn import load_params
 from setup import setup_components
 
 # ── Timing ───────────────────────────────────────────────────────────────────

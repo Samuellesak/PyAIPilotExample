@@ -42,7 +42,7 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 
-import rotations
+from flight_model import rotations
 
 
 @dataclass(frozen=True)

@@ -15,8 +15,8 @@ Phase sequence:
   GAIN_P_POS -> SETTLE -> GAIN_P_NEG -> SETTLE ->
   GAIN_R_POS -> SETTLE -> GAIN_Y_POS -> SETTLE -> KILL
 
-Run:
-  python flight_sysid_gt.py
+Run (from the repo root):
+  python -m sysid.flight_sysid_gt
   Press 's' to arm and start.
 """
 
@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dyn import load_params
+from flight_model.dyn import load_params
 from setup import setup_components
 
 # ── Tuning constants ─────────────────────────────────────────────────────────

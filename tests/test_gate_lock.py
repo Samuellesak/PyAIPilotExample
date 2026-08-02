@@ -1,11 +1,11 @@
 """
 test_gate_lock.py — regression tests for gate_lock.py's UNLOCKED/ACQUIRING/
 LOCKED state machine against the exact invariants of the code it replaces.
-Run: `python test_gate_lock.py`.
+Run: `python -m tests.test_gate_lock` from the repo root.
 """
 
-from gate_lock import GateLock
-from pose_estimate import LockState
+from vision.gate_lock import GateLock
+from vision.pose_estimate import LockState
 
 
 def main():

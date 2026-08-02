@@ -6,10 +6,10 @@ Sends predefined motor commands to the sim, records HIGHRES_IMU responses,
 then optimises {Dv, Dw, kappa, m} by minimising one-step prediction error
 of the dyn.py rotational + translational model.
 
-Usage:
-    python sysid.py            # collect new data and fit
-    python sysid.py --fit-only # fit from existing sysid_data.npy
-    python sysid.py --plot-only # plot comparison without fitting
+Usage (from the repo root):
+    python -m sysid.sysid            # collect new data and fit
+    python -m sysid.sysid --fit-only # fit from existing sysid_data.npy
+    python -m sysid.sysid --plot-only # plot comparison without fitting
 
 Motor ordering (dyn.py / controller.py convention):
     u[0]=T1 (BR), u[1]=T2 (BL), u[2]=T3 (FL), u[3]=T4 (FR)
@@ -26,8 +26,8 @@ import matplotlib.pyplot as plt
 from scipy.optimize import minimize
 from pymavlink import mavutil
 
-from ekf import QuadEKF
-from dyn import load_params
+from ekf.ekf import QuadEKF
+from flight_model.dyn import load_params
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 SIM_IP    = "127.0.0.1"

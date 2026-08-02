@@ -4,8 +4,8 @@ msg_probe.py
 Connect to the sim, listen for MSG_DURATION seconds, and print every unique
 MAVLink message type along with its field names and a sample value snapshot.
 
-Usage:
-    python msg_probe.py
+Usage (from the repo root):
+    python -m comms.msg_probe
 
 Run this while the sim is already open (before arming).  The script is read-only
 and sends no commands.

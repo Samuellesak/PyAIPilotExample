@@ -11,11 +11,11 @@ import cv2
 import numpy as np
 from ultralytics import YOLO as _YOLO
 
-from dyn import load_params
-import rotations
-import pose_disambiguation
-import gate_lock
-from pose_estimate import LockState, PoseEstimate
+from flight_model.dyn import load_params
+from flight_model import rotations
+from vision import pose_disambiguation
+from vision import gate_lock
+from vision.pose_estimate import LockState, PoseEstimate
 
 SIM_SERVER_UDP_IP   = "0.0.0.0"
 SIM_SERVER_UDP_PORT = 5600

@@ -3,10 +3,10 @@ plot_calib.py
 =============
 Offline plotter for gate_vision_calib.py flight logs.
 
-Usage
+Usage (from the repo root)
 -----
-  python plot_calib.py                      # plots most recent logs/calib_* directory
-  python plot_calib.py logs/calib_20260720  # plots specific directory
+  python -m sysid.plot_calib                      # plots most recent logs/calib_* directory
+  python -m sysid.plot_calib logs/calib_20260720  # plots specific directory
 
 Outputs
 -------

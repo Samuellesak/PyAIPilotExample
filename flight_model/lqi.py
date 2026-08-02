@@ -41,7 +41,7 @@ import numpy as np
 from scipy.linalg import solve_continuous_are
 from scipy.optimize import fsolve
 
-from dyn import load_params, dyn, _quat_to_R
+from flight_model.dyn import load_params, dyn, _quat_to_R
 
 PARAMS_YAML = "params.yaml"
 OUTPUT_FILE = "lqi_gains.npz"

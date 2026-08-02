@@ -10,10 +10,10 @@ Output (saved next to the log):
   yolo_check.png        6-panel comparison plot
   annotated/            annotated frames (--save-annotated only)
 
-Usage:
-  python check_yolo.py                        # auto-find latest log
-  python check_yolo.py logs/20260722_164557   # specific log dir
-  python check_yolo.py --save-annotated       # also write annotated frames
+Usage (from the repo root):
+  python -m vision.check_yolo                        # auto-find latest log
+  python -m vision.check_yolo logs/20260722_164557   # specific log dir
+  python -m vision.check_yolo --save-annotated       # also write annotated frames
 """
 
 import sys

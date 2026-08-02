@@ -5,9 +5,6 @@ from ultralytics import YOLO
 from ultralytics.utils.plotting import plot_results
 import torch
 
-#from ultralytics import settings; settings.update({"tensorboard": True})
-#C:/Users/Arno/.conda/envs/ml1/python.exe -c "from ultralytics import settings; settings.update({'tensorboard': True}); print(settings)"
-#C:/Users/Arno/.conda/envs/ml1/python.exe -m tensorboard.main --logdir runs
 
 def _cuda_works():
     """Return True only if torchvision CUDA ops (NMS) are functional.

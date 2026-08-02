@@ -23,7 +23,7 @@ vision_rx.py's camera/model machinery.
 from dataclasses import dataclass
 from typing import Optional
 
-from pose_estimate import LockState
+from vision.pose_estimate import LockState
 
 
 @dataclass

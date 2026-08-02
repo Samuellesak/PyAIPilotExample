@@ -32,9 +32,9 @@ from collections import deque
 
 import numpy as np
 
-from ekf import QuadEKF
-from dyn import _quat_to_R as _dyn_quat_to_R
-import rotations
+from ekf.ekf import QuadEKF
+from flight_model.dyn import _quat_to_R as _dyn_quat_to_R
+from flight_model import rotations
 
 
 def _quat_mult(q1, q2):

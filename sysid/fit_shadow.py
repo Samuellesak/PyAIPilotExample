@@ -30,13 +30,13 @@ Non-observable from translational data (need rotational sysid):
     Dw       → rotational drag
     (see flight_sysid_rot.py)
 
-Usage:
-    python fit_shadow.py                        # auto-find latest shadow CSV
-    python fit_shadow.py path/to/shadow.csv
-    python fit_shadow.py path/to/shadow.csv --write         # write Dv/m/tau_motor/T_max_motor
-    python fit_shadow.py path/to/shadow.csv --write --write-bias   # also write accel_bias
-    python fit_shadow.py path/to/shadow.csv --free-mass  # fit m instead of holding it fixed
-    python fit_shadow.py path/to/shadow.csv --free-dv    # fit Dv_x/Dv_y independently
+Usage (from the repo root):
+    python -m sysid.fit_shadow                        # auto-find latest shadow CSV
+    python -m sysid.fit_shadow path/to/shadow.csv
+    python -m sysid.fit_shadow path/to/shadow.csv --write         # write Dv/m/tau_motor/T_max_motor
+    python -m sysid.fit_shadow path/to/shadow.csv --write --write-bias   # also write accel_bias
+    python -m sysid.fit_shadow path/to/shadow.csv --free-mass  # fit m instead of holding it fixed
+    python -m sysid.fit_shadow path/to/shadow.csv --free-dv    # fit Dv_x/Dv_y independently
 """
 
 import sys

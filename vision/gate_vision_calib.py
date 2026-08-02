@@ -44,9 +44,9 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from pymavlink import mavutil
 
-from dyn import load_params
-from mavlink_rx import MAVLinkRX
-from vision_rx import VisionRX
+from flight_model.dyn import load_params
+from comms.mavlink_rx import MAVLinkRX
+from vision.vision_rx import VisionRX
 
 # ── Connection ────────────────────────────────────────────────────────────────
 SIM_IP   = "127.0.0.1"

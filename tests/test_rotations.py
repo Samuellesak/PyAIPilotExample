@@ -1,11 +1,12 @@
 """
 test_rotations.py — regression tests for rotations.py against the exact
 formulas it replaces, plus round-trip/consistency checks. Run before and
-after migrating any call site: `python test_rotations.py`.
+after migrating any call site: `python -m tests.test_rotations` from the
+repo root.
 """
 
 import numpy as np
-import rotations as rot
+from flight_model import rotations as rot
 
 
 def _old_rot_from_quat(q):
