@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 import matplotlib
 
-import rotations
+from flight_model import rotations
 matplotlib.use("Agg")  # write to file without a display
 import matplotlib.pyplot as plt
 
