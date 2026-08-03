@@ -21,23 +21,30 @@ def main():
             n_fail += 1
         print(f"[{status}] {name}")
 
-    # 1. VisionModeTracker: not locked -> trust_w forced to 0, mode BLIND.
-    vm = VisionModeTracker(reacq_tau_s=0.4)
+    # 1. VisionModeTracker: not locked -> trust_w decays toward 0 (loss_tau_s)
+    #    instead of snapping to it, mode BLIND regardless. An instant snap
+    #    stepped controller.py's pursuit-blend weight straight from ~1.0 to
+    #    0.0 in one control tick on a real loss, which spiked the reference-
+    #    derivative feedforward into a violent one-tick attitude command
+    #    (confirmed in a flight log: 40 deg phi_des step, ~700 deg/s roll
+    #    rate). Decaying instead of snapping is the actual fix.
+    vm = VisionModeTracker(reacq_tau_s=0.4, loss_tau_s=0.15)
     vm.update(LockState.UNLOCKED, 0.02)
-    check("UNLOCKED forces trust_w to 0", vm.trust_w == 0.0)
+    _expect1 = float(np.exp(-0.02 / 0.15))
+    check("UNLOCKED decays trust_w toward 0 (not an instant snap)",
+          0.0 < vm.trust_w < 1.0 and abs(vm.trust_w - _expect1) < 1e-9)
     check("UNLOCKED -> base_mode BLIND", vm.base_mode(LockState.UNLOCKED) == Mode.BLIND)
+    _prev1 = vm.trust_w
     vm.update(LockState.ACQUIRING, 0.02)
-    check("ACQUIRING also forces trust_w to 0", vm.trust_w == 0.0)
+    check("ACQUIRING keeps decaying trust_w toward 0", 0.0 < vm.trust_w < _prev1)
     check("ACQUIRING -> base_mode BLIND", vm.base_mode(LockState.ACQUIRING) == Mode.BLIND)
 
     # 2. Continuous LOCKED ramps trust_w 0->1 over reacq_tau_s, mode flips
     #    REACQUIRING -> TRACKING once it crosses the 0.999 threshold. Start
-    #    from an explicit loss (trust_w default is 1.0, matching a fresh
-    #    flight's initial trust) so this is a genuine "just reacquired" ramp,
-    #    the same as how a real loss->reacquire sequence would drive it.
-    vm2 = VisionModeTracker(reacq_tau_s=0.4)
-    vm2.update(LockState.UNLOCKED, 0.01)
-    check("setup: trust_w is 0 right after a loss", vm2.trust_w == 0.0)
+    #    from trust_w=0.0 explicitly (a fresh loss has fully decayed) so
+    #    this is a genuine "just reacquired" ramp, the same as how a real
+    #    loss->reacquire sequence would drive it.
+    vm2 = VisionModeTracker(reacq_tau_s=0.4, trust_w=0.0)
     saw_reacquiring = False
     t = 0.0
     # exp(-t/tau) < 0.001 needs t > tau*ln(1000) =~ 2.76s at tau=0.4 -> 500
@@ -55,12 +62,17 @@ def main():
     check("base_mode is TRACKING once trust_w > 0.999",
           vm2.base_mode(LockState.LOCKED) == Mode.TRACKING)
 
-    # 3. A real loss (leaving LOCKED) resets trust_w to 0 even after it had
-    #    fully ramped up — ordinary brief flicker never leaves LOCKED at
-    #    all (that's GateLock's own miss-streak hysteresis), so this reset
-    #    only ever fires on a genuine loss.
+    # 3. A real loss (leaving LOCKED) starts decaying trust_w toward 0 even
+    #    after it had fully ramped up — ordinary brief flicker never leaves
+    #    LOCKED at all (that's GateLock's own miss-streak hysteresis), so
+    #    this decay only ever starts on a genuine loss. Not an instant
+    #    snap: see test 1's docstring for why that mattered in a real flight.
     vm2.update(LockState.UNLOCKED, 0.01)
-    check("leaving LOCKED resets trust_w to 0 even after full ramp", vm2.trust_w == 0.0)
+    check("leaving LOCKED starts decaying trust_w, not an instant snap to 0",
+          0.0 < vm2.trust_w < 1.0)
+    for _ in range(500):
+        vm2.update(LockState.UNLOCKED, 0.01)
+    check("trust_w keeps decaying to ~0 while unlocked", vm2.trust_w < 0.001)
 
     # 4. effective_mode: COMMIT overrides everything, regardless of lock state.
     vm3 = VisionModeTracker(reacq_tau_s=0.4)

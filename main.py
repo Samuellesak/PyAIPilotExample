@@ -50,7 +50,7 @@ time.sleep(1.0)
 if logger is not None:
     logger.reset_flight_data()
 
-FLIGHT_TIMEOUT_S = 50.0
+FLIGHT_TIMEOUT_S = 150.0
 
 print("Starting control loop...", flush=True)
 _flight_start = time.time()
@@ -74,7 +74,18 @@ try:
         # instead of another round of inference from position/attitude
         # traces.
         try:
+            gate_passed = bool(shared_data.get('gate_passed', False))
+            if gate_passed:
+                gate_id = shared_data.get('last_gate_id')
+                ekf_pos = shared_data.get('mav_state', {}).get('pos_ned')
+                if ekf_pos is not None:
+                    pos_str = f"[{ekf_pos[0]:.6f}, {ekf_pos[1]:.6f}, {ekf_pos[2]:.6f}]"
+                else:
+                    pos_str = 'unknown'
+                print(f"[main] gate passed gate_id={gate_id} ekf_pos={pos_str}", flush=True)
             controller.update()
+            if gate_passed:
+                shared_data['gate_passed'] = False
         except Exception:
             _tb = traceback.format_exc()
             print(_tb, flush=True)

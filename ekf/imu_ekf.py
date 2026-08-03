@@ -737,9 +737,33 @@ class IMUEKFHandler:
                 vel_err = vel - gt_vel
                 roll, pitch, yaw = _quat_to_euler_deg(quat)
                 roll_gt, pitch_gt, yaw_gt = _quat_to_euler_deg(gt_quat)
+                # Yaw error needs its own GT quaternion, flipped UNCONDITIONALLY.
+                # mavlink_rx.on_attitude negates the sim's inverted pitch but
+                # deliberately leaves yaw inverted (GT mode depends on that raw
+                # sign — see its comment), so gt_quat above carries a mirrored
+                # yaw and `yaw - yaw_gt` computes yaw_ekf - (-yaw_true), not an
+                # error. Confirmed against this log: it read 25-38 deg while the
+                # true error was under 10, and the artifact vanishes near a
+                # 180 deg heading (where mirroring is nearly identity), so it
+                # masqueraded as "error grows as the track turns."
+                #
+                # gt_correct_quat's SECOND ARG IS HARDCODED True on purpose:
+                # passing self._gt_mode would make this identity in the current
+                # (ground_truth_mode: false) config — i.e. look like a fix and
+                # change nothing — because the raw yaw is inverted regardless of
+                # mode. Flip before composing with _q_align (post-multiplying by
+                # a yaw rotation leaves roll/pitch alone, so those are unaffected
+                # either way). Shadow-local: the flight-path gt_quat above and the
+                # GT-override blocks below are deliberately untouched.
+                _gt_quat_yawfix = _quat_mult(
+                    rotations.gt_correct_quat(_gt_quat_ge, True), self._q_align)
+                _qn_yf = float(np.linalg.norm(_gt_quat_yawfix))
+                if _qn_yf > 1e-9:
+                    _gt_quat_yawfix = _gt_quat_yawfix / _qn_yf
+                _, _, yaw_gt_true = _quat_to_euler_deg(_gt_quat_yawfix)
                 roll_err  = (roll  - roll_gt  + 180) % 360 - 180
                 pitch_err = (pitch - pitch_gt + 180) % 360 - 180
-                yaw_err   = (yaw   - yaw_gt   + 180) % 360 - 180
+                yaw_err   = (yaw   - yaw_gt_true + 180) % 360 - 180
 
                 self._gt_err_shadow_writer.writerow([
                     f'{now:.4f}',

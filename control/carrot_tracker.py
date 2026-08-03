@@ -33,10 +33,10 @@ For the current segment  r0 → r1  (unit tangent ea):
   3.  Reference velocity:  v_ned_ref = v_ref * unit(rC - pos)  (NED frame)
       Reference yaw:       psi_ref   = atan2(ea_E, ea_N)
 
-  4.  Waypoint advance is driven externally: the controller calls
-      tracker.wp += 1 on gate_passed (COLLISION) only. Switching segments
-      means the whole lookahead geometry (r0, r1, ea) is recomputed from
-      scratch, which is a real, unavoidable jump in rC/v_ned_ref for any
+  4.  Waypoint advance is driven externally: the controller advances
+      tracker.wp on the gate-passed RACE_STATUS event only. Switching
+      segments means the whole lookahead geometry (r0, r1, ea) is recomputed
+      from scratch, which is a real, unavoidable jump in rC/v_ned_ref for any
       turn that isn't dead straight. wp_transition_blend_tau blends the
       output from its pre-transition value over that short window instead
       of snapping, so both carrot_pos and v_ned_ref cross the transition

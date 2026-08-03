@@ -86,8 +86,23 @@ class VisionModeTracker:
     GateLock's own miss-streak hysteresis already absorbs ordinary brief
     flicker without ever leaving LOCKED; leaving LOCKED IS the "real loss"
     signal this ramp resets on.
+
+    trust_w decays toward 0 on loss (loss_tau_s) instead of snapping to it,
+    mirroring the ramp-up on reacquisition (reacq_tau_s). Confirmed in a
+    flight log: with an instant snap-to-0, controller.py's pursuit-blend
+    weight (min(trust_w, path_conv_w)) dropped from 0.94 to 0.0 in the same
+    control tick lock was lost, stepping v_ref_for_gains from "mostly
+    pursuit direction" to "pure carrot direction" in one tick — that raw
+    step drove the reference-derivative feedforward term to spike, commanding
+    a 40 degree attitude step and a ~700 deg/s physical roll rate. Decaying
+    instead of snapping turns that single-tick step into a gradual hand-off
+    from vision pursuit to carrot/IMU dead-reckoning. loss_tau_s should stay
+    noticeably shorter than reacq_tau_s: too slow a decay risks flying a few
+    more ticks on a bearing that's stale for a real reason (e.g. the gate
+    left frame because the drone turned away, not because of noise).
     """
     reacq_tau_s: float
+    loss_tau_s: float = 0.15
     trust_w: float = 1.0
 
     def update(self, lock_state: LockState, dt: float) -> None:
@@ -95,7 +110,8 @@ class VisionModeTracker:
             a = np.exp(-dt / self.reacq_tau_s) if self.reacq_tau_s > 0.0 else 0.0
             self.trust_w = 1.0 - a * (1.0 - self.trust_w)
         else:
-            self.trust_w = 0.0
+            a = np.exp(-dt / self.loss_tau_s) if self.loss_tau_s > 0.0 else 0.0
+            self.trust_w = a * self.trust_w
 
     def base_mode(self, lock_state: LockState) -> Mode:
         if lock_state == LockState.LOCKED:

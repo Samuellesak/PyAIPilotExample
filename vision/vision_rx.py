@@ -1277,8 +1277,17 @@ class VisionRX:
                             and _tvec_ng[2] < self._max_gate_dist):
                         _mav_ng = self.data.get('mav_state')
                         if _mav_ng is not None:
-                            _R_b2n_ng = rotations.quat_to_R_body2ned(_mav_ng['quat'])
-                            _t_ng_ned = _R_b2n_ng @ (self._R_cam2body @ _tvec_ng)
+                            # Routed through rotate_body_to_ned rather than
+                            # building quat_to_R_body2ned inline: this is the
+                            # 4th site named in that helper's docstring as the
+                            # one that forgot gt_correct_quat while the other 3
+                            # remembered, silently reintroducing the mirrored-
+                            # heading bug in GT mode. Identity when gt_mode is
+                            # False, so this changes nothing in the current
+                            # config — it only stops the bug from returning if
+                            # ground_truth_mode is switched back on.
+                            _t_ng_ned = rotations.rotate_body_to_ned(
+                                self._R_cam2body @ _tvec_ng, _mav_ng['quat'], self._gt_mode)
                             _gate2_ned = np.asarray(_mav_ng['pos_ned']) + _t_ng_ned
                             _ng_now = time.time()
                             self._next_gate_ned_buf.append((_ng_now, _gate2_ned))

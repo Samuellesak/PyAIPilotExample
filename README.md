@@ -138,6 +138,9 @@ Because these packages use plain absolute imports (`from flight_model.dyn import
 # Install dependencies
 pip install -r requirements.txt
 
+
+
+
 # Run (from the repo root)
 python main.py
 # Press 's' to arm and start

@@ -46,8 +46,8 @@ C_M_q: 0.0
 # In GT mode this value also sets the controller's initial psi_cmd; GT
 # overrides the EKF quaternion from ATTITUDE every tick so the correct
 # physical heading is always reflected there regardless of this value.
-initial_yaw_deg: 180       # EKF frame alignment at spawn (must match physical spawn heading)
-hover_target_yaw_deg: 180  # psi_cmd set at hover entry [deg]; drone turns to this heading
+initial_yaw_deg: 0       # EKF frame alignment at spawn (must match physical spawn heading)
+hover_target_yaw_deg: 0  # psi_cmd set at hover entry [deg]; drone turns to this heading
 
 
 # ── Carrot tracker ────────────────────────────────────────────────────────────
@@ -55,22 +55,28 @@ hover_target_yaw_deg: 180  # psi_cmd set at hover entry [deg]; drone turns to th
 # First entry is the starting point (world origin).
 # NED z is negative upward: z = -10 means 10 m altitude.
 # Drone faces North (psi=0°) — gates are along the +N axis.
-waypoints: # Ground truth NED coordinates of the gates (from sim TRACK messages).
-- [0.0, 0.0, 0.0]             #Start
-- [-23.29796791, -0.39990234, -1.03195801]
-- [-46.89374924, -2.49999022, 4.0680418]
-- [-74.59375, 1.2000097, 12.66804123]
-- [-111.4937439, -5.09998989, 23.56804085]
-- [-135.4937439, -0.79999024, 24.35565376]
-- [-159.19374084, -4.39999008, 24.96804047]
+#waypoints: # Ground truth NED coordinates of the gates (from sim TRACK messages).
+#- [0.0, 0.0, 0.0]             #Start
+#- [-23.29796791, -0.39990234, -1.03195801]
+#- [-46.89374924, -2.49999022, 4.0680418]
+#- [-74.59375, 1.2000097, 12.66804123]
+#- [-111.4937439, -5.09998989, 23.56804085]
+#- [-135.4937439, -0.79999024, 24.35565376]
+#- [-159.19374084, -4.39999008, 24.96804047]
 
-#waypoints: # Ground truth NED coordinates from competition track
-#  - [    0.0,   0.0,   0.0]   #Start
-#  - [     10,   -1,     -0]   #G0 CONFIRMED
-#  - [     20,   -4,     20]   #G1 UNCONFIRMED
-#  - [     25,   -4,     20]   #G2 UNCONFIRMED
-#  - [     40,   -1,     -20]  #G2 UNCONFIRMED
-#  - [     60,   -6,     -30]  #G3 UNCONFIRMED
+waypoints: # Ground truth NED coordinates from competition track
+  - [    0.0,   0.0,   0.0]   #Start 
+  - [     10,   -1,     0]    #G0 CONFIRMED 
+  - [     20,   3.3,    -2]    #G1 CONFIRMED 
+  - [     25,    5,     -2]    #G2 CONFIRMED
+  - [     30,   -1,     0]    #G3 CONFIRMED
+  - [     32,   -4 , -1]    #G4 CONFIRMED
+  - [     48, -16,    -5]     #G6 UCONFIRMED 
+  - [     55, -10,    -5]     #G7 UCONFIRMED
+  - [     65, -10,    -5]  #G4 UCONFIRMED
+
+
+
 
 gate_beam_to_center_offset_m: 1.0   # [m]   
   # Drone spawns North-facing (psi=0°) and turns South to fly through gates.
@@ -118,7 +124,7 @@ vision_authority: 0.3174
 # ordinary gaps, not just genuine dropouts. Still bounded so a real, much
 # longer dropout doesn't get integrated as one enormous single step.
 imu_predict_dt_max_s: 0.15
-ekf_vision_sigma: 0.5           # 1-sigma position noise from PnP at range≈0 [m]
+ekf_vision_sigma: 0.5          # 1-sigma position noise from PnP at range≈0 [m]
 ekf_vision_sigma_range_k: 0.08  # additional 1-sigma per metre of PnP range [m/m]
 # Tightened from 10.0: confirmed in a flight log that a 9 m innovation (from a
 # real 15° yaw error 0.55s post-reset — see vision_settle_sec below) was let
@@ -127,7 +133,7 @@ ekf_vision_sigma_range_k: 0.08  # additional 1-sigma per metre of PnP range [m/m
 # position bias the carrot tracker then chased with sustained wrong-direction
 # roll (phi grew -17deg->-56deg over 9s, never correcting). 3.0 m rejects that
 # class of error while still allowing legitimate gate-relative corrections.
-ekf_vision_gate: 3.0        # reject PnP position innovation > this [m]
+ekf_vision_gate: 2.0        # reject PnP position innovation > this [m]
 # Separate from ekf_vision_gate above: rejects a fix whose implied speed from
 # the immediately preceding raw PnP position measurement exceeds this, before
 # the gate check even runs. Confirmed in a flight log: a run of self-
@@ -148,7 +154,7 @@ ekf_vision_pos_max_speed: 15.0   # reject a PnP position fix implying more than 
 # when the resulting slope disagrees substantially with truth, so the dynamic
 # sigma alone was letting the EKF over-trust these fixes. 2.0 reflects the
 # worst-axis empirical noise (single scalar — no per-axis split exists here).
-ekf_vision_vel_sigma: 2.0    # 1-sigma velocity noise from PnP differencing [m/s]
+ekf_vision_vel_sigma: 1.0    # 1-sigma velocity noise from PnP differencing [m/s]
 # Was 5.0: confirmed in a flight log this is tight enough to cause a
 # self-reinforcing lockout at real flight speed, not just reject outliers.
 # GT vN reached -12.6 m/s during a dive, but the EKF's own vN estimate never
@@ -222,7 +228,7 @@ vision_yaw_outlier_deg: 12.0  # reject a single yaw_ned frame this far from the 
 # mav_state['pos_ned'] (independent, reliable) when available, or
 # rate-limited continuity against the pipeline's own last-accepted output
 # otherwise. The two params below tune that shared policy.
-vision_pnp_continuity_max_rate: 3.0  # [rad/s] max plausible rotation-candidate switch rate (continuity tier)
+vision_pnp_continuity_max_rate: 2.0  # [rad/s] max plausible rotation-candidate switch rate (continuity tier)
 # How far apart (metres) candidates' implied positions must be before
 # position-consistency is used to disambiguate at all — below this they're
 # treated as position-degenerate (always true for corner-labelling, since
@@ -255,10 +261,10 @@ gate_height_default: 1.5     # [m]
 # empty space (background clutter mistaken for a gate) get used for PnP/EKF
 # updates. Was 0.03 (near-disabled); raised to reject those low-confidence
 # false positives while flying.
-vision_conf_min: 0.6
+vision_conf_min: 0.2
 
 # Gate distance lock — prevents distant-gate detections from corrupting PnP
-vision_max_gate_dist: 62.0   # reject PnP solutions farther than this [m]
+vision_max_gate_dist: 28.0   # reject PnP solutions farther than this [m]
 vision_vel_max_factor: 2.5   # reject PnP velocity > v_ref * this (e.g. 2.5 × 2 m/s = 5 m/s)
 # Time-based, not frame-count-based: a fixed frame count is a proxy for
 # "roughly N seconds at the assumed camera rate" — confirmed in a flight log
@@ -267,9 +273,9 @@ vision_vel_max_factor: 2.5   # reject PnP velocity > v_ref * this (e.g. 2.5 × 2
 # wall-clock terms, directly extending BLIND periods. vision_lock_min_hits
 # is a small floor kept alongside so a single lucky frame plus a long gap
 # can't lock on elapsed time alone. See gate_lock.GateLock's docstring.
-vision_lock_time_s: 0.2      # sustained good detection required to acquire lock [s]
+vision_lock_time_s: 0.3      # sustained good detection required to acquire lock [s]
 vision_lock_min_hits: 2      # floor on accepted-frame count, independent of elapsed time
-vision_lock_miss: 30         # consecutive missed frames before lock is released
+vision_lock_miss: 60         # consecutive missed frames before lock is released
 vision_spike_tol: 5.0        # reject PnP if distance > locked_dist + this [m]
 # "Largest visible box wins" gate selection (vision_rx.py) assumes the
 # closest visible gate IS the current target — breaks the instant the current
@@ -318,7 +324,7 @@ vision_landmark_sigma_mult: 2.0    # multiplies the normal range-scaled position
 # (~0.4s span) -> ~8 m/s residual error; 25 frames (~1.25s span) -> ~1.3 m/s.
 # Set high, prioritising a clean estimate over tracking fast velocity changes —
 # revisit if that lag turns out to hurt high-speed/sharp-turn tracking.
-vision_vel_window_frames: 10
+vision_vel_window_frames: 8
 # Sanity cap only: buffered samples are de-rotated using gyro-integrated relative
 # rotation before the velocity regression (see vision_rx.py), so ordinary flight
 # rotation is compensated rather than rejected. This just bails out of the fit for
@@ -386,6 +392,11 @@ wp_live_update_tau: 0.5   # [s]
 # prove itself. Ordinary brief HOLD flicker never resets this (stays at 1.0),
 # so continuous-lock behavior is unchanged.
 vision_reacq_blend_tau: 0.4   # [s]
+# How fast trust_w decays toward 0 on lock loss (mirrors the ramp-up above).
+# Kept shorter than vision_reacq_blend_tau on purpose: this only needs to
+# smooth the single-tick step out of pursuit blending, not carry a stale
+# bearing along for as long as reacquisition takes to rebuild trust.
+vision_reacq_loss_tau: 0.15   # [s]
 # Caps how fast the pursuit-override's NED bearing direction can slew,
 # independent of the trust_w ramp above (which only scales magnitude toward
 # this same otherwise-unlimited direction). Confirmed in a flight log: a
@@ -441,10 +452,10 @@ vision_path_recover_dist_m: 4.0   # [m] cross-track distance for zero pursuit we
 # this never fires during ordinary long inter-gate cruise, where CARROT mode
 # is normal and expected. The commanded descent is bounded and unwinds
 # smoothly the instant vision reacquires or the drone drifts out of range.
-vision_search_range_m: 15.0        # only search-nudge within this distance of the target gate [m]
-vision_search_trigger_sec: 0.5     # continuous blind (CARROT) duration before nudging starts [s]
-vision_search_max_descend_m: 2.0   # cap on commanded descent below nominal path altitude [m]
-vision_search_descend_mps: 0.6     # ramp rate for the descend bias (both in and out) [m/s]
+vision_search_range_m: 0        # only search-nudge within this distance of the target gate [m]
+vision_search_trigger_sec: 0    # continuous blind (CARROT) duration before nudging starts [s]
+vision_search_max_descend_m: 0  # cap on commanded descent below nominal path altitude [m]
+vision_search_descend_mps: 0    # ramp rate for the descend bias (both in and out) [m/s]
 # Vertical visual-centering nudge: while the gate is still visible but close
 # to the top/bottom of frame, bias the D velocity reference to bring it back
 # toward vertical center. Proactive counterpart to the blind-search nudge
@@ -452,10 +463,9 @@ vision_search_descend_mps: 0.6     # ramp rate for the descend bias (both in and
 # late for a segment needing a large sustained descent/climb (confirmed: the
 # drone flew too high and missed a gate whose approach segment required the
 # largest sustained descent on the track). Border-fraction gating means
-# ordinary comfortably-centered flight is unaffected.
-#NUDGE
-vision_vnudge_border_frac: 0.2   # start nudging once the gate is this far toward the top/bottom edge (0-1)
-vision_vnudge_max_mps: 0       # max additional vertical velocity bias right at the border [m/s]
+# ordinary comfortably-centered flight is unaffected. Disabled here.
+vision_vnudge_border_frac: 0   # start nudging once the gate is this far toward the top/bottom edge (0-1)
+vision_vnudge_max_mps: 0.0       # max additional vertical velocity bias right at the border [m/s]
 vision_debug_overlay: true    # set true to open a live OpenCV window with mode + bearing overlay
 # Saved frames are named after frame_id, which skips numbers (rate-limited
 # background frames + forced detection frames) — reads as missing/black
@@ -558,7 +568,7 @@ gate_vel_heading: 1.0      # Mahalanobis gate for vel-heading yaw update [rad]
 sigma_gate_pass_pos: 0.5   # 1-sigma position noise for gate-pass fix [m]
 
 # Item 4: PnP latency compensation — shift pos measurement forward by dead-reckoning
-vision_latency_s: 0.08     # image-to-EKF-update pipeline delay [s]; 0 = disabled
+vision_latency_s: 0.1    # image-to-EKF-update pipeline delay [s]; 0 = disabled
 
 
 
@@ -578,7 +588,7 @@ ekf_gt_error_shadow: true        # log EKF-vs-GT error to logs/ekf_gt_error_shad
 # the gate centre instead — commits to flying through that specific point for
 # the final approach rather than a lookahead point that keeps sliding forward.
 # Defaults to the lookahead distance itself (lookahead_gain * v_ref) if unset.
-commit_dist_m: 2
+commit_dist_m: 1.0
 
 # During commit (see commit_dist_m above), blend the aim point/yaw toward the
 # NEXT gate's approach direction as the drone closes in, so it's already
@@ -587,7 +597,7 @@ commit_dist_m: 2
 # from 0 at the start of commit to this fraction (max) exactly at the gate —
 # 0 disables (old dead-straight behaviour). Start conservative; a too-large
 # value risks cutting the corner enough to affect gate-hit accuracy.
-corner_cut_frac: 0.1
+corner_cut_frac: 0.0
 
 # Blends carrot_pos/v_ned_ref from their pre-transition value over this many
 # seconds right after tr acker.wp advances, instead of snapping straight to
@@ -595,7 +605,7 @@ corner_cut_frac: 0.1
 # jump (confirmed: near-90 deg v_ned_ref flip in one tick on a sharp turn)
 # since the whole lookahead computation restarts on the new segment. 0 = old
 # behaviour (no blend).s
-wp_transition_blend_tau: 0.25
+wp_transition_blend_tau: 0.05
 
 # ── Controller selections ─────────────────────────────────────────────────────
 # 1 = Cascade PI  (analytical gains, no offline solve required)
@@ -640,8 +650,8 @@ sigma_bias_z_proc: 5.0e-6  # bgz (yaw gyro bias) random-walk std [rad/s/√s]; 0
 yolo_enabled: true
 
 
-v_ref: 5            # reference cruise speed [m/s]
-lookahead_gain: 1.3   # lookahead distance = lookahead_gain * v_ref [m]; larger = smoother carrot direction 1.6
+v_ref: 2         # reference cruise speed [m/s]
+lookahead_gain: 1.1   # lookahead distance = lookahead_gain * v_ref [m]; larger = smoother carrot direction 1.6
 
 # Outer loop: velocity PI -> desired tilt angle -> P on tilt error -> desired rates
 # R22 = cos(roll)*cos(pitch): thrust compensation factor for tilt.  At level flight
@@ -651,15 +661,15 @@ lookahead_gain: 1.3   # lookahead distance = lookahead_gain * v_ref [m]; larger 
 # by vD alone: v_ref_D=0 in hover, carrot D component during race.
 #---------------------------------------------------------------------------------------------------------------------
 Kp_vN: 1.5     # North velocity P  [1/s]  — sysid_vel: τ_v=4.59 s, T_settle=1.5 s
-Ki_vN: 0.1    # North velocity I  [1/s²]
+Ki_vN: 0.3    # North velocity I  [1/s²]
 Kd_vN: 0.0    # North velocity D  [s]    — derivative-on-measurement; 0=off
 
 Kp_vE: 1.5   # East  velocity P  [1/s]  — sysid_vel: τ_v=4.44 s, T_settle=1.5 s
-Ki_vE: 0.1    # East  velocity I  [1/s²]
+Ki_vE: 0.3    # East  velocity I  [1/s²]
 Kd_vE: 0    # East  velocity D  [s]    — derivative-on-measurement; 0=off
 
 
-Kp_vD: 1.5     # Down  velocity P  [1/s]  — was 2.5 ("stronger correction for vD drift"),
+Kp_vD: 1.3     # Down  velocity P  [1/s]  — was 2.5 ("stronger correction for vD drift"),
              # reduced to match horizontal: confirmed in a flight log that vD is
              # noisy/dead-reckoned (no baro/GPS) with no filtering (tau_vel_d=0,
              # see that param's note — a filter here made a transition-phase
@@ -670,19 +680,19 @@ Kp_vD: 1.5     # Down  velocity P  [1/s]  — was 2.5 ("stronger correction for 
              # despite good N/E tracking). Testing whether a gain matching
              # horizontal settles the oscillation without needing more lag.
 Ki_vD: 0.1   # Down  velocity I  [1/s²] — small integral to trim steady-state vD offset
-Kd_vD: 0.1   # Down  velocity D  [s]    — derivative-on-measurement; 0=off
+Kd_vD: 0.5   # Down  velocity D  [s]    — derivative-on-measurement; 0=off
 
 K_att: 6
-K_psi: 6       # yaw P   [1/s] 2
+K_psi: 6      # yaw P   [1/s] 2
 Ki_psi: 0.0002     # yaw I   [1/s^2]  = K_psi^2 / 5 0.2
 
-MAX_TILT_DEG: 60.0   # outer loop tilt limit [deg]; 55° → ~8 m/s² heading authority for high-speed flight
+MAX_TILT_DEG: 70.0   # outer loop tilt limit [deg]; 55° → ~8 m/s² heading authority for high-speed flight
 #---------------------------------------------------------------------------------------------------------
 
 tau_vN: 4.59     # North velocity plant time constant [s]  — used for feedforward
 tau_vE: 4.44     # East  velocity plant time constant [s]  — used for feedforward
 K_dv: 1.5        # reference-derivative lag compensator gain [s]; 0=off, tune 0.3–0.5 
-K_dv_D: 1.5      # same lag comp, D axis only [s]; independent of K_dv since vD was never
+K_dv_D: 1.8      # same lag comp, D axis only [s]; independent of K_dv since vD was never
                  # getting a lag-comp term before (N/E-only) — start ~2x K_dv, tune from there
 # [s] 1st-order LP on v_ned_ref before PI; smooths carrot direction oscillation; 0=off
 # Raised from 0.15: waypoint transitions on this course can flip the lateral
@@ -695,7 +705,7 @@ K_dv_D: 1.5      # same lag comp, D axis only [s]; independent of K_dv since vD 
 # position estimate every tick, so it needs a heavier time constant to smooth
 # out. Tradeoff: more lag between a real course change and the commanded
 # tilt — watch the commit-phase approach (commit_dist_m) for sluggishness.
-tau_ref_smooth: 0.6
+tau_ref_smooth: 0.45
 
 
 # ── Velocity measurement filter time constants ────────────────────────────────
@@ -737,7 +747,7 @@ gate_debounce_sec: 2.0
 # gate_pass_timeout_sec is a fallback in case the drone overshoots without
 # crossing the threshold (e.g. missed gate).  Set dist=0 to disable (immediate).
 gate_pass_dist_m: 1        # m — at 20 m/s: ~0.15 s delay
-gate_pass_timeout_sec: 2.0   # s — hard cap
+gate_pass_timeout_sec: 1.0   # s — hard cap
 
 # ── Helper waypoints (pre/post gate alignment) ────────────────────────────────
 # Set both > 0 to expand each gate into [pre_helper, gate, post_helper].

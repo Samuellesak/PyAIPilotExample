@@ -161,7 +161,8 @@ class Controller:
         # (old _reacq_blend_w) — see VisionModeTracker.update() for why no
         # separate edge-detection is needed any more.
         self._vision_mode = VisionModeTracker(
-            reacq_tau_s=float(param.get('vision_reacq_blend_tau', 0.4)))
+            reacq_tau_s=float(param.get('vision_reacq_blend_tau', 0.4)),
+            loss_tau_s=float(param.get('vision_reacq_loss_tau', 0.15)))
 
         # Vertical assist (vision_mode.py) — merges the old blind-search
         # descend nudge and vertical visual-centering nudge under one owner
@@ -184,6 +185,13 @@ class Controller:
         # docstring.
         self._pursuit_guidance = PursuitGuidance(
             max_turn_rate=np.deg2rad(float(param.get('vision_pursuit_turn_rate_max_deg', 60.0))))
+        # Fixed NED point (not a body-frame vector — see the pursuit-
+        # override block for why) computed from the last gate_bearing_body_m
+        # seen while gate_id_match was True. The trust_w-decay grace window
+        # needs a target to blend toward once gate_id_match itself goes
+        # False (same tick mode flips to BLIND on a real loss), since pose
+        # no longer asserts one at that point.
+        self._last_pursuit_target_ne = None
         # Reacquisition speed cap — see the matching comment where it's
         # applied. Buys convergence time by slowing the approach instead of
         # letting the drone close in at full speed while trust_w is still
@@ -604,9 +612,59 @@ class Controller:
                 self._pursuit_guidance.reset()
                 if _rec_dist > 1e-3:
                     v_ref_for_gains = (_rec_vec / _rec_dist) * self._recovery_speed_mps
-            elif (mode in (Mode.TRACKING, Mode.REACQUIRING)
-                    and gate_id_match and not self._debug_waypoints_only):
-                _t_body_v = pose.gate_bearing_body_m
+            elif (not self._debug_waypoints_only and (
+                    (mode in (Mode.TRACKING, Mode.REACQUIRING) and gate_id_match)
+                    or (mode == Mode.BLIND and self._vision_mode.trust_w > 1e-3
+                        and self._last_pursuit_target_ne is not None))):
+                # Two ways in: (a) the ordinary case, a fresh gate_id_match
+                # this tick; (b) the trust_w-decay grace window right after
+                # a real loss (mode flips to BLIND the SAME tick GateLock
+                # leaves LOCKED and vision_rx.py stops asserting gate_id —
+                # confirmed in a flight log: agi_match flips 1->0 on the
+                # exact tick mode flips to BLIND, well before trust_w has
+                # meaningfully decayed). Explicitly scoped to BLIND (not
+                # "any mode with trust_w>0") so COMMIT still fully suppresses
+                # pursuit as documented below, regardless of trust_w.
+                #
+                # Case (b) can't read pose.gate_bearing_body_m — vision_rx.py
+                # has already stopped asserting a gate_id, so gate_id_match
+                # is False and nothing about the current gate is confirmed.
+                # The cache below is a fixed NED point, not a body-frame
+                # vector: caching the raw body vector and re-rotating it by
+                # the CURRENT yaw every tick (an earlier version of this fix)
+                # made the "target" swing sideways in lockstep with the
+                # drone's own yaw motion during the decay window — confirmed
+                # in a flight log: psi_meas rotated ~19deg across the decay
+                # window while carrot's cross-track offset swung ~1.8m, right
+                # after a wp advance with no real gate motion to justify it.
+                # Anchoring to a fixed NED point and re-deriving the body-
+                # frame bearing from it every tick (current pos_ned, current
+                # attitude) is what set_live_target already does for the
+                # tracker's own target — same fix, applied here.
+                # Yaw-only 2D rotation throughout this cache (matching the
+                # yaw-only convention the rest of this block already uses
+                # for dir_n/dir_e below, and deliberately NOT the 3D
+                # rotate_body_to_ned helper) — caching with the full 3D
+                # rotation but reconstructing with yaw-only would introduce
+                # a mismatch proportional to roll/pitch at capture time.
+                _psi_v = self._gt_yaw_convention(quat_to_euler(quat)[2])
+                _cp, _sp = np.cos(_psi_v), np.sin(_psi_v)
+                if gate_id_match:
+                    _bx, _by = float(pose.gate_bearing_body_m[0]), float(pose.gate_bearing_body_m[1])
+                    _rel_ne = np.array([_cp * _bx - _sp * _by, _sp * _bx + _cp * _by])
+                    self._last_pursuit_target_ne = pos_ned[:2] + _rel_ne
+                    _t_body_v = pose.gate_bearing_body_m
+                else:
+                    _rel_ne = self._last_pursuit_target_ne - pos_ned[:2]
+                    # Re-derive the equivalent body-frame bearing from the
+                    # fixed NED target and the CURRENT attitude — the inverse
+                    # of the rotation just above, so this reconstructs
+                    # exactly what a fresh detection would report if the
+                    # target were still visible at this pose.
+                    _t_body_v = np.array([
+                        _cp * _rel_ne[0] + _sp * _rel_ne[1],
+                        -_sp * _rel_ne[0] + _cp * _rel_ne[1],
+                    ])
                 _horiz_v = float(np.sqrt(_t_body_v[0]**2 + _t_body_v[1]**2))
                 if _horiz_v > 1.0:   # gate at least 1 m away horizontally
                     _dir_xb = _t_body_v[0] / _horiz_v   # body-forward component
@@ -618,9 +676,8 @@ class Controller:
                     # its own yaw-only 2D rotation (not the 3D
                     # rotate_body_to_ned helper) — this override deliberately
                     # ignores roll/pitch for a horizontal-only reference,
-                    # same as before.
-                    _psi_v  = self._gt_yaw_convention(quat_to_euler(quat)[2])
-                    _cp, _sp = np.cos(_psi_v), np.sin(_psi_v)
+                    # same as before. _cp/_sp already computed above (also
+                    # needed there for case (b)'s inverse rotation).
                     _dir_n  =  _cp * _dir_xb - _sp * _dir_yb
                     _dir_e  =  _sp * _dir_xb + _cp * _dir_yb
                     # Rate-limit the pursuit direction itself (not just the
@@ -678,11 +735,12 @@ class Controller:
                         v_ned_ref_carrot[2],
                     ])
             else:
-                # Pursuit not active this tick (BLIND/COMMIT, no gate_id
-                # match, or debug_waypoints_only) — drop the rate-limiter's
-                # cached direction so a stale bearing from a previous gate
-                # can't leak into the next reacquisition.
+                # Pursuit not active this tick (COMMIT, trust_w decayed out,
+                # or debug_waypoints_only) — drop the rate-limiter's cached
+                # direction AND the bearing cache so neither can leak into
+                # the next reacquisition or a later, unrelated BLIND stretch.
                 self._pursuit_guidance.reset()
+                self._last_pursuit_target_ne = None
 
             # Vertical assist (vision_mode.py): merges the old blind-search
             # descend nudge and vertical visual-centering nudge under one
@@ -785,19 +843,19 @@ class Controller:
                 vnudge_bias    = self.data.get('vnudge_bias', 0.0),
             )
 
-        # Advance carrot waypoint when sim signals gate passage — via either
-        # COLLISION (gate_passed) or a RACE_STATUS active_gate_index increase.
-        # See _last_seen_agi's init comment for why both are needed.
+        # Advance carrot waypoint when the sim reports a gate passage through
+        # the RACE_STATUS active_gate_index update.
         _agi_now      = int(self.data.get('active_gate_index', -1))
         _agi_advanced = _agi_now > self._last_seen_agi
         self._last_seen_agi = _agi_now
-        _via_collision = self.data.pop('gate_passed', False)
-        if _via_collision or _agi_advanced:
-            # Label which signal actually fired — id=None from COLLISION is
-            # normal on sim builds that don't send it; RACE_STATUS (agi=N) is
-            # the primary trigger there. See _last_seen_agi's init comment.
-            _trigger = (f"COLLISION id={self.data.get('last_gate_id')}"
-                        if _via_collision else f"RACE_STATUS agi={_agi_now}")
+        if _agi_advanced:
+            _trigger = f"RACE_STATUS agi={_agi_now}"
+            ekf_pos = self.data.get('mav_state', {}).get('pos_ned')
+            if ekf_pos is not None:
+                pos_str = f"[{ekf_pos[0]:.6f}, {ekf_pos[1]:.6f}, {ekf_pos[2]:.6f}]"
+            else:
+                pos_str = 'unknown'
+            print(f"[GATE PASSED {_trigger}] ekf_pos={pos_str}", flush=True)
             agi    = _agi_now
             new_wp = self.tracker.wp + 1
             if agi >= 0:
@@ -820,18 +878,13 @@ class Controller:
                     self._wp_pending = None
                     # Keep active_gate_index in lockstep with tracker.wp instead
                     # of waiting for the sim's own RACE_STATUS message to catch
-                    # up. Confirmed in a flight log: a COLLISION-triggered
-                    # advance can fire before RACE_STATUS reports the new gate
-                    # index, leaving _agi_matches_wp (and vision_rx.py's own
-                    # gate_info resolution, which reads this same shared value)
-                    # stuck on the just-passed gate for however long RACE_STATUS
-                    # lags — not just one frame, but potentially the whole
-                    # approach to the next gate, during which NEITHER the raw
-                    # controller overrides NOR the EKF's vision fusion get any
-                    # correction toward the real target, since both key off
-                    # active_gate_index. new_wp-1 >= agi always holds (from the
-                    # max() above), so this only ever advances the index, never
-                    # regresses it if RACE_STATUS already agrees or is ahead.
+                    # up. Confirmed in a flight log: an active-gate-index-triggered
+                    # advance can arrive before the next update cycle, leaving
+                    # _agi_matches_wp (and vision_rx.py's own gate_info resolution,
+                    # which reads this same shared value) stuck on the just-passed
+                    # gate for a brief window. new_wp-1 >= agi always holds (from
+                    # the max() above), so this only ever advances the index,
+                    # never regresses it if RACE_STATUS already agrees or is ahead.
                     self.data['active_gate_index'] = new_wp - 1
                     print(f"[GATE PASSED {_trigger}] "
                           f"tracker.wp → {self.tracker.wp}", flush=True)
