@@ -112,7 +112,14 @@ class VisionRX:
         self._max_gate_dist = float(_p.get('vision_max_gate_dist', 50.0))
         self._v_ref         = float(_p.get('v_ref', 2.0))
         self._vel_max_factor = float(_p.get('vision_vel_max_factor', 2.5))
-        self._lock_frames   = int(_p.get('vision_lock_frames', 5))
+        # Time-based, not frame-count-based: a fixed frame count is a proxy
+        # for "roughly N seconds at the assumed camera rate" — confirmed in
+        # a flight log that once the real rate dropped, acquisition took
+        # proportionally longer in wall-clock terms. lock_min_hits is a
+        # small floor kept alongside so a single lucky frame can't lock on
+        # elapsed time alone. See gate_lock.GateLock's docstring.
+        self._lock_time_s   = float(_p.get('vision_lock_time_s', 0.2))
+        self._lock_min_hits = int(_p.get('vision_lock_min_hits', 2))
         self._lock_miss_max = int(_p.get('vision_lock_miss',   30))
         self._spike_tol     = float(_p.get('vision_spike_tol', 5.0))
         # "Largest visible box wins" (below) assumes the closest visible gate
@@ -152,7 +159,8 @@ class VisionRX:
         # acquisition) as a guarded transition inside the machine rather
         # than a side channel that mutates lock state from outside it.
         self._lock = gate_lock.GateLock(
-            lock_frames=self._lock_frames, miss_max=self._lock_miss_max,
+            lock_time_s=self._lock_time_s, lock_min_hits=self._lock_min_hits,
+            miss_max=self._lock_miss_max,
             spike_tol_m=self._spike_tol,
             id_tol_m=float(_p.get('vision_gate_id_tol_m', 10.0)),
             id_recheck_period_s=float(_p.get('vision_gate_id_recheck_interval_s', 1.5)),
@@ -322,9 +330,18 @@ class VisionRX:
         # Next-gate candidate: accumulate PnP-derived NED positions of the second-largest
         # YOLO detection across many frames.  Confirmed position = median of buffer.
         # Buffer clears on gate-index change to discard stale measurements.
-        self._next_gate_min_frames = int(_p.get('next_gate_min_frames', 15))
-        self._next_gate_ned_buf    = deque(maxlen=self._next_gate_min_frames)
-        self._next_gate_ned        = None    # median NED once buffer is full, else None
+        # Time-based, not frame-count-based (see gate_lock.GateLock's
+        # docstring for why): confirming the next-gate candidate after
+        # next_gate_min_time_s of accumulation, not a fixed frame count,
+        # keeps this consistent in wall-clock terms regardless of camera
+        # fps. next_gate_min_hits is a small floor kept alongside so it
+        # can't confirm on time alone from very few samples. Buffer stores
+        # (timestamp, ned) pairs; maxlen is a generous cap on retained
+        # history, not the confirmation threshold itself.
+        self._next_gate_min_time_s = float(_p.get('next_gate_min_time_s', 0.5))
+        self._next_gate_min_hits   = int(_p.get('next_gate_min_hits', 5))
+        self._next_gate_ned_buf    = deque(maxlen=200)
+        self._next_gate_ned        = None    # median NED once buffer spans enough time, else None
 
         # Live debug overlay window (enabled via vision_debug_overlay: true in params.yaml).
         self._debug_overlay     = bool(_p.get('vision_debug_overlay', False))
@@ -579,14 +596,14 @@ class VisionRX:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, dist_col, 2, cv2.LINE_AA)
 
         # ── Next-gate status ──────────────────────────────────────────────────
-        ng_ned    = self.data.get('next_gate_ned')
-        ng_frames = self.data.get('next_gate_buf_frames', 0)
-        ng_min    = self.data.get('next_gate_min_frames', self._next_gate_min_frames)
+        ng_ned     = self.data.get('next_gate_ned')
+        ng_elapsed = self.data.get('next_gate_buf_elapsed_s', 0.0)
+        ng_min_t   = self.data.get('next_gate_min_time_s', self._next_gate_min_time_s)
         if ng_ned is not None:
             ng_lbl = 'NEXT GATE: CONFIRMED'
             ng_col = (0, 220, 0)
-        elif ng_frames > 0:
-            ng_lbl = f'NEXT GATE: {ng_frames}/{ng_min}'
+        elif ng_elapsed > 0:
+            ng_lbl = f'NEXT GATE: {ng_elapsed:.1f}/{ng_min_t:.1f}s'
             ng_col = (0, 200, 220)
         else:
             ng_lbl = 'NEXT GATE: --'
@@ -1242,7 +1259,9 @@ class VisionRX:
 
                 # ── Next-gate candidate (second-largest valid box) ────────────
                 # Accumulates PnP-derived NED positions across many frames and
-                # publishes a confirmed median position once the buffer is full.
+                # publishes a confirmed median position once the buffer spans
+                # at least next_gate_min_time_s of wall-clock time (not just a
+                # frame count — see its init comment).
                 # Guard: second gate must be farther than current gate by ≥5 m so
                 # duplicate detections of the same gate are rejected.
                 _cur_dist = float(tvec_cam[2]) if tvec_cam is not None else 0.0
@@ -1261,15 +1280,19 @@ class VisionRX:
                             _R_b2n_ng = rotations.quat_to_R_body2ned(_mav_ng['quat'])
                             _t_ng_ned = _R_b2n_ng @ (self._R_cam2body @ _tvec_ng)
                             _gate2_ned = np.asarray(_mav_ng['pos_ned']) + _t_ng_ned
-                            self._next_gate_ned_buf.append(_gate2_ned)
-                            if len(self._next_gate_ned_buf) >= self._next_gate_min_frames:
-                                _buf = np.array(list(self._next_gate_ned_buf))
+                            _ng_now = time.time()
+                            self._next_gate_ned_buf.append((_ng_now, _gate2_ned))
+                            if (len(self._next_gate_ned_buf) >= self._next_gate_min_hits
+                                    and (_ng_now - self._next_gate_ned_buf[0][0])
+                                        >= self._next_gate_min_time_s):
+                                _buf = np.array([_ned for _, _ned in self._next_gate_ned_buf])
                                 self._next_gate_ned = np.median(_buf, axis=0)
 
         # Publish next-gate state for controller and overlay.
-        self.data['next_gate_ned']        = self._next_gate_ned
-        self.data['next_gate_buf_frames'] = len(self._next_gate_ned_buf)
-        self.data['next_gate_min_frames'] = self._next_gate_min_frames
+        self.data['next_gate_ned']         = self._next_gate_ned
+        self.data['next_gate_buf_elapsed_s'] = (
+            (time.time() - self._next_gate_ned_buf[0][0]) if self._next_gate_ned_buf else 0.0)
+        self.data['next_gate_min_time_s']  = self._next_gate_min_time_s
 
         # Hard range gate: the next gate is never more than 50 m away.
         # Detections beyond this are background noise or a gate from a later lap.

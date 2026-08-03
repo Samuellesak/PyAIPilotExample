@@ -112,6 +112,12 @@ vision_authority: 0.3174
 # (several metres of real scatter beyond ~15-20 m) as if it were as trustworthy as
 # close-range PnP (sub-metre). The range-scaled sigma below lets the EKF trust
 # close-in gate-pass fixes tightly while discounting distant, noisier ones.
+# Predict-step dt ceiling — was 0.05s, sized for a ~250Hz nominal IMU rate.
+# Confirmed in a flight log the sim can deliver HIGHRES_IMU at ~61Hz with
+# jitter up to ~62ms; the old ceiling was clipping (discarding) the tail of
+# ordinary gaps, not just genuine dropouts. Still bounded so a real, much
+# longer dropout doesn't get integrated as one enormous single step.
+imu_predict_dt_max_s: 0.15
 ekf_vision_sigma: 0.5           # 1-sigma position noise from PnP at range≈0 [m]
 ekf_vision_sigma_range_k: 0.08  # additional 1-sigma per metre of PnP range [m/m]
 # Tightened from 10.0: confirmed in a flight log that a 9 m innovation (from a
@@ -254,7 +260,15 @@ vision_conf_min: 0.6
 # Gate distance lock — prevents distant-gate detections from corrupting PnP
 vision_max_gate_dist: 62.0   # reject PnP solutions farther than this [m]
 vision_vel_max_factor: 2.5   # reject PnP velocity > v_ref * this (e.g. 2.5 × 2 m/s = 5 m/s)
-vision_lock_frames: 5        # consecutive valid PnP frames required to acquire lock
+# Time-based, not frame-count-based: a fixed frame count is a proxy for
+# "roughly N seconds at the assumed camera rate" — confirmed in a flight log
+# that once the real delivery rate dropped well below what the old frame
+# count was tuned against, acquisition took proportionally longer in
+# wall-clock terms, directly extending BLIND periods. vision_lock_min_hits
+# is a small floor kept alongside so a single lucky frame plus a long gap
+# can't lock on elapsed time alone. See gate_lock.GateLock's docstring.
+vision_lock_time_s: 0.2      # sustained good detection required to acquire lock [s]
+vision_lock_min_hits: 2      # floor on accepted-frame count, independent of elapsed time
 vision_lock_miss: 30         # consecutive missed frames before lock is released
 vision_spike_tol: 5.0        # reject PnP if distance > locked_dist + this [m]
 # "Largest visible box wins" gate selection (vision_rx.py) assumes the
@@ -451,7 +465,11 @@ vision_debug_overlay: true    # set true to open a live OpenCV window with mode 
 # off, while frame_id stays in the name for correlating against
 # frame_timestamps.csv/vision.csv.
 frame_seq_index_enabled: true
-next_gate_min_frames: 5      # frames second-gate PnP must be consistent before waypoint update
+# Time-based, not frame-count-based (same rationale as vision_lock_time_s
+# above) — confirms the next-gate candidate once the buffer spans
+# next_gate_min_time_s of wall-clock time, not a fixed frame count.
+next_gate_min_time_s: 0.5    # [s] second-gate PnP must be consistent for this long before waypoint update
+next_gate_min_hits: 5        # floor on accepted-frame count, independent of elapsed time
 
 # ── Image preprocessing (applied before orange mask) ─────────────────────────
 # Unsharp mask recovers orange saturation lost to motion blur without widening
@@ -560,7 +578,7 @@ ekf_gt_error_shadow: true        # log EKF-vs-GT error to logs/ekf_gt_error_shad
 # the gate centre instead — commits to flying through that specific point for
 # the final approach rather than a lookahead point that keeps sliding forward.
 # Defaults to the lookahead distance itself (lookahead_gain * v_ref) if unset.
-commit_dist_m: 3
+commit_dist_m: 2
 
 # During commit (see commit_dist_m above), blend the aim point/yaw toward the
 # NEXT gate's approach direction as the drone closes in, so it's already
@@ -569,7 +587,7 @@ commit_dist_m: 3
 # from 0 at the start of commit to this fraction (max) exactly at the gate —
 # 0 disables (old dead-straight behaviour). Start conservative; a too-large
 # value risks cutting the corner enough to affect gate-hit accuracy.
-corner_cut_frac: 0.2
+corner_cut_frac: 0.1
 
 # Blends carrot_pos/v_ned_ref from their pre-transition value over this many
 # seconds right after tr acker.wp advances, instead of snapping straight to

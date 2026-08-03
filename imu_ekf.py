@@ -72,6 +72,11 @@ class IMUEKFHandler:
             sigma_bias_z_proc=float(param.get('sigma_bias_z_proc', 5e-6)),
         )
         self._last_imu_t = None
+        # See on_imu_msg's predict-dt clamp for why this needs to be bigger
+        # than the nominal ~250Hz period once the actual IMU delivery rate
+        # is lower — confirmed via flight-log wall_t deltas (~61Hz + jitter
+        # up to ~62ms in a real run). Not tied to any single assumed rate.
+        self._imu_dt_max_s = float(param.get('imu_predict_dt_max_s', 0.15))
 
         # World-NED position at hover-entry reset (EKF zeroes at that point).
         # Subtracted from every vision position update so EKF and PnP share a frame.
@@ -335,7 +340,13 @@ class IMUEKFHandler:
 
         now = time.time()
         dt  = (now - self._last_imu_t) if self._last_imu_t is not None else 0.004
-        dt  = float(np.clip(dt, 0.0005, 0.05))
+        # Ceiling was 0.05s, sized for a ~250Hz nominal IMU rate — confirmed
+        # in a flight log the sim can now deliver HIGHRES_IMU at ~61Hz with
+        # jitter up to ~62ms, so that ceiling was clipping (and silently
+        # discarding) the tail of ordinary gaps, not just genuine dropouts.
+        # Raised to comfortably cover that jitter; still bounded so a real,
+        # much longer dropout doesn't get integrated as one enormous step.
+        dt  = float(np.clip(dt, 0.0005, self._imu_dt_max_s))
         self._last_imu_t = now
 
         # ── Model-aided EKF predict ───────────────────────────────────────────

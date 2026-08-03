@@ -20,7 +20,7 @@ Dependency-free (stdlib only) so this can be unit-tested without pulling in
 vision_rx.py's camera/model machinery.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from pose_estimate import LockState
@@ -28,7 +28,8 @@ from pose_estimate import LockState
 
 @dataclass
 class GateLock:
-    lock_frames:          int
+    lock_time_s:          float   # sustained good-detection duration required to LOCK
+    lock_min_hits:        int     # floor on accepted-frame count, independent of elapsed time
     miss_max:             int
     spike_tol_m:          float
     id_tol_m:             float
@@ -39,6 +40,18 @@ class GateLock:
     miss_streak:         int             = 0
     last_good_range_m:   Optional[float] = None
     last_id_recheck_t:   Optional[float] = None
+    # Wall-clock time of the first accepted frame in the current ACQUIRING
+    # run — set once on UNLOCKED->ACQUIRING and left alone by isolated
+    # misses (same "isolated miss doesn't wipe progress" invariant as
+    # hit_count), so acquisition is gated on how long good detection has
+    # actually been sustained rather than on a fixed frame count. A fixed
+    # count is a proxy for "roughly N seconds at the assumed camera rate" —
+    # confirmed in a flight log that once the real rate dropped well below
+    # what lock_frames (the old field) was tuned against, acquisition took
+    # proportionally longer in wall-clock terms, directly extending BLIND
+    # periods. lock_min_hits is a small floor kept alongside lock_time_s so
+    # a single lucky frame plus a long gap can't lock on time alone.
+    _acquiring_since:    Optional[float] = field(default=None, repr=False)
     # Diagnostics only, set by the most recent on_frame() call — lets the
     # caller (vision_rx.py) pick the right skip_reason/gate_id_rejected
     # values without re-deriving the identity-tolerance comparison itself.
@@ -53,6 +66,7 @@ class GateLock:
         self.hit_count = 0
         self.miss_streak = 0
         self.last_good_range_m = None
+        self._acquiring_since = None
         # last_id_recheck_t is NOT cleared here: it tracks wall-clock recheck
         # cadence, not lock identity, and clearing it would make the very
         # next frame after a reset skip straight to "due" regardless of how
@@ -120,13 +134,19 @@ class GateLock:
             return True
 
         # UNLOCKED or ACQUIRING: every identity-plausible frame counts,
-        # consecutive or not (an isolated miss above never reset hit_count).
+        # consecutive or not (an isolated miss above never reset hit_count
+        # or _acquiring_since). Locks once BOTH the elapsed-time and
+        # min-hits thresholds are satisfied — see _acquiring_since's
+        # comment for why time, not just a frame count, is load-bearing.
         self.last_reject_reason = None
         self.miss_streak = 0
         self.hit_count += 1
         if self.state == LockState.UNLOCKED:
             self.state = LockState.ACQUIRING
-        if self.hit_count >= self.lock_frames:
+            self._acquiring_since = now
+        if (self.hit_count >= self.lock_min_hits
+                and self._acquiring_since is not None
+                and (now - self._acquiring_since) >= self.lock_time_s):
             self.state = LockState.LOCKED
             self.last_good_range_m = accepted
         return True
